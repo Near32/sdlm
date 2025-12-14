@@ -22,8 +22,9 @@ setup(
     ],
     python_requires=">=3.7",
     install_requires=[
-        "torch>=1.9.0",
-        "transformers>=4.0.0",
+        #"torch>=1.9.0",
+        #"transformers>=4.0.0",
+        "dspy",
     ],
     extras_require={
         "dev": [

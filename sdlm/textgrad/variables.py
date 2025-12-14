@@ -28,6 +28,7 @@ class Variable(STGSDiffString):
         logit_scaler: float = 10.0,
         hard: bool = False,
         learnable_temperature: bool = False,
+        decouple_learnable_temperature: bool = False,
         device: Optional[str] = None,
         constraint: Optional[Callable] = None,
         **kwargs,
@@ -59,6 +60,7 @@ class Variable(STGSDiffString):
             logit_scaler=logit_scaler,
             hard=hard,
             learnable_temperature=learnable_temperature,
+            decouple_learnable_temperature=learnable_temperature,
             device=device
         )
         

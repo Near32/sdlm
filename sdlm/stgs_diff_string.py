@@ -24,6 +24,7 @@ class STGSDiffString(nn.Module):
         temperature: float = 0.1,
         hard: bool = False,
         learnable_temperature: bool = False,
+        decouple_learnable_temperature: bool = False,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     ):
         """
@@ -43,7 +44,8 @@ class STGSDiffString(nn.Module):
         super().__init__()
         self.tokenizer = tokenizer
         self.device = device
-        
+        self.decouple_learnable_temperature = decouple_learnable_temperature
+
         assert initial_string is not None or initial_ids is not None
         if initial_ids is not None:
             self.input_ids = initial_ids.to(device)
@@ -119,6 +121,7 @@ class STGSDiffString(nn.Module):
             stgs_hard=hard,
             init_temperature=temperature,
             learnable_temperature=learnable_temperature,
+            nbr_learnable_temperatures=self.logits.shape[1] if decouple_learnable_temperature else None, 
             device=device
         )
 
@@ -175,6 +178,8 @@ class STGSDiffString(nn.Module):
             self.logits,
             temperature=temperature,
         )
+        if self.decouple_learnable_temperature:
+            self.eff_temperatures = eff_temperature.mean(dim=0)
         self.eff_temperature = (eff_temperature.sum()/len(eff_temperature)).item()
 
         # Decode the string
