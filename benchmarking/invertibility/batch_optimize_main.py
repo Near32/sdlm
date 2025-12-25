@@ -633,7 +633,10 @@ def parse_args():
 def main():
     """Main entry point."""
     args = parse_args()
-    
+    if args.decouple_learnable_temperature \
+    and not args.learnable_temperature:
+        raise ValueError("decouple_learnable_temperature requires learnable_temperature")
+
     # Parse target indices if provided
     target_indices = None
     if args.target_indices:
