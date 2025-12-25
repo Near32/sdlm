@@ -25,6 +25,9 @@ setup(
         #"torch>=1.9.0",
         #"transformers>=4.0.0",
         "dspy",
+        "sentence-transformers",
+        "bert-score",
+        "mauve-text",
     ],
     extras_require={
         "dev": [
