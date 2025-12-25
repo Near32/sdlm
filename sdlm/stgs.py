@@ -35,6 +35,7 @@ class STGS(nn.Module):
         dropout: float = 0.0,
         eps: float = 1e-12,
         device: str = "cpu",
+        tokenizer = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -50,6 +51,7 @@ class STGS(nn.Module):
         assert 0 <= self.dropout <= 1, "Dropout rate must be between 0 and 1"
         self.eps = eps
         self.device = device
+        self.tokenizer = tokenizer
 
         if self.learnable_temperature:
             if self.conditioning_dim < 1:

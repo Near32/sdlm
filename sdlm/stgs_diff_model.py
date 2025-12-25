@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Union
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from dataclasses import dataclass
+from typing import Optional, Dict, Union, Tuple
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 from torch import Tensor
 
@@ -74,7 +75,13 @@ class STGSOutput(CausalLMOutputWithPast):
         return getattr(self, key, default)
 
 
-class STGSDiffModel(PreTrainedModel):
+@dataclass
+class DifferentiableKVCache:
+    past_key_values: Tuple[Tuple[Tensor, Tensor], ...]
+    attention_mask: Tensor
+
+
+class STGSDiffModel(PreTrainedModel,GenerationMixin):
     """
     A wrapper for HuggingFace models that makes token generation differentiable
     using the Straight-Through Gumbel-Softmax trick.
@@ -84,23 +91,27 @@ class STGSDiffModel(PreTrainedModel):
         tokenizer: The corresponding tokenizer
         stgs_kwargs: Dictionary of STGS parameters
         device: Device to run the model on
+        attn_implementation: Attention implementation to use
     """
     def __init__(
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         stgs_kwargs: Dict[str, bool] = {
-            "stgs_hard": False,
+            "hard": False,
             "init_temperature": 1.0,
             "learnable_temperature": False,
             "hidden_state_conditioning": False,
+            "dropout": 0.0,
         },
         stgs_logits_generation: Optional[bool] = True,
         device: Optional[str] = None,
         strategy: Optional[str] = 'STGS', #or 'distributional'
+        attn_implementation: Optional[str] = "eager",
     ):
         # Initialize with the config from the base model
-        super().__init__(model.config)
+        model.config._attn_implementation = attn_implementation
+        super().__init__(model.config)        
         
         self.model = model
         self.tokenizer = tokenizer
@@ -119,6 +130,7 @@ class STGSDiffModel(PreTrainedModel):
             init_temperature=self.stgs_kwargs["temperature"],
             learnable_temperature=self.stgs_kwargs["learnable_temperature"],
             conditioning_dim=conditioning_dim,
+            dropout=self.stgs_kwargs['dropout'],
             device=self.device,
         )
         
@@ -139,6 +151,7 @@ class STGSDiffModel(PreTrainedModel):
         output_stgs_logits: Optional[bool] = False,
         output_past_key_values: bool = True,
         return_dict: bool = True,
+        eff_logits_generation: Optional[str] = None,
         **kwargs
     ) -> Union[STGSOutput, Tensor]:
         """
@@ -172,6 +185,13 @@ class STGSDiffModel(PreTrainedModel):
             assert inputs_embeds is None and input_ids is None
             inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight.detach())
         
+        # Override logits generation scheme:
+        if eff_logits_generation is None:
+            if self.stgs_logits_generation:
+                eff_logits_generation = 'stgs_logits'
+            else:
+                eff_logits_generation = 'normal_logits'
+            
         # Get model outputs
         kwargs.update(dict(
             use_cache=True, #output_past_key_values=output_past_key_values,
@@ -190,11 +210,16 @@ class STGSDiffModel(PreTrainedModel):
             **kwargs,
         )
        
+        # WARNING: logits are not normalized!
         logits = outputs.logits
+        #normalized_logits = F.softmax(logits, dim=-1)
         hidden_states = outputs.hidden_states if hasattr(outputs, 'hidden_states') else None
         
         # Apply STGS sampling
-        if self.stgs_logits_generation:
+        #if self.stgs_logits_generation:
+        if 'stgs' in eff_logits_generation:
+            # diff_one_hot is normalized, as either true one_hot or output of softmax (+/- backprop trick)
+            # stgs_logits is actually y_soft, i.e. the output of tempered softmax, which is normalized as well!!
             diff_output_ids, diff_one_hot, temperature, stgs_logits = self.stgs(
                 logits,
                 hidden_states=hidden_states
@@ -250,6 +275,7 @@ class STGSDiffModel(PreTrainedModel):
         self,
         input_ids: Optional[Tensor] = None,
         input_one_hots: Optional[Tensor] = None,
+        inputs_embeds: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         max_length: Optional[int] = None,
         max_new_tokens: Optional[int] = 256,
@@ -259,9 +285,12 @@ class STGSDiffModel(PreTrainedModel):
         output_diff_one_hots: Optional[bool] = True,
         output_normal_logits: Optional[bool] = False,
         output_stgs_logits: Optional[bool] = False,
-        num_beams: int = 1,
-        use_bpttoken: bool = False,
-        use_diff_tokens: bool = False,
+        num_beams: Optional[int] = 1,
+        use_bpttoken: Optional[bool] = False,
+        use_diff_tokens: Optional[bool] = False,
+        use_soft_embeds: Optional[bool] = True,
+        use_stgs_logits_generation: Optional[bool] = None,
+        return_cache: Optional[bool] = False,
         **kwargs
     ) -> Tensor:
         """
@@ -270,6 +299,7 @@ class STGSDiffModel(PreTrainedModel):
         Args:
             input_ids: Input token IDs (batch_size, seq_len)
             input_one_hots: Input one-hot representation (batch_size, seq_len, vocab_size)
+            inputs_embeds: Optional precomputed embeddings (takes precedence if provided)
             attention_mask: Attention mask (batch_size, seq_len)
             max_length: Maximum length of generated sequence
             temperature: Sampling temperature (overrides the initialized value if provided)
@@ -280,6 +310,9 @@ class STGSDiffModel(PreTrainedModel):
         Returns:
             Tensor of differentiable one-hot sampled tokens (batch_size, max_length)
         """
+        if return_cache and not kwargs.get('return_dict', False):
+            raise ValueError("return_cache=True requires return_dict=True")
+
         return_dict = kwargs.get('return_dict', False)
         use_bpttoken = use_bpttoken or self.use_bpttoken
 
@@ -293,35 +326,53 @@ class STGSDiffModel(PreTrainedModel):
         
         # Override temperature if provided
         original_temp = self.stgs.init_temperature
+        eff_temperature = temperature if temperature is not None else original_temp
         if temperature is not None:
             self.stgs.init_temperature = temperature
         
+        # Override logits generation if provided
+        use_stgs_logits_generation = use_stgs_logits_generation and self.stgs_logits_generation
+        eff_logits_generation = 'stgs_logits' if use_stgs_logits_generation else 'normal_logits' 
+
         # Prepare inputs
-        if input_ids is None and input_one_hots is None:
-            raise ValueError("At least one of input_ids or input_one_hots must be provided")
-        
-        if input_ids is not None:
+        if inputs_embeds is None and input_ids is None and input_one_hots is None:
+            raise ValueError("At least one of input_ids, input_one_hots, or inputs_embeds must be provided")
+
+        if inputs_embeds is not None:
+            batch_size = inputs_embeds.size(0)
+            input_len = inputs_embeds.size(1)
+        elif input_ids is not None:
             batch_size = input_ids.size(0)
             input_len = input_ids.size(1)
-        elif input_one_hots is not None:
+        else:
             batch_size = input_one_hots.size(0)
             input_len = input_one_hots.size(1)
-        
+
         with torch.no_grad():
             if attention_mask is None:
                 if input_ids is not None:
                     attention_mask = (input_ids != self.pad_token_id).long()
                 elif input_one_hots is not None:
                     attention_mask = (input_one_hots.sum(-1) != 0).long()
+                elif inputs_embeds is not None:
+                    attention_mask = torch.ones(
+                        (batch_size, input_len),
+                        device=self.device,
+                        dtype=torch.long,
+                    )
         
         # Get embedding layer
         embedding_layer = self.model.get_input_embeddings()
         
         # Generate inputs_embeds:
-        if input_ids is not None:
-            inputs_embeds = embedding_layer(input_ids)
-        elif input_one_hots is not None:
-            inputs_embeds = torch.matmul(input_one_hots, embedding_layer.weight.unsqueeze(0).detach())
+        if inputs_embeds is None:
+            if input_ids is not None:
+                inputs_embeds = embedding_layer(input_ids)
+            elif input_one_hots is not None:
+                inputs_embeds = torch.matmul(
+                    input_one_hots,
+                    embedding_layer.weight.unsqueeze(0).detach(),
+                )
         
         # Prepare output
         '''
@@ -344,14 +395,16 @@ class STGSDiffModel(PreTrainedModel):
             'loss':[],
         }
         all_one_hot = []
+        all_sampled_ids = []
         
         # Initial forward pass
-        if not self.stgs_logits_generation:
-            output_hidden_states=output_hidden_states and self.stgs_logits_generation
-            output_diff_tokens=output_diff_tokens and self.stgs_logits_generation
-            output_diff_one_hots=output_diff_one_hots and self.stgs_logits_generation
-            output_normal_logits=output_normal_logits or not(self.stgs_logits_generation)
-            output_stgs_logits=output_stgs_logits and self.stgs_logits_generation
+        #if not self.stgs_logits_generation:
+        if 'normal' in eff_logits_generation:
+            output_hidden_states=output_hidden_states and 'stgs' in eff_logits_generation
+            output_diff_tokens=output_diff_tokens and 'stgs' in eff_logits_generation
+            output_diff_one_hots=output_diff_one_hots and 'stgs' in eff_logits_generation
+            output_normal_logits=output_normal_logits or 'normal' in eff_logits_generation
+            output_stgs_logits=output_stgs_logits and 'stgs' in eff_logits_generation
         
         kwargs.update(dict(
             output_hidden_states=output_hidden_states,
@@ -359,6 +412,7 @@ class STGSDiffModel(PreTrainedModel):
             output_diff_one_hots=output_diff_one_hots,
             output_normal_logits=output_normal_logits,
             output_stgs_logits=output_stgs_logits,
+            eff_logits_generation=eff_logits_generation,
             output_past_key_values=True,
             use_cache=True,
             return_dict=True,
@@ -369,17 +423,26 @@ class STGSDiffModel(PreTrainedModel):
             attention_mask=attention_mask.detach(),
             **kwargs,
         )
-        
+        # WARNING: logits are unnormalized, but stgs_logits are normalized
+         
         if not use_diff_tokens:
             next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
             next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
         else:
-            next_token_logits = None
-
-        next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+            #next_token_logits = None
+            next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+            next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+        
         if next_token_logits is not None:
-            next_token_id = next_token_logits.argmax(-1)
+            #PREVIOUSLY: argmax:
+            # next_token_id = next_token_logits.argmax(-1)
+            # NOW: we sample with the temperature, because nothing asked for argmax:
+            next_token_tlogits = (next_token_logits/eff_temperature).to(torch.float32)
+            next_token_id = torch.distributions.categorical.Categorical(
+                logits=next_token_tlogits,
+            ).sample()
             next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+        
         if not use_diff_tokens:
             next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
         input_logits = outputs.input_logits
@@ -392,10 +455,18 @@ class STGSDiffModel(PreTrainedModel):
                 and ok != 'input_logits':
                     ov = ov[:,-1:]
                 all_dict[ok].append(ov)
-            if self.stgs_logits_generation:
+            #if self.stgs_logits_generation:
+            if 'stgs' in eff_logits_generation:
+                # Normalized
                 all_one_hot.append(next_token_stgs_one_hot)
+                all_sampled_ids.append(next_token_stgs_id)
             else:
-                all_one_hot.append(next_token_logits)
+                # Need normalization, with temperature
+                if use_soft_embeds:
+                    all_one_hot.append(F.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype))
+                else:
+                    all_one_hot.append(F.one_hot(next_token_id, num_classes=self.model.config.vocab_size).to(next_token_logits.dtype))
+                all_sampled_ids.append(next_token_id)
         past_key_values = outputs.past_key_values
 
         ##
@@ -406,14 +477,24 @@ class STGSDiffModel(PreTrainedModel):
         ##
 
         # Get embeddings for the next token
-        if self.stgs_logits_generation:
+        #if self.stgs_logits_generation:
+        if 'stgs' in eff_logits_generation:
             if use_diff_tokens:
                 next_token_embedding = embedding_layer(next_token_stgs_id.long())
             else:
                 next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
         else:
-            next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
-            next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
+            #next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
+            #next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
+            if use_soft_embeds:
+                next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype)
+                next_token_embedding = torch.matmul(next_token_logits_temp_distr, embedding_layer.weight.unsqueeze(0))
+            else:
+                #next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1)#.to(next_token_logits.dtype)
+                #sampled_next_token_id = torch.distributions.categorical.Categorical(
+                #    probs=next_token_logits_temp_distr,
+                #).sample()
+                next_token_embedding = embedding_layer(all_sampled_ids[-1].long())
         # batch_size x 1 x embedding_dim
 
         if not use_bpttoken:
@@ -429,6 +510,7 @@ class STGSDiffModel(PreTrainedModel):
         # Generation loop with BPTT
         kwargs.update(dict(
            output_hidden_states=output_hidden_states,
+           eff_logits_generation=eff_logits_generation,
            use_cache=True,
            return_dict=True,
         ))
@@ -446,18 +528,28 @@ class STGSDiffModel(PreTrainedModel):
                 past_key_values=past_key_values,
                 **kwargs
             )
+            # WARNING: logits are not normalized, but stgs_logits are normalized
+
             past_key_values = outputs.past_key_values
             
             # Get elements for ONLY THE NEXT TOKEN:
             if not use_diff_tokens:
                 next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
                 next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
-            next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+            else:
+                next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
             if next_token_logits is not None:
-                next_token_id = next_token_logits.argmax(-1)
+                # PREVIOUSLY:
+                # next_token_id = next_token_logits.argmax(-1)
+                # NOW: we sample with the temperature, because nothing asked for argmax:
+                next_token_tlogits = (next_token_logits/eff_temperature).to(torch.float32)
+                next_token_id = torch.distributions.categorical.Categorical(
+                    logits=next_token_tlogits,
+                ).sample()
                 next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
             else:
-                assert self.stgs_logits_generation
+                #assert self.stgs_logits_generation
+                assert 'stgs' in eff_logits_generation
             
             if not use_diff_tokens:
                 next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
@@ -469,21 +561,37 @@ class STGSDiffModel(PreTrainedModel):
                     and ok != 'input_logits':
                         ov = ov[:,-1:]
                     all_dict[ok].append(ov)
-                if self.stgs_logits_generation:
+                #if self.stgs_logits_generation:
+                if 'stgs' in eff_logits_generation:
+                    # Normalized
                     all_one_hot.append(next_token_stgs_one_hot)
+                    all_sampled_ids.append(next_token_stgs_id)
                 else:
-                    all_one_hot.append(next_token_logits)
+                    # Need normalization, with temperature
+                    if use_soft_embeds:
+                        all_one_hot.append(F.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype))
+                    else:
+                        all_one_hot.append(F.one_hot(next_token_id, num_classes=self.model.config.vocab_size).to(next_token_logits.dtype))
+                    all_sampled_ids.append(next_token_id)
 
             # Get embeddings for the next token
             #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
-            if self.stgs_logits_generation:
+            #if self.stgs_logits_generation:
+            if 'stgs' in eff_logits_generation:
                 if use_diff_tokens:
                     next_token_embedding = embedding_layer(next_token_stgs_id.long())
                 else:
                     next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
             else:
-                next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
-                next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
+                if use_soft_embeds:
+                    next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype)
+                    next_token_embedding = torch.matmul(next_token_logits_temp_distr, embedding_layer.weight.unsqueeze(0))
+                else:
+                    #next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1)#.to(next_token_logits.dtype)
+                    #sampled_next_token_id = torch.distributions.categorical.Categorical(
+                    #    probs=next_token_logits_temp_distr,
+                    #).sample()
+                    next_token_embedding = embedding_layer(all_sampled_ids[-1].long())
             # batch_size x 1 x embedding_dim
             
             if not use_bpttoken:
@@ -511,6 +619,13 @@ class STGSDiffModel(PreTrainedModel):
         gc.collect()
         ##
 
+        cache = None
+        if return_cache:
+            cache = DifferentiableKVCache(
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+            )
+
         if return_dict:
             output_dict: STGSOutput = STGSOutput(
                 input_logits=input_logits, #all_dict['input_logits'][-1],
@@ -519,19 +634,53 @@ class STGSDiffModel(PreTrainedModel):
                 stgs_logits=torch.cat(all_dict['stgs_logits'], dim=1) \
                 if output_stgs_logits else None,
                 sampled_diff_tokens=torch.cat(all_dict['sampled_diff_tokens'], dim=1) \
-                if output_diff_tokens else None,
+                if output_diff_tokens else torch.cat(all_sampled_ids, dim=1),
                 sampled_diff_one_hot=torch.cat(all_dict['sampled_diff_one_hot'], dim=1) \
-                if output_diff_one_hots else None,
+                if output_diff_one_hots else all_one_hot,
                 temperature=torch.stack(all_dict['temperature']) \
                 if self.stgs_logits_generation else None,
                 loss=torch.stack(all_dict['loss']) if len(all_dict['loss']) else None, 
             )
+            if return_cache:
+                output_dict.cache = cache
             #torch.cuda.empty_cache()
             #gc.collect()
             return output_dict
         #torch.cuda.empty_cache()
         #gc.collect()
         return all_one_hot
+
+    def continue_from_cache(
+        self,
+        cache: 'DifferentiableKVCache',
+        new_inputs_embeds: Tensor,
+        new_attention_mask: Optional[Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Continue a differentiable sequence by feeding new embeddings while
+        preserving gradient flow through the cached past_key_values.
+        """
+        if new_attention_mask is None:
+            new_attention_mask = torch.ones(
+                (cache.attention_mask.shape[0], new_inputs_embeds.shape[1]),
+                dtype=cache.attention_mask.dtype,
+                device=new_inputs_embeds.device,
+            )
+        extended_mask = torch.cat([cache.attention_mask, new_attention_mask], dim=-1)
+        outputs = self.forward(
+            inputs_embeds=new_inputs_embeds,
+            attention_mask=extended_mask,
+            past_key_values=cache.past_key_values,
+            use_cache=True,
+            return_dict=True,
+            **kwargs,
+        )
+        new_cache = DifferentiableKVCache(
+            past_key_values=outputs.past_key_values,
+            attention_mask=extended_mask,
+        )
+        return outputs, new_cache
     
     def to(self, device=None, *args, **kwargs):
         """Moves the model to the specified device."""
@@ -595,6 +744,8 @@ class STGSDiffModel(PreTrainedModel):
     def set_input_embeddings(self, value):
         """Set the input embeddings."""
         return self.model.set_input_embeddings(value)
+
+
 
 
 # Example usage:

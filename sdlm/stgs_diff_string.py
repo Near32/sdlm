@@ -122,7 +122,8 @@ class STGSDiffString(nn.Module):
             init_temperature=temperature,
             learnable_temperature=learnable_temperature,
             nbr_learnable_temperatures=self.logits.shape[1] if decouple_learnable_temperature else None, 
-            device=device
+            device=device,
+            tokenizer=self.tokenizer,
         )
 
         self.eff_temperature = 0.0
