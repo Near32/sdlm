@@ -87,7 +87,11 @@ class STGS(nn.Module):
             if self.conditioning_dim < 1:
                 # PREVIOUSLY:
                 #eff_temperature = F.softplus(self.temperature_param) + self.init_temperature
-                eff_temperature = self.eps + 1.0 / (F.softplus(self.temperature_param) + 1.0 / (self.eps + self.init_temperature))
+                #eff_temperature = self.eps + 1.0 / (F.softplus(self.temperature_param) + 1.0 / (self.eps + self.init_temperature))
+                # TANH:
+                eff_temperature = self.eps+self.init_temperature*(1+F.tanh(self.temperature_param))
+                # SIGMOID:
+                #eff_temperature = self.eps+self.init_temperature*F.sigmoid(self.temperature_param)
                 eff_temperature = eff_temperature.reshape(1, -1, 1)
                 batch_size = x.shape[0]
                 eff_temperature = eff_temperature.repeat(batch_size, 1, 1)
@@ -97,7 +101,11 @@ class STGS(nn.Module):
                 seq_len = x.shape[1]
                 last_hidden_state = hidden_states[-1][:,-1,:].reshape(batch_size, self.conditioning_dim).float()
                 self.inv_tau0 = 1.0/(self.eps+self.init_temperature)
-                eff_temperature = self.eps + 1. / (self.tau_fc(last_hidden_state)+self.inv_tau0).reshape(batch_size, -1, 1)
+                #eff_temperature = self.eps + 1. / (self.tau_fc(last_hidden_state)+self.inv_tau0).reshape(batch_size, -1, 1)
+                # TANH:
+                eff_temperature = self.eps+self.init_temperature*(1+F.tanh(self.tau_fc(last_hidden_state)))
+                # SIGMOID:
+                #eff_temperature = self.eps+self.init_temperature*F.sigmoid(self.tau_fc(last_hidden_state))
                 if self.nbr_learnable_temperatures==1 \
                 and self.nbr_learnable_temperatures != seq_len:
                     eff_temperature = eff_temperature.repeat(1, seq_len, 1)
