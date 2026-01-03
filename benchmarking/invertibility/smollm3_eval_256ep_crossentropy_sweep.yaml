@@ -30,11 +30,11 @@ parameters:
   stgs_grad_variance_samples:
     values: [5]
   stgs_grad_variance_period:
-    values: [50]
+    values: [25]
   stgs_grad_bias_samples:
     values: [5]
   stgs_grad_bias_period:
-    values: [100]
+    values: [50]
   stgs_grad_bias_reference_samples:
     values: [5]
   stgs_grad_bias_reference_use_baseline:
@@ -44,9 +44,9 @@ parameters:
   stgs_grad_bias_reference_baseline_beta:
     values: [0.9]
   epochs:
-    values: [1000]
+    values: [256]
   temperature:
-    values: [0.1, 1.0, 10, 100]
+    values: [1.0, 100]
   decouple_learnable_temperature:
     values: [True, False]
   learnable_temperature:
