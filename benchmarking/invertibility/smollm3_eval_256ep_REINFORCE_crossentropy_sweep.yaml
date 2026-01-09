@@ -1,0 +1,83 @@
+project: PromptOptimisationSTGS 
+entity: kevin-near32-org
+program: batch_optimize_main.py
+command:
+  - ${env}
+  - ./venv/bin/python
+  - ${program}
+  - ${args}
+method: grid
+metric:
+  name: loss
+  goal: minimize 
+parameters:
+  dataset_path:
+    values: ["./data/smollm3-3b-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+  output_dir:
+    values: ["results/smollm3_grid_sweep"]
+  model_name:
+    values: ["HuggingFaceTB/SmolLM3-3B-Base"]
+  model_precision:
+    values: ["full"]
+  gradient_checkpointing:
+    values: ["False"]
+  losses:
+    values: ["crossentropy"]
+  seq_len:
+    values: [10, 80]
+  gradient_estimator:
+    values: ['reinforce']
+  reinforce_reward_scale:
+    values: [1.0]
+  reinforce_use_baseline:
+    values: [True]
+  reinforce_baseline_beta:
+    values: [0.9]
+  stgs_grad_variance_samples:
+    values: [5]
+  stgs_grad_variance_period:
+    values: [0]
+  stgs_grad_bias_samples:
+    values: [5]
+  stgs_grad_bias_period:
+    values: [0]
+  stgs_grad_bias_reference_samples:
+    values: [0]
+  stgs_grad_bias_reference_use_baseline:
+    values: [True]
+  stgs_grad_bias_reference_reward_scale:
+    values: [1.0]
+  stgs_grad_bias_reference_baseline_beta:
+    values: [0.9]
+  epochs:
+    values: [256]
+  temperature:
+    values: [1.0]
+  decouple_learnable_temperature:
+    values: [False]
+  learnable_temperature:
+    values: [False]
+  stgs_hard:
+    values: [False]
+  bptt:
+    values: [False]
+  bptt_temperature:
+    values: [100]
+  bptt_learnable_temperature:
+    values: [False]
+  bptt_stgs_hard:
+    values: [False]
+  bptt_hidden_state_conditioning:
+    values: [False]
+  plot_every:
+    values: [100000]
+  seed:
+    values: [10, 20, 30, 40, 50]
+  batch_size:
+    values: [8]
+  learning_rate:
+    values: [1.0e-1]
+  num_workers:
+    values: [1]
+
+                   
