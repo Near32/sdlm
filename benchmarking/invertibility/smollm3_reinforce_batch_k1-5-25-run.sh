@@ -13,6 +13,8 @@ python -m ipdb -c c batch_optimize_main.py  \
 --reinforce_reward_scale=1.0 \
 --reinforce_use_baseline=True \
 --reinforce_baseline_beta=0.9 \
+--reinforce_grad_variance_samples=5 \
+--reinforce_grad_variance_period=25 \
 --stgs_grad_variance_samples=0 \
 --stgs_grad_variance_period=20 \
 --stgs_grad_bias_samples=0 \

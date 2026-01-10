@@ -33,6 +33,10 @@ parameters:
     values: [True]
   reinforce_baseline_beta:
     values: [0.9]
+  reinforce_grad_variance_samples:
+    values: [5]
+  reinforce_grad_variance_period:
+    values: [25]
   stgs_grad_variance_samples:
     values: [5]
   stgs_grad_variance_period:
