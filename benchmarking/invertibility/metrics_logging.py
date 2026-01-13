@@ -74,6 +74,7 @@ class MetricsLogger:
             #reinit=False,
             #reinit=True,
             resume=resume,
+            allow_val_change=True,
         )
         
         # Initialize tables
