@@ -22,10 +22,17 @@ classifiers = [
 dependencies = [
     "torch>=1.9.0",
     "transformers>=4.0.0",
+    "dspy",
+    "sentence-transformers",
+    "bert-score",
+    "mauve-text",
+    "matplotlib",
+    "wandb",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "ipdb",
     "pytest>=6.0",
     "black>=21.0",
     "isort>=5.0",

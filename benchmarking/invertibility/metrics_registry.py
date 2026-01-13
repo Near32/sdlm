@@ -298,12 +298,14 @@ def compute_mauve_score(generated_text, reference_text, model_name="gpt2-medium"
         logger.error(f"Error computing MAUVE score: {e}")
         return {"mauve_score": 0.0}
 
+'''
 registry.register(
     name="mauve",
     compute_fn=compute_mauve_score,
     requires=["generated_text", "reference_text"],
     group="distribution"
 )
+'''
 
 def compute_sentencebert_similarity(generated_text, reference_text, model_name="all-MiniLM-L6-v2", batch_size=32, device=None, **kwargs):
     """Compute SentenceBERT similarity score."""

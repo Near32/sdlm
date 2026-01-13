@@ -28,9 +28,12 @@ setup(
         "sentence-transformers",
         "bert-score",
         "mauve-text",
+        "matplotlib",
+        "wandb",
     ],
     extras_require={
         "dev": [
+            "ipdb",
             "pytest>=6.0",
             "black>=21.7b0",
             "isort>=5.9.0",
