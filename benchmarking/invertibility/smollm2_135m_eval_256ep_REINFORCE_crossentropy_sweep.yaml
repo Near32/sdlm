@@ -14,7 +14,7 @@ parameters:
   dataset_path:
     values: ["./data/smollm2-135m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
   output_dir:
-    values: ["results/smollm2_135m_grid_sweep"]
+    values: ["results/smollm2_135m_reinforce_grid_sweep"]
   model_name:
     values: ["HuggingFaceTB/SmolLM2-135M"]
   model_precision:

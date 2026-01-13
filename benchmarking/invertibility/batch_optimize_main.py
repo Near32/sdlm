@@ -38,19 +38,30 @@ def setup_model_and_tokenizer(model_name: str, device: str = 'cpu', model_precis
     """
     logger.info(f"Loading model: {model_name}")
     
-    # Load model and move to device
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    # Determine torch dtype based on precision
+    #model = AutoModelForCausalLM.from_pretrained(model_name)
+
+    torch_dtype = torch.float32
+    if model_precision == "half":
+        torch_dtype = torch.float16
+    
+    # Load model with memory optimizations
+    # device_map="auto" handles loading directly to GPU/offloading
+    # low_cpu_mem_usage=True prevents full loading into RAM
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True
+    )
+    
     model.eval()  # Set to evaluation mode (frozen)
 
     # Freeze model weights
     for param in model.parameters():
         param.requires_grad = False
 
-    model = model.to(device)
-    
-    # Convert to half precision if requested
-    if model_precision == "half":
-        model.half()
+    # Note: model.to(device) is not needed/recommended when using device_map="auto"
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
