@@ -6,6 +6,7 @@ import json
 import wandb
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
+import os
 
 logger = logging.getLogger("metrics_logging")
 
@@ -62,20 +63,38 @@ class MetricsLogger:
             
         name = name or f"run_{self.run_id}"
         
-        self.wandb_run = wandb.init(
-            project=self.wandb_project,
-            entity=self.wandb_entity,
-            name=name,
-            id=self.run_id,
-            group=group,
-            job_type=job_type,
-            config=config,
-            reinit='finish_previous', #True,
-            #reinit=False,
-            #reinit=True,
-            resume=resume,
-            allow_val_change=True,
-        )
+        is_sweep = os.getenv('WANDB_SWEEP_ID') is not None
+
+        if is_sweep:
+            self.wandb_run = wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                name=name,
+                id=self.run_id,
+                group=group,
+                job_type=job_type,
+                #config=config,
+                reinit='finish_previous', #True,
+                #reinit=False,
+                #reinit=True,
+                resume=resume,
+                allow_val_change=True,
+            )
+        else:
+            self.wandb_run = wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                name=name,
+                id=self.run_id,
+                group=group,
+                job_type=job_type,
+                config=config,
+                reinit='finish_previous', #True,
+                #reinit=False,
+                #reinit=True,
+                resume=resume,
+                allow_val_change=True,
+            )
         
         # Initialize tables
         self.summary_table = self._create_summary_table()

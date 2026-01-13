@@ -27,6 +27,7 @@ dependencies = [
     "bert-score",
     "mauve-text",
     "matplotlib",
+    "wandb",
 ]
 
 [project.optional-dependencies]

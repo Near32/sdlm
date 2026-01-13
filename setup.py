@@ -29,6 +29,7 @@ setup(
         "bert-score",
         "mauve-text",
         "matplotlib",
+        "wandb",
     ],
     extras_require={
         "dev": [
