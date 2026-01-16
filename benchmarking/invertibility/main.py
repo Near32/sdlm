@@ -256,7 +256,7 @@ class LossClass(object):
         lslhd = lslhd.log_softmax(dim=-1)
         lslhd = lslhd.gather(
             dim=-1, 
-            index=predictions.unsqueeze(-1),
+            index=predictions.unsqueeze(-1).int(),
         ).squeeze(-1)
         # (batch_size x seq_len)
         #lslhd = lsoftmaxed_pl.gather(dim=-1, index=tokenized_prediction.unsqueeze(-1)).squeeze(-1)
@@ -373,10 +373,13 @@ class LossClass(object):
             if 'promptPerplexity' in self.losses:
                 promptPLX = self.compute_perplexity(
                     all_logits=input_dict['prompt_logits'],
-                    predictions=input_dict['prompt_ids'],
+                    # PREVIOUSLY:
+                    #predictions=input_dict['prompt_ids'],
+                    # NOW: with argmax ids:
+                    predictions=input_dict['prompt_argmax_ids'],
                 )
             else:
-                promptPLX = torch.zeros(self.batch_size)
+                promptPLX = torch.zeros(self.batch_size).to(loss.device)
 
             if 'completionPerplexity' in self.losses:
                 complPLX = self.compute_perplexity(
@@ -384,7 +387,7 @@ class LossClass(object):
                     predictions=input_dict['completion_ids'],
                 )
             else:
-                complPLX = torch.zeros(self.batch_size)
+                complPLX = torch.zeros(self.batch_size).to(loss.device)
             
             promptLambda = self.kwargs['promptLambda']
             complLambda = self.kwargs['complLambda']
