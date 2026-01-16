@@ -3,7 +3,7 @@ projects:
 
 cache_dir: 'wandb_cache'
 
-output_dir: "SmolLM3-base-3B-STGSvsGS-ablation/bias-PL80"
+output_dir: "SmolLM2-135M-STGSvsGS-ablation/Var-PL80"
 output_format: "png"
 dpi: 300
 
@@ -25,19 +25,19 @@ Kolmogorov-Smirnov-kwargs:
 
 
 figures:
-  - name: "Gradient-Max-Abs-Bias"
+  - name: "Gradient-Max-Variance"
     step_column: "_step"
     metrics:
-      - "stgs_grad_bias_abs_max"
+      - "stgs_grad_variance_max"
     
     barplot_config:
       enabled: true
       figsize: [6,4]
       capsize: 5
-      title: "Max Gradient Abs Bias (Mean +/- Std.Err. - PL=80)"
+      title: "Max Gradient Variance (Mean +/- Std.Err. - PL=80)"
       xtick_rotation: 20
       log_scale: true
-    
+
     lineplot_config:
       enabled: false
       title: "KeyCorridor-S6R3"
@@ -53,54 +53,54 @@ figures:
     
     smoothing:
       method: "running_average"
-      window_size: 32
+      window_size: 2
       center: True
       min_periods: 1
 
     groups:
-      - name: "GS(Tau=100)"
+      - name: "GS(Tau=100 - 2 seeds)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "vuoqjsyz"
-          - "alx5u7ca"
-          - "9y20gy3u"
-          - "1x5rwol3"
-          - "ae1flap9"
+          - "1utbi1zz"
+          - "yo78ohr7"
+            #- "9y20gy3u"
+            #- "1x5rwol3"
+            #- "ae1flap9"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(Tau=1)"
+      - name: "GS(Tau=1 - 4 seeds)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "ty1poqp9"
-          - "q9hqax7h"
-          - "ts0itlbt"
-          - "953k2lew"
-          - "89x2nr2x"
+          - "yo78ohr7"
+          - "74u1l7w0"
+          - "9o54dzqi"
+          - "r9t28s8n"
+            #- "89x2nr2x"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
    
-      - name: "STGS(Tau=100)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "26gl5iuw"
-          - "iv0lf4qi"
-          - "fxu73qhy"
-          - "vx1tb9op"
-          - "36k2705p"
+      #- name: "STGS(Tau=100)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #   - "26gl5iuw"
+      #    - "iv0lf4qi"
+      #    - "fxu73qhy"
+      #    - "vx1tb9op"
+      #    - "36k2705p"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "STGS(Tau=1 - 4 seeds)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "r9gx0kbi"
-          - "de37uya2"
-          - "wu7al5ow"
-          - "savd1bn2"
+      #- name: "STGS(Tau=1 - 4 seeds)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "r9gx0kbi"
+      #    - "de37uya2"
+      #    - "wu7al5ow"
+      #    - "savd1bn2"
         #  - ""
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
@@ -109,46 +109,46 @@ figures:
       - name: "GS(LTau=100)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "md189ns4"
-          - "7q7yh7a0"
-          - "209trf20"
-          - "l2vpn5bf"
-          - "b9f2x6qf"
+          - "p3ymxa6s"
+          - "gkbj8ddh"
+          - "ih85hdt7"
+          - "2aut1lwo"
+          - "ro4o68zw"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(LTau=1)"
+      - name: "GS(LTau=1 - 4 seeds)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "xvr7e9o1"
-          - "27pfyobh"
-          - "hmg6eb6h"
-          - "p3l77ip9"
-          - "3aza8swx"
+          - "8dqvoghq"
+          - "ln03i3cu"
+          - "euds61ar"
+          - "aetmlw6l"
+            #- "3aza8swx"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "STGS(LTau=100 - 4 seeds)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "afa5frpm"
-          - "d388onbv"
-          - "xbsjdidb"
-          - "9c5zfbaz"
+      #- name: "STGS(LTau=100 - 4 seeds)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "afa5frpm"
+      #    - "d388onbv"
+      #    - "xbsjdidb"
+      #    - "9c5zfbaz"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps"
      
-      - name: "STGS(LTau=1)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "7kaw3s7t"
-          - "cy5qg5bw"
-          - "10bkzfxv"
-          - "g9abwgn2"
-          - "jssl36si"
+      #- name: "STGS(LTau=1)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "7kaw3s7t"
+      #    - "cy5qg5bw"
+      #    - "10bkzfxv"
+      #    - "g9abwgn2"
+      #    - "jssl36si"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
@@ -156,11 +156,11 @@ figures:
       - name: "GS(DLTau=100)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "rmsbs6px"
-          - "9gk8puja"
-          - "01zf1re9"
-          - "vylmb7ht"
-          - "n0loxigz"
+          - "35c80euk"
+          - "vxsnb3ov"
+          - "3tfvm5wa"
+          - "pw9jlvxf"
+          - "l335g92v"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
@@ -168,49 +168,50 @@ figures:
       - name: "GS(DLTau=1)"
         project: "near32/PromptOptimisationSTGS"
         run_ids:
-          - "j944p4mj"
-          - "tvtatkws"
-          - "193rbnvw"
-          - "2ij5b0ev"
-          - "f64ytwfu"
+          - "sbjxgre3"
+          - "ncojjl0g"
+          - "99vnz3ko"
+          - "t79u7mhd"
+          - "qzqqxf93"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "STGS(DLTau=100)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "ijajrpxx"
-          - "sw5vc7ct"
-          - "bh8mdwmi"
-          - "ikwu0xpx"
-          - "s812d41w"
-        #metric_aliases:
-        #  "mean_episode_return": "rollout/ep_info_rew_mean"
-        #  "obs_count": "time/total_timesteps"
-      
-      - name: "STGS(DLTau=1)"
-        project: "near32/PromptOptimisationSTGS"
-        run_ids:
-          - "1ipm9764"
-          - "ekulrwie"
-          - "h3qv2x61"
-          - "ef5as961"
-          - "kxrnqx7d"
-        #metric_aliases:
-        #  "mean_episode_return": "rollout/ep_info_rew_mean"
-        #  "obs_count": "time/total_timesteps"
-      
-      #- name: "REINFORCE"
+      #- name: "STGS(DLTau=100)"
       #  project: "near32/PromptOptimisationSTGS"
       #  run_ids:
-      #   - "R:x95xqqu8"
-      #    - "R:wi8sd0gv"
-      #    - "R:1bb59fkf"
-      #    - "R:ylqrgh3o"
-      #    - "R:bcun6f7i"
-      #  metric_aliases:
-      #    "sdlm_grad_variance_max": "stgs_grad_bias_reference_grad_variance_max"
+      #    - "ijajrpxx"
+      #    - "sw5vc7ct"
+      #    - "bh8mdwmi"
+      #    - "ikwu0xpx"
+      #    - "s812d41w"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps"
       
-          
+      #- name: "STGS(DLTau=1)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "1ipm9764"
+      #    - "ekulrwie"
+      #    - "h3qv2x61"
+      #    - "ef5as961"
+      #    - "kxrnqx7d"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps"
+      
+      - name: "REINFORCE"
+        project: "near32/PromptOptimisationSTGS"
+        run_ids:
+          - "ztx41ie4"
+          - "w751sn0n"
+          - "544wtz7z"
+          - "xr2l3gbu"
+          - "8in4cwq1"
+        metric_aliases:
+          "stgs_grad_variance_max": "reinforce_grad_variance_max"
+      
+       
+    
       

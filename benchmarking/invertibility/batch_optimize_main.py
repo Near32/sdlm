@@ -169,6 +169,10 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         job_type="single_target_optimization"
     )
     
+    if config['decouple_learnable_temperature'] \
+    and not config['learnable_temperature']:
+        raise ValueError("decouple_learnable_temperature requires learnable_temperature")
+
     # Tokenize target for later comparison
     target_tokens = tokenizer(target_text, return_tensors="pt").input_ids[0].cpu().tolist()
     
@@ -644,9 +648,9 @@ def parse_args():
 def main():
     """Main entry point."""
     args = parse_args()
-    if args.decouple_learnable_temperature \
-    and not args.learnable_temperature:
-        raise ValueError("decouple_learnable_temperature requires learnable_temperature")
+    #if args.decouple_learnable_temperature \
+    #and not args.learnable_temperature:
+    #    raise ValueError("decouple_learnable_temperature requires learnable_temperature")
 
     # Parse target indices if provided
     target_indices = None
