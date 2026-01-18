@@ -369,31 +369,30 @@ class LossClass(object):
             losses_dict[f"embLayer{loss_type}"] = loss
             sumloss += loss
 
+        promptPLX = self.compute_perplexity(
+            all_logits=input_dict['prompt_logits'],
+            # PREVIOUSLY:
+            #predictions=input_dict['prompt_ids'],
+            # NOW: with argmax ids:
+            predictions=input_dict['prompt_argmax_ids'],
+        )
+        losses_dict[f"PLX-prompt"] = promptPLX.mean()
+        complPLX = self.compute_perplexity(
+            all_logits=input_dict['generated_logits'],
+            predictions=input_dict['completion_ids'],
+        )
+        losses_dict[f"PLX-completion"] = complPLX.mean()
+        
         if 'perplexity' in self.losses.lower():
-            if 'promptPerplexity' in self.losses:
-                promptPLX = self.compute_perplexity(
-                    all_logits=input_dict['prompt_logits'],
-                    # PREVIOUSLY:
-                    #predictions=input_dict['prompt_ids'],
-                    # NOW: with argmax ids:
-                    predictions=input_dict['prompt_argmax_ids'],
-                )
-            else:
+            if 'promptPerplexity' not in self.losses:
                 promptPLX = torch.zeros(self.batch_size).to(loss.device)
 
-            if 'completionPerplexity' in self.losses:
-                complPLX = self.compute_perplexity(
-                    all_logits=input_dict['generated_logits'],
-                    predictions=input_dict['completion_ids'],
-                )
-            else:
+            if 'completionPerplexity' not in self.losses:
                 complPLX = torch.zeros(self.batch_size).to(loss.device)
             
             promptLambda = self.kwargs['promptLambda']
             complLambda = self.kwargs['complLambda']
             loss = (complLambda*complPLX + promptLambda*promptPLX).mean()
-            losses_dict[f"PLX-prompt"] = promptPLX.mean()
-            losses_dict[f"PLX-completion"] = complPLX.mean()
             sumloss += loss
 
         losses_dict['sumloss'] = sumloss

@@ -145,6 +145,7 @@ def reinforce_forward_pass(
             "generated_hidden_states": all_hidden_states,
             "completion_ids": completion_ids,
             "prompt_ids": message_ids,
+            "prompt_argmax_ids": message_logits.argmax(dim=-1),
             "prompt_logits": prompt_logits,
         },
     )
