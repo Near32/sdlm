@@ -19,6 +19,8 @@ class MetricsAggregator:
         """Initialize the metrics aggregator."""
         self.metrics_by_k = defaultdict(lambda: defaultdict(list))
         self.all_metrics = defaultdict(list)
+        # For per-epoch metrics: epoch -> k_value -> list of lcs_ratio values
+        self.lcs_ratio_by_epoch_by_k = defaultdict(lambda: defaultdict(list))
         
     def add_sample(self, metrics: Dict[str, Any], k_value: Optional[int] = None):
         """
@@ -54,7 +56,32 @@ class MetricsAggregator:
             assert len(batch_metrics) == len(k_values), "Length of metrics and k_values must match"
             for metrics, k in zip(batch_metrics, k_values):
                 self.add_sample(metrics, k)
-    
+
+    def add_epoch_metrics(self, lcs_ratio_history: List[float], k_value: int):
+        """
+        Add per-epoch lcs_ratio values for a sample.
+
+        Args:
+            lcs_ratio_history: List of lcs_ratio values, one per epoch
+            k_value: The k value for this sample
+        """
+        for epoch, lcs_ratio in enumerate(lcs_ratio_history):
+            self.lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
+
+    def compute_avg_lcs_ratio_by_epoch_by_k(self) -> Dict[int, Dict[int, float]]:
+        """
+        Compute avg_lcs_ratio for each (epoch, k_value) pair.
+
+        Returns:
+            Dictionary mapping epoch -> k_value -> avg_lcs_ratio
+        """
+        result = {}
+        for epoch, k_dict in self.lcs_ratio_by_epoch_by_k.items():
+            result[epoch] = {}
+            for k_value, values in k_dict.items():
+                result[epoch][k_value] = sum(values) / len(values) if values else 0.0
+        return result
+
     def compute_average(self, metric_name: str) -> float:
         """
         Compute the average value for a specific metric.
@@ -243,7 +270,8 @@ class MetricsAggregator:
             "auc": self.compute_all_auc_metrics(),
             "k_values": self.get_k_values(),
             "metric_names": self.get_metric_names(),
-            "total_samples": self.get_sample_count()
+            "total_samples": self.get_sample_count(),
+            "avg_lcs_ratio_by_epoch_by_k": self.compute_avg_lcs_ratio_by_epoch_by_k(),
         }
-        
+
         return summary

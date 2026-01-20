@@ -21,6 +21,7 @@ from gradient_estimators import (
     estimate_stgs_gradient_bias,
     estimate_reinforce_gradient_variance,
 )
+from metrics_registry import lcs_length
 
 
 def setup_model_and_tokenizer(model_name="HuggingFaceM4/tiny-random-LlamaForCausalLM",device='cpu',model_precision='full'):
@@ -711,6 +712,7 @@ def optimize_inputs(
 
     # Training loop
     losses = []
+    lcs_ratio_history = []
     pbar = tqdm(range(epochs))
     for epoch in pbar:
         optimizer.zero_grad()
@@ -914,6 +916,13 @@ def optimize_inputs(
         generated_output_str = tokenizer.decode(table_generated_output_ids[0], skip_special_tokens=False)
 
         generated_tokens = table_generated_output_ids[0].cpu().tolist()
+        target_tokens_list = target_tokens[0].cpu().tolist()
+
+        # Compute LCS ratio between generated output and target
+        lcs = lcs_length(generated_tokens, target_tokens_list)
+        lcs_ratio = lcs / len(target_tokens_list) if len(target_tokens_list) > 0 else 0.0
+        wandb_log['lcs_ratio'] = lcs_ratio
+        lcs_ratio_history.append(lcs_ratio)
 
         metrics_dict = token_overlap_metric.measure(
             prompt_tokens=learnable_input_ids,
@@ -974,7 +983,7 @@ def optimize_inputs(
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
 
-    return generated_tokens, learnable_inputs, losses
+    return generated_tokens, learnable_inputs, losses, lcs_ratio_history
 
 
 def str2bool(instr):
@@ -1076,7 +1085,7 @@ def main():
     torch.manual_seed(config["seed"])
     # Optimize inputs
     print(f"Starting optimization with target: {args.target_text}")
-    generated_tokens, optimized_inputs, losses = optimize_inputs(
+    generated_tokens, optimized_inputs, losses, lcs_ratio_history = optimize_inputs(
         model,
         tokenizer,
         losses=config['losses'],

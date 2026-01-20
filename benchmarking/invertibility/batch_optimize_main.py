@@ -177,7 +177,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
     target_tokens = tokenizer(target_text, return_tensors="pt").input_ids[0].cpu().tolist()
     
     # Optimize inputs for this target
-    generated_tokens, optimized_inputs, losses = optimize_inputs(
+    generated_tokens, optimized_inputs, losses, lcs_ratio_history = optimize_inputs(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -248,7 +248,8 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         "generated_text": evaluation_metrics["generated_text"],
         "evaluation": evaluation_metrics,
         "final_loss": float(losses[-1]),
-        "loss_history": [float(loss) for loss in losses]
+        "loss_history": [float(loss) for loss in losses],
+        "lcs_ratio_history": lcs_ratio_history,
     }
     
     # Save results to file
@@ -305,10 +306,15 @@ def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, 
             metric_groups=metric_groups
         )
         results[target["id"]] = result
-        
+
         # Add metrics to aggregator
         metrics_aggregator.add_sample(result["evaluation"], k_value=target["k_target"])
-    
+        # Add per-epoch lcs_ratio history to aggregator
+        metrics_aggregator.add_epoch_metrics(
+            lcs_ratio_history=result["lcs_ratio_history"],
+            k_value=target["k_target"]
+        )
+
     return results
 
 def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, config: Dict[str, Any], 
@@ -355,9 +361,14 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
             try:
                 result = future.result()
                 results[target["id"]] = result
-                
+
                 # Add metrics to aggregator
                 metrics_aggregator.add_sample(result["evaluation"], k_value=target["k_target"])
+                # Add per-epoch lcs_ratio history to aggregator
+                metrics_aggregator.add_epoch_metrics(
+                    lcs_ratio_history=result["lcs_ratio_history"],
+                    k_value=target["k_target"]
+                )
 
             except Exception as exc:
                 logger.error(f"Target {target['id']} generated an exception: {exc}")
@@ -465,10 +476,21 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
     
     # Get the complete summary
     summary = metrics_aggregator.get_summary()
-    
+
     # Log the summary
     metrics_logger.log_summary(summary)
-    
+
+    # Log per-epoch avg_lcs_ratio by k-value to W&B
+    avg_lcs_by_epoch_k = summary.get("avg_lcs_ratio_by_epoch_by_k", {})
+    for epoch, k_dict in avg_lcs_by_epoch_k.items():
+        for k_value, avg_lcs in k_dict.items():
+            log_entry = {
+                "epoch": epoch,
+                "k": k_value,
+                "avg_lcs_ratio": avg_lcs,
+            }
+            metrics_logger.log_metrics(log_entry)
+
     # Add results to summary
     summary["results"] = results
     
