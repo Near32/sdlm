@@ -12,7 +12,7 @@ metric:
   goal: minimize 
 parameters:
   dataset_path:
-    values: ["./data/qwen3_600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+    values: ["./data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
   output_dir:
     values: ["results/qwen3_600m_2048ep_grid_sweep"]
   model_name:
