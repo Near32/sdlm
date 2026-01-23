@@ -5,6 +5,7 @@ python -m ipdb -c c batch_optimize_main.py  \
 --dataset_path="data/smollm2-135m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
 --output_dir="results/smollm2-135m-base_STGS+Soft+LearnTau+SoftBPTT+LearnBTau+BS=16+LR=1e-1+SEED=2_test_k1-5-25-run" \
 --learning_rate=1.0e-1  \
+--teacher_forcing=False \
 --epochs 256 \
 --model_precision full \
 --gradient_checkpointing=False \
@@ -28,7 +29,7 @@ python -m ipdb -c c batch_optimize_main.py  \
 --temperature=100.0 \
 --bptt=False \
 --bptt_stgs_hard=False \
---bptt_learnable_temperature=True \
+--bptt_learnable_temperature=False \
 --bptt_hidden_state_conditioning=False \
 --bptt_temperature=100.0 
 

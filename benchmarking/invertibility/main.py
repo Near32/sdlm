@@ -495,11 +495,94 @@ def optimize_inputs(
     filter_vocab=False,
     max_gradient_norm=0.0,
     batch_size=1,
+    # Method selection (NEW)
+    method="stgs",  # "stgs", "reinforce", "soda", "gcg"
+    # Backend selection for SODA/GCG (NEW)
+    baseline_backend="hf",  # "hf" or "tl"
+    baseline_model_name=None,  # Model name for transformer_lens backend
+    # SODA-specific parameters (NEW)
+    soda_decay_rate=0.9,
+    soda_betas=(0.9, 0.995),
+    soda_reset_epoch=50,
+    soda_reinit_epoch=1500,
+    soda_reg_weight=None,
+    soda_bias_correction=False,
+    soda_init_strategy="zeros",
+    soda_init_std=0.05,
+    # GCG-specific parameters (NEW)
+    gcg_num_candidates=704,
+    gcg_top_k=128,
+    gcg_num_mutations=1,
+    gcg_pos_choice="uniform",
+    gcg_token_choice="uniform",
+    gcg_init_strategy="zeros",
+    # Teacher forcing (for faster training)
+    teacher_forcing=False,
     kwargs={},
 ):
     """
-    Optimize input embeddings to make the frozen model produce the target output as a completion
+    Optimize input embeddings to make the frozen model produce the target output as a completion.
+
+    Args:
+        method: Optimization method - "stgs", "reinforce", "soda", or "gcg"
+        baseline_backend: Backend for SODA/GCG - "hf" (HuggingFace) or "tl" (transformer_lens)
+        baseline_model_name: Model name for transformer_lens backend (defaults to model's name)
+        soda_*: SODA-specific parameters
+        gcg_*: GCG-specific parameters
+        ... (other parameters documented below)
     """
+    # Dispatch to SODA/GCG if requested
+    method_lower = method.lower() if method else "stgs"
+
+    if method_lower == "soda":
+        from baselines.soda import soda_optimize_inputs
+        return soda_optimize_inputs(
+            model=model,
+            model_name=baseline_model_name,
+            tokenizer=tokenizer,
+            device=device,
+            target_text=target_text,
+            backend=baseline_backend,
+            batching="single",  # batch_optimize_main handles iteration
+            seq_len=seq_len,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            temperature=temperature,
+            decay_rate=soda_decay_rate,
+            betas=soda_betas,
+            reset_epoch=soda_reset_epoch,
+            reinit_epoch=soda_reinit_epoch,
+            reg_weight=soda_reg_weight,
+            bias_correction=soda_bias_correction,
+            init_strategy=soda_init_strategy,
+            init_std=soda_init_std,
+            batch_size=batch_size,
+            kwargs=kwargs,
+        )
+
+    elif method_lower == "gcg":
+        from baselines.gcg import gcg_optimize_inputs
+        return gcg_optimize_inputs(
+            model=model,
+            model_name=baseline_model_name,
+            tokenizer=tokenizer,
+            device=device,
+            target_text=target_text,
+            backend=baseline_backend,
+            batching="single",
+            seq_len=seq_len,
+            epochs=epochs,
+            num_candidates=gcg_num_candidates,
+            top_k=gcg_top_k,
+            num_mutations=gcg_num_mutations,
+            pos_choice=gcg_pos_choice,
+            token_choice=gcg_token_choice,
+            init_strategy=gcg_init_strategy,
+            batch_size=batch_size,
+            kwargs=kwargs,
+        )
+
+    # Continue with STGS/REINFORCE for other methods
 
     # Enabling Gradient checkpointing:
     if kwargs.get("gradient_checkpointing", False):
@@ -580,6 +663,7 @@ def optimize_inputs(
         "reinforce_reward_scale": reinforce_reward_scale,
         "reinforce_use_baseline": reinforce_use_baseline,
         "reinforce_baseline_beta": reinforce_baseline_beta,
+        "teacher_forcing": teacher_forcing,
     })
     wandb_table = wandb.Table(columns=[
         "epoch", 
@@ -689,6 +773,8 @@ def optimize_inputs(
             bptt=bptt,
             bptt_stgs=bptt_stgs_module,
             filter_vocab=filter_vocab,
+            teacher_forcing=teacher_forcing,
+            target_tokens=target_tokens_mapped,
         )
     else:
         forward_pass_callable = partial(

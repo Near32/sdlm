@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from .base import ForwardPassResult
 from sdlm import STGS
 
+logger = logging.getLogger(__name__)
+
 class STGS_standalone(nn.Module):
     def __init__(
         self,
@@ -100,6 +102,8 @@ def stgs_forward_pass(
     bptt: bool,
     bptt_stgs: Optional[STGS],
     filter_vocab: bool,
+    teacher_forcing: bool = False,
+    target_tokens: Optional[torch.Tensor] = None,
 ) -> ForwardPassResult:
     message_logits = learnable_inputs.repeat(batch_size, 1, 1)
     if model_precision == "half":
@@ -116,6 +120,78 @@ def stgs_forward_pass(
     else:
         current_embeds = input_embeddings
 
+    seq_len = current_embeds.shape[1]
+    bptt_eff_temperature = torch.tensor(0.0, device=device)
+
+    if teacher_forcing and target_tokens is not None:
+        # FAST PATH: Single forward pass with teacher forcing (like SODA)
+        # This processes all positions in one call instead of autoregressive loop
+        if bptt:
+            logger.warning("Teacher forcing is incompatible with bptt=True. Falling back to autoregressive.")
+        else:
+            # Get target token embeddings (shifted by 1 for next-token prediction)
+            # target_tokens shape: (batch_size, target_length)
+            # We need embeddings for positions 0 to target_length-2 to predict 1 to target_length-1
+            target_embeds = embedding_weights_subset[target_tokens[:, :-1]]
+            # Concatenate prompt embeddings with target embeddings
+            combined_embeds = torch.cat([current_embeds, target_embeds], dim=1)
+
+            # Single forward pass for all positions
+            outputs = model(
+                inputs_embeds=combined_embeds,
+                output_hidden_states=True,
+                use_cache=False,  # No need for KV cache in teacher forcing
+                return_dict=True,
+            )
+
+            logits = outputs.logits
+            # Get prompt logits (positions 0 to seq_len-1 predict positions 1 to seq_len)
+            prompt_logits = logits[:, :seq_len, :]
+            prompt_logits = prompt_logits[..., allowed_tokens]
+
+            # Get generated logits for target prediction positions
+            # Position seq_len-1 predicts first target token, position seq_len predicts second, etc.
+            generated_logits = logits[:, seq_len-1:seq_len-1+target_length, :]
+            generated_logits = generated_logits[..., allowed_tokens]
+
+            # Get completion IDs from argmax of generated logits
+            completion_ids = generated_logits.argmax(dim=-1)
+
+            # Build hidden states list for loss computation (one entry per target position)
+            all_hidden_states = [
+                tuple(hs[:, seq_len-1+i:seq_len+i, :] for hs in outputs.hidden_states)
+                for i in range(target_length)
+            ]
+
+            losses_dict = loss_instance.compute_loss(
+                input_dict={
+                    "generated_logits": generated_logits,
+                    "generated_hidden_states": all_hidden_states,
+                    "completion_ids": completion_ids,
+                    "prompt_ids": message_ids,
+                    "prompt_argmax_ids": message_logits.argmax(dim=-1),
+                    "prompt_logits": prompt_logits,
+                },
+            )
+            loss = losses_dict["sumloss"]
+
+            estimator_state: Dict[str, Optional[torch.Tensor]] = {
+                "eff_temperature": eff_temperature,
+                "bptt_eff_temperature": bptt_eff_temperature,
+            }
+
+            return ForwardPassResult(
+                loss=loss,
+                backward_loss=loss,
+                losses_dict=losses_dict,
+                generated_logits=generated_logits,
+                prompt_ids=message_ids,
+                prompt_logits=prompt_logits,
+                completion_ids=completion_ids,
+                estimator_state=estimator_state,
+            )
+
+    # SLOW PATH: Existing autoregressive generation (unchanged)
     outputs = model(
         inputs_embeds=current_embeds,
         output_hidden_states=True,
@@ -134,7 +210,6 @@ def stgs_forward_pass(
 
     completion_ids = []
     current_length = 1
-    bptt_eff_temperature = torch.tensor(0.0, device=device)
     while current_length < target_length:
         if bptt:
             assert bptt_stgs is not None, "BPTT requested but no STGS module provided for it."

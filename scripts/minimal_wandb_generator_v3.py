@@ -1383,13 +1383,14 @@ class MinimalWandBGenerator:
         return stats
 
     def _create_line_plot(
-        self, 
-        stats_data: pd.DataFrame, 
-        metric: str, 
-        plot_config: Dict[str, Any], 
+        self,
+        stats_data: pd.DataFrame,
+        metric: str,
+        plot_config: Dict[str, Any],
         step_column: str = '_step',
         group_order: list[str]=None,
         group_axis: Optional[str]=None,
+        group_colors: Optional[Dict[str, str]] = None,
     ) -> plt.Figure:
         """Create line plot with mean ± standard error."""
         fig, ax = plt.subplots(figsize=plot_config.get('figsize', (10, 6)))
@@ -1426,9 +1427,12 @@ class MinimalWandBGenerator:
             y = group_data['mean']
             yerr = group_data['stderr']
             
-            # Get color from configured palette - index matches config order
-            color_idx = i % len(self.color_palette)
-            color = self.color_palette[color_idx]
+            # Use custom color if specified, otherwise fall back to palette
+            if group_colors and group in group_colors:
+                color = group_colors[group]
+            else:
+                color_idx = i % len(self.color_palette)
+                color = self.color_palette[color_idx]
             
             ax.plot(x, y, label=group, linewidth=2, alpha=0.8, color=color)
             ax.fill_between(x, y - yerr, y + yerr, alpha=0.5, color=color)
@@ -1459,6 +1463,7 @@ class MinimalWandBGenerator:
         step_column: str,
         group_order: list[str] = None,
         group_axis: Optional[str] = None,
+        group_colors: Optional[Dict[str, str]] = None,
     ) -> plt.Figure:
         """Plot the number of contributing runs per datapoint for each group."""
         fig, ax = plt.subplots(figsize=plot_config.get('figsize', (10, 6)))
@@ -1488,9 +1493,13 @@ class MinimalWandBGenerator:
             group_data = stats_data[stats_data['group'] == group].sort_values(step_column)
             if group_data.empty:
                 continue
-            
-            color_idx = i % len(self.color_palette)
-            color = self.color_palette[color_idx]
+
+            # Use custom color if specified, otherwise fall back to palette
+            if group_colors and group in group_colors:
+                color = group_colors[group]
+            else:
+                color_idx = i % len(self.color_palette)
+                color = self.color_palette[color_idx]
             linestyle = line_styles[i % len(line_styles)]
             marker = markers[i % len(markers)]
             adjusted_counts = group_data['count'] + i * value_offset
@@ -1596,6 +1605,7 @@ class MinimalWandBGenerator:
         metric: str,
         plot_config: Dict[str, Any],
         group_order: Optional[List[str]] = None,
+        group_colors: Optional[Dict[str, str]] = None,
     ) -> Optional[plt.Figure]:
         """Create bar plot of mean ± standard error across groups without synchronization."""
         required_cols = {'group', metric}
@@ -1632,7 +1642,13 @@ class MinimalWandBGenerator:
 
         fig, ax = plt.subplots(figsize=plot_config.get('figsize', (8, 5)))
         positions = np.arange(len(ordered))
-        colors = [self.color_palette[i % len(self.color_palette)] for i in range(len(ordered))]
+        # Use custom colors if specified, otherwise fall back to palette
+        if group_colors is None:
+            group_colors = {}
+        colors = [
+            group_colors.get(g, self.color_palette[i % len(self.color_palette)])
+            for i, g in enumerate(ordered)
+        ]
 
         ax.bar(
             positions,
@@ -1648,8 +1664,12 @@ class MinimalWandBGenerator:
         if plot_config.get('log_scale', False):
             ax.set_yscale('log')
 
+        if 'ylim' in plot_config:
+            ax.set_ylim(plot_config['ylim'])
+
         ax.set_xticks(positions)
         ax.set_xticklabels(ordered, rotation=plot_config.get('xtick_rotation', 30), ha='right')
+        ax.set_xlabel(plot_config.get('xlabel', ''))
         ax.set_ylabel(plot_config.get('ylabel', metric))
         ax.set_title(plot_config.get('title', f"{metric} — mean ± SE"))
         ax.grid(True, axis='y', alpha=0.3)
@@ -2085,6 +2105,7 @@ class MinimalWandBGenerator:
             # Prepare data for this figure
             figure_data = []
             group_order = []
+            group_colors = {}  # Maps group name -> custom color (if specified)
             pre_sync_dir = output_dir / "pre_sync_diagnostics" / figure_config['name']
             step_column = figure_config.get('step_column', '_step')
             for group_config in figure_config['groups']:
@@ -2107,9 +2128,14 @@ class MinimalWandBGenerator:
                     
                     figure_data.append(group_data)
                     group_order.append(group_config['name'])
-                    
-                    color_idx = (len(group_order) - 1) % len(self.color_palette)
-                    group_color = self.color_palette[color_idx]
+
+                    # Use custom color if specified, otherwise use palette
+                    if 'color' in group_config:
+                        group_color = group_config['color']
+                        group_colors[group_config['name']] = group_color
+                    else:
+                        color_idx = (len(group_order) - 1) % len(self.color_palette)
+                        group_color = self.color_palette[color_idx]
 
 
                     for metric in figure_config['metrics']:
@@ -2263,10 +2289,11 @@ class MinimalWandBGenerator:
                 plot_config['title'] = plot_config.get('title', f"{figure_config['name']}: {metric}")
                 
                 fig = self._create_line_plot(
-                    stats, metric, plot_config, 
+                    stats, metric, plot_config,
                     figure_config.get('step_column', '_step'),
                     group_order=group_order,
                     group_axis=group_axis_column,
+                    group_colors=group_colors,
                 )
                 
                 count_fig = self._create_count_plot(
@@ -2276,6 +2303,7 @@ class MinimalWandBGenerator:
                     figure_config.get('step_column', '_step'),
                     group_order=group_order,
                     group_axis=group_axis_column,
+                    group_colors=group_colors,
                 )
 
                 if barplot_enabled:
@@ -2284,6 +2312,7 @@ class MinimalWandBGenerator:
                         metric,
                         barplot_settings,
                         group_order=group_order,
+                        group_colors=group_colors,
                     )
                 else:
                     bar_fig = None

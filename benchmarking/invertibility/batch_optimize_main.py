@@ -217,6 +217,29 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         filter_vocab=config.get("filter_vocab", True),
         max_gradient_norm=config.get("max_gradient_norm", 0.0),
         batch_size=config.get("batch_size", 1),
+        # Method selection (NEW)
+        method=config.get("method", "stgs"),
+        # Backend selection for SODA/GCG (NEW)
+        baseline_backend=config.get("baseline_backend", "hf"),
+        baseline_model_name=config.get("baseline_model_name") or config.get("model_name"),
+        # SODA parameters (NEW)
+        soda_decay_rate=config.get("soda_decay_rate", 0.9),
+        soda_betas=(config.get("soda_beta1", 0.9), config.get("soda_beta2", 0.995)),
+        soda_reset_epoch=config.get("soda_reset_epoch", 50),
+        soda_reinit_epoch=config.get("soda_reinit_epoch", 1500),
+        soda_reg_weight=config.get("soda_reg_weight"),
+        soda_bias_correction=config.get("soda_bias_correction", False),
+        soda_init_strategy=config.get("soda_init_strategy", "zeros"),
+        soda_init_std=config.get("soda_init_std", 0.05),
+        # GCG parameters (NEW)
+        gcg_num_candidates=config.get("gcg_num_candidates", 704),
+        gcg_top_k=config.get("gcg_top_k", 128),
+        gcg_num_mutations=config.get("gcg_num_mutations", 1),
+        gcg_pos_choice=config.get("gcg_pos_choice", "uniform"),
+        gcg_token_choice=config.get("gcg_token_choice", "uniform"),
+        gcg_init_strategy=config.get("gcg_init_strategy", "zeros"),
+        # Teacher forcing (for faster training)
+        teacher_forcing=config.get("teacher_forcing", False),
         kwargs=config,
     )
     
@@ -580,7 +603,62 @@ def parse_args():
                         help="Enable running baseline to reduce REINFORCE variance")
     parser.add_argument("--reinforce_baseline_beta", type=float, default=0.9,
                         help="Exponential moving average coefficient for the REINFORCE baseline")
-    
+
+    # Method selection (NEW: for SODA/GCG support)
+    parser.add_argument("--method", type=str, default="stgs",
+                        choices=["stgs", "reinforce", "soda", "gcg"],
+                        help="Optimization method to use")
+
+    # Backend selection for SODA/GCG
+    parser.add_argument("--baseline_backend", type=str, default="hf",
+                        choices=["hf", "tl"],
+                        help="Model backend for SODA/GCG: 'hf' (HuggingFace) or 'tl' (transformer_lens)")
+    parser.add_argument("--baseline_model_name", type=str, default=None,
+                        help="Model name for transformer_lens backend (defaults to --model_name)")
+
+    # SODA-specific parameters
+    parser.add_argument("--soda_decay_rate", type=float, default=0.9,
+                        help="SODA: embedding decay rate per epoch")
+    parser.add_argument("--soda_beta1", type=float, default=0.9,
+                        help="SODA: Adam beta1 parameter")
+    parser.add_argument("--soda_beta2", type=float, default=0.995,
+                        help="SODA: Adam beta2 parameter")
+    parser.add_argument("--soda_reset_epoch", type=int, default=50,
+                        help="SODA: optimizer state reset frequency")
+    parser.add_argument("--soda_reinit_epoch", type=int, default=1500,
+                        help="SODA: embedding reinitialization frequency")
+    parser.add_argument("--soda_reg_weight", type=float, default=None,
+                        help="SODA: fluency regularization weight (None = disabled)")
+    parser.add_argument("--soda_bias_correction", type=str2bool, default=False,
+                        help="SODA: use standard Adam bias correction")
+    parser.add_argument("--soda_init_strategy", type=str, default="zeros",
+                        choices=["zeros", "normal"],
+                        help="SODA: embedding initialization strategy")
+    parser.add_argument("--soda_init_std", type=float, default=0.05,
+                        help="SODA: standard deviation for normal initialization")
+
+    # GCG-specific parameters
+    parser.add_argument("--gcg_num_candidates", type=int, default=704,
+                        help="GCG: number of mutation candidates per epoch")
+    parser.add_argument("--gcg_top_k", type=int, default=128,
+                        help="GCG: vocabulary size limit for candidates")
+    parser.add_argument("--gcg_num_mutations", type=int, default=1,
+                        help="GCG: number of token positions to mutate")
+    parser.add_argument("--gcg_pos_choice", type=str, default="uniform",
+                        choices=["uniform", "weighted", "greedy"],
+                        help="GCG: position selection strategy")
+    parser.add_argument("--gcg_token_choice", type=str, default="uniform",
+                        choices=["uniform", "weighted"],
+                        help="GCG: token selection strategy")
+    parser.add_argument("--gcg_init_strategy", type=str, default="zeros",
+                        choices=["zeros", "random"],
+                        help="GCG: token initialization strategy")
+
+    # Teacher forcing (for faster training)
+    parser.add_argument("--teacher_forcing", type=str2bool, default=False,
+                        help="Use teacher forcing for faster training (single forward pass instead of autoregressive). "
+                             "Changes loss semantics - predicts next token given correct prefix rather than own generations.")
+
     # BPTT parameters
     parser.add_argument("--bptt", type=str2bool, default=False,
                         help="Whether to use backpropagation through time")
