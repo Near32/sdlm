@@ -604,9 +604,9 @@ def parse_args():
     parser.add_argument("--reinforce_baseline_beta", type=float, default=0.9,
                         help="Exponential moving average coefficient for the REINFORCE baseline")
 
-    # Method selection (NEW: for SODA/GCG support)
+    # Method selection (NEW: for SODA/GCG/O2P support)
     parser.add_argument("--method", type=str, default="stgs",
-                        choices=["stgs", "reinforce", "soda", "gcg"],
+                        choices=["stgs", "reinforce", "soda", "gcg", "o2p"],
                         help="Optimization method to use")
 
     # Backend selection for SODA/GCG
@@ -653,6 +653,14 @@ def parse_args():
     parser.add_argument("--gcg_init_strategy", type=str, default="zeros",
                         choices=["zeros", "random"],
                         help="GCG: token initialization strategy")
+
+    # O2P-specific parameters
+    parser.add_argument("--o2p_model_path", type=str, default=None,
+                        help="O2P: path to trained O2P inverse model (required for method='o2p')")
+    parser.add_argument("--o2p_num_beams", type=int, default=4,
+                        help="O2P: beam size for T5 generation")
+    parser.add_argument("--o2p_max_length", type=int, default=32,
+                        help="O2P: maximum generation length for T5 decoder")
 
     # Teacher forcing (for faster training)
     parser.add_argument("--teacher_forcing", type=str2bool, default=False,

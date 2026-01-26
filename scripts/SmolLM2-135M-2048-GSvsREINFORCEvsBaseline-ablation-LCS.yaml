@@ -1,0 +1,258 @@
+projects:
+  - "near32/PromptOptimisationSTGS"
+  - "near32/LMI-SODA"
+
+cache_dir: 'wandb_cache'
+full_history: true                                                                                                                                                                          
+
+output_dir: "SmolLM2-135M-2048-GSvsREINFORCEvsBaselines-ablation-LCS-PL80"
+output_format: "png"
+dpi: 300
+
+# Style
+plot_style: "seaborn-v0_8"
+color_palette: "pastel"
+font_sizes: 11
+
+# Configure Kolmogorov-Smirnov tests
+Kolmogorov-Smirnov-anchors:
+  #- "REINFORCE"
+  - "GS(LTau=100)"
+  - "GS(Tau=100)"
+
+Kolmogorov-Smirnov-kwargs:
+  alternative: "two-sided"
+  mode: "auto"
+
+
+
+figures:
+  - name: "LCS Ratios"
+    step_column: "k"
+    metrics:
+      - "avg_lcs_ratio"
+    #data_filter: "epoch==2048"  # Applied to all groups by default
+
+    barplot_config:
+      enabled: true
+      ylabel: "Accuracy Metric"
+      figsize: [6,4]
+      capsize: 5
+      title: "Longest-Common-Sequence Ratios (Mean +/- Std.Err. - PL=80)"
+      xtick_rotation: 20
+      log_scale: false
+      ylim: [0, 1]
+
+    conditioned_barplot_config:
+      enabled: true
+      condition_column: "k"              # Required: column for x-axis
+      condition_values: [1, 6, 11, 16, 21]     # Optional: specific values
+      figsize: [10, 6]
+      ylabel: "LCS Ratio"
+      xlabel: "Inversion Difficulty (Rank k)"
+      title: "LCS Ratio vs Difficulty "
+      capsize: 4
+      alpha: 0.9
+      ylim: [0, 1]
+      log_scale: false
+      legend_loc: "best"
+      show_values: true
+
+    lineplot_config:
+      enabled: false
+      title: "KeyCorridor-S6R3"
+      xlabel: "# Observations"
+      ylabel: ""
+      xlim: [0, 25]
+      ylim: [0, 1]
+    
+    synchronization:
+      method: "global_interpolate"
+      num_points: 25
+      aggregate_on_sync_axis: true 
+    
+    smoothing:
+      method: "running_average"
+      window_size: 2
+      center: True
+      min_periods: 1
+
+    groups:
+      - name: "REINFORCE"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#ff7f0e"  # Orange
+        run_ids:
+          - "6dbw9mjf"
+          - "1o88kfbp"
+          - "wmisdkeu"
+          - "nq4kg8ur"
+          - "zcof3885"
+        #metric_aliases:
+        #  "sdlm_grad_variance_max": "stgs_grad_bias_reference_grad_variance_max"
+      
+      - name: "GS($\\tau=100$)" # - 2 seeds)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#2ca02c"  # Green
+        run_ids:
+          - "uzxm69ea"
+          - "nn1jwdb8"
+            #- "9y20gy3u"
+            #- "1x5rwol3"
+            #- "ae1flap9"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      - name: "GS($\\tau=1$)" # - 4 seeds)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#37c837"  # lighter Green
+        run_ids:
+          - "5u5sj7u8"
+          - "or36l8lt"
+            #- ""
+            #- ""
+            #- "89x2nr2x"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+   
+      #- name: "STGS(Tau=100)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #   - "26gl5iuw"
+      #    - "iv0lf4qi"
+      #    - "fxu73qhy"
+      #    - "vx1tb9op"
+      #    - "36k2705p"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      #- name: "STGS(Tau=1 - 4 seeds)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "r9gx0kbi"
+      #    - "de37uya2"
+      #    - "wu7al5ow"
+      #    - "savd1bn2"
+        #  - ""
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+      
+      - name: "SODA"
+        project: "near32/LMI-SODA"
+        color: "#9900cc"  # Purple 40%
+        data_filter: "epoch==2047"  # overrides
+        loose_filtering: True
+        run_ids:
+          - "2vmkgnzi"
+        #metric_aliases:
+        #  "sdlm_grad_variance_max": "stgs_grad_bias_reference_grad_variance_max"
+      
+      - name: "GS(L-$\\tau=100$)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#1e72ae"  # Blue
+        run_ids:
+          - "aoukwyb1"
+          - "jxcwxnwl"
+          - "aczhq1o4"
+            #- ""
+            #- ""
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      - name: "GS(L-$\\tau=1$)" # - 4 seeds)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#258fda"  # Blue
+        run_ids:
+          - "nmnb9fhl"
+          - "jftyoxc2"
+          - "yajz6kc5"
+          - "xlkbb8dw"
+            #- "3aza8swx"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      - name: "GS(DL-$\\tau=100$)+TF (256 Opt. steps)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#cc0000"  # Red
+        data_filter: "epoch==255"  # overrides
+        loose_filtering: True
+        run_ids:
+          - "fw048qur"
+          #- "21g4ubll"
+          - "vomcef6s"
+          - "gjv636dz"
+          - "dydh72sy"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      - name: "GS(DL-$\\tau=100$)+TF" # (2048 Opt. steps)"
+        project: "near32/PromptOptimisationSTGS"
+        color: "#ff0000"  # Red
+        data_filter: "epoch==2047"  # overrides
+        loose_filtering: True
+        run_ids:
+          - "fw048qur"
+          #- "21g4ubll"
+          - "vomcef6s"
+          - "gjv636dz"
+          - "dydh72sy"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+ 
+      #- name: "STGS(LTau=100 - 4 seeds)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "afa5frpm"
+      #    - "d388onbv"
+      #    - "xbsjdidb"
+      #    - "9c5zfbaz"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps"
+     
+      #- name: "STGS(LTau=1)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "7kaw3s7t"
+      #    - "cy5qg5bw"
+      #    - "10bkzfxv"
+      #    - "g9abwgn2"
+      #    - "jssl36si"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps" 
+               
+      #- name: "STGS(DLTau=100)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "ijajrpxx"
+      #    - "sw5vc7ct"
+      #    - "bh8mdwmi"
+      #    - "ikwu0xpx"
+      #    - "s812d41w"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps"
+      
+      #- name: "STGS(DLTau=1)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  run_ids:
+      #    - "1ipm9764"
+      #    - "ekulrwie"
+      #    - "h3qv2x61"
+      #    - "ef5as961"
+      #    - "kxrnqx7d"
+        #metric_aliases:
+        #  "mean_episode_return": "rollout/ep_info_rew_mean"
+        #  "obs_count": "time/total_timesteps"
+      
+             
+    
+      

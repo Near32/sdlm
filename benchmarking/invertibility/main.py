@@ -582,6 +582,21 @@ def optimize_inputs(
             kwargs=kwargs,
         )
 
+    elif method_lower == "o2p":
+        from baselines.o2p import o2p_optimize_inputs
+        return o2p_optimize_inputs(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            target_text=target_text,
+            o2p_model_path=kwargs.get("o2p_model_path"),
+            seq_len=seq_len,
+            num_beams=kwargs.get("o2p_num_beams", 4),
+            max_length=kwargs.get("o2p_max_length", 32),
+            batch_size=batch_size,
+            kwargs=kwargs,
+        )
+
     # Continue with STGS/REINFORCE for other methods
 
     # Enabling Gradient checkpointing:

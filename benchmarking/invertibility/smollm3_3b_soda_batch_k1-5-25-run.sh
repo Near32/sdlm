@@ -2,9 +2,9 @@
 
 python -m ipdb -c c batch_optimize_main.py  \
 --wandb_project="LMI-SODA" \
---model_name="HuggingFaceTB/SmolLM2-135M" \
---dataset_path="data/smollm2-135m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
---output_dir="results/smollm2-135m-base_SODA+BS=8+LR=0.03+SEED=2_k1-5-25-run" \
+--model_name="HuggingFaceTB/SmolLM3-3B-Base"  \
+--dataset_path="data/smollm3-3b-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
+--output_dir="results/smollm3-3b-base_SODA+BS=8+LR=0.03+SEED=2_k1-5-25-run" \
 --method="soda" \
 --baseline_backend="hf" \
 --learning_rate=0.03 \
@@ -12,7 +12,7 @@ python -m ipdb -c c batch_optimize_main.py  \
 --model_precision=full \
 --gradient_checkpointing=False \
 --batch_size=8 \
---seed=3 \
+--seed=2 \
 --num_workers=1 \
 --seq_len=80 \
 --temperature=0.05 \

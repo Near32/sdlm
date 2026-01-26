@@ -143,15 +143,21 @@ class MinimalWandBGenerator:
         """
         all_metrics = set()
         all_step_columns = set()
-        
+
         for figure_config in self.config['figures']:
             # Add global figure metrics
             figure_metrics = set(figure_config['metrics'])
             all_metrics.update(figure_metrics)
-            
+
             # Add step column
             all_step_columns.add(figure_config.get('step_column', '_step'))
-            
+
+            # Collect figure-level filter columns
+            figure_filter = figure_config.get('data_filter', '')
+            if figure_filter:
+                filter_cols = self._extract_columns_from_filter(figure_filter)
+                all_metrics.update(filter_cols)
+
             # Add group-specific metric aliases
             for group_config in figure_config['groups']:
                 if 'metric_aliases' in group_config:
@@ -161,7 +167,13 @@ class MinimalWandBGenerator:
                 else:
                     # No aliases, so group uses the same metrics as figure
                     all_metrics.update(figure_metrics)
-        
+
+                # Collect group-specific filter columns
+                group_filter = group_config.get('data_filter', '')
+                if group_filter:
+                    filter_cols = self._extract_columns_from_filter(group_filter)
+                    all_metrics.update(filter_cols)
+
         return all_metrics, all_step_columns
     
     @staticmethod
@@ -198,8 +210,219 @@ class MinimalWandBGenerator:
             else:
                 print(f"      Warning: Group metric '{group_metric}' not found in data for global metric '{global_metric}'")
         
-        return data_copy 
-    
+        return data_copy
+
+    def _parse_filter_string(self, filter_string: str) -> List[Tuple[str, str, Any]]:
+        """Parse a filter string like 'col1==val1 & col2>val2' into conditions.
+
+        Returns list of (column, operator, value) tuples.
+        Supported operators: ==, !=, >, <, >=, <=
+        """
+        import re
+        conditions = []
+        # Split on '&' (with optional whitespace)
+        parts = re.split(r'\s*&\s*', filter_string.strip())
+
+        for part in parts:
+            # Match: column_name operator value
+            match = re.match(r'(\w+)\s*(==|!=|>=|<=|>|<)\s*(.+)', part.strip())
+            if match:
+                col, op, val = match.groups()
+                # Try to convert value to appropriate type
+                val = val.strip().strip('"').strip("'")
+                try:
+                    val = float(val)
+                    if val.is_integer():
+                        val = int(val)
+                except ValueError:
+                    pass  # Keep as string
+                conditions.append((col, op, val))
+            else:
+                # Warn about unparseable parts and launch debugger
+                if part.strip():
+                    print(f"    WARNING: Could not parse filter condition: '{part.strip()}'")
+                    print(f"    Expected format: 'column==value' or 'column>value' etc.")
+                    print(f"    Supported operators: ==, !=, >, <, >=, <=")
+                    print(f"    Launching debugger for investigation...")
+                    import ipdb; ipdb.set_trace()
+
+        return conditions
+
+    def _apply_filter_conditions(self, data: pd.DataFrame, conditions: List[Tuple[str, str, Any]]) -> Tuple[pd.DataFrame, List[str]]:
+        """Apply parsed filter conditions to a DataFrame.
+
+        Returns:
+            Tuple of (filtered_data, warnings_list)
+        """
+        filter_warnings = []
+
+        if not conditions or data.empty:
+            return data, filter_warnings
+
+        mask = pd.Series([True] * len(data), index=data.index)
+
+        for col, op, val in conditions:
+            if col not in data.columns:
+                msg = f"Filter column '{col}' not found in data, condition skipped"
+                print(f"    WARNING: {msg}")
+                print(f"    Available columns: {list(data.columns)}")
+                print(f"    Launching debugger for investigation...")
+                import ipdb; ipdb.set_trace()
+                filter_warnings.append(msg)
+                continue
+
+            col_data = pd.to_numeric(data[col], errors='coerce')
+
+            if op == '==':
+                mask &= (col_data == val)
+            elif op == '!=':
+                mask &= (col_data != val)
+            elif op == '>':
+                mask &= (col_data > val)
+            elif op == '<':
+                mask &= (col_data < val)
+            elif op == '>=':
+                mask &= (col_data >= val)
+            elif op == '<=':
+                mask &= (col_data <= val)
+
+        filtered = data[mask]
+        rows_before = len(data)
+        rows_after = len(filtered)
+
+        # Check for problematic outcomes
+        if rows_after == 0:
+            msg = f"Filter resulted in 0 rows! Filter may be too restrictive or values don't exist"
+            print(f"    ERROR: {msg}")
+            print(f"    Filter conditions: {conditions}")
+            print(f"    Launching debugger for investigation...")
+            import ipdb; ipdb.set_trace()
+            filter_warnings.append(msg)
+        elif rows_after == rows_before:
+            msg = f"Filter had no effect (all {rows_before} rows matched)"
+            print(f"    INFO: {msg}")
+            print(f"    Filter conditions: {conditions}")
+            print(f"    Launching debugger for investigation...")
+            import ipdb; ipdb.set_trace()
+            filter_warnings.append(msg)
+        else:
+            print(f"    Filter applied: {rows_before} -> {rows_after} rows")
+
+        return filtered, filter_warnings
+
+    def _apply_loose_filter(
+        self,
+        data: pd.DataFrame,
+        conditions: List[Tuple[str, str, Any]],
+        step_column: str = '_step',
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Apply filter with per-step fallback to closest values.
+
+        For each step value, if the exact filter match (e.g., epoch==100) has no data,
+        find the closest filter value that does have data for that step.
+
+        Args:
+            data: DataFrame to filter
+            conditions: List of (column, operator, value) tuples from _parse_filter_string
+            step_column: Column name to use as the step/x-axis
+
+        Returns:
+            Tuple of (filtered_data, fallback_info)
+            fallback_info contains which steps used fallback values
+        """
+        if not conditions or data.empty:
+            return data, {'steps_with_fallback': {}}
+
+        # 1. Identify equality conditions (can fallback) vs other conditions (strict)
+        equality_conditions = [(col, val) for col, op, val in conditions if op == '==']
+        other_conditions = [(col, op, val) for col, op, val in conditions if op != '==']
+
+        # 2. Apply non-equality conditions first (these are strict, no fallback)
+        if other_conditions:
+            filtered, _ = self._apply_filter_conditions(data, other_conditions)
+        else:
+            filtered = data.copy()
+
+        if filtered.empty:
+            return filtered, {'steps_with_fallback': {}}
+
+        # 3. For each step value that has data, apply loose filtering for equality conditions
+        if step_column not in filtered.columns:
+            print(f"    WARNING: Step column '{step_column}' not in data for loose filtering")
+            # Fall back to strict filtering
+            return self._apply_filter_conditions(data, conditions)
+
+        all_steps = filtered[step_column].dropna().unique()
+        result_rows = []
+        fallback_info = {'steps_with_fallback': {}}
+
+        for step in all_steps:
+            step_data = filtered[filtered[step_column] == step]
+            current_data = step_data
+
+            step_fallbacks = {}
+            for col, target_val in equality_conditions:
+                if col not in current_data.columns:
+                    continue
+
+                col_data = pd.to_numeric(current_data[col], errors='coerce')
+
+                # Try exact match first
+                exact_match = current_data[col_data == target_val]
+
+                if not exact_match.empty:
+                    current_data = exact_match
+                else:
+                    # Find closest value that has data for this step
+                    available_vals = col_data.dropna().unique()
+                    if len(available_vals) > 0:
+                        # Find closest value to target
+                        closest_val = min(available_vals, key=lambda v: abs(v - target_val))
+                        current_data = current_data[col_data == closest_val]
+                        step_fallbacks[col] = {'requested': target_val, 'used': closest_val}
+
+            if not current_data.empty:
+                result_rows.append(current_data)
+                if step_fallbacks:
+                    fallback_info['steps_with_fallback'][step] = step_fallbacks
+
+        if result_rows:
+            result = pd.concat(result_rows, ignore_index=True)
+        else:
+            result = pd.DataFrame()
+
+        # Log summary of fallbacks
+        n_fallback_steps = len(fallback_info['steps_with_fallback'])
+        if n_fallback_steps > 0:
+            print(f"    Loose filtering used fallback for {n_fallback_steps} steps")
+            # Show details for first few steps
+            shown = 0
+            for step, fb_info in sorted(fallback_info['steps_with_fallback'].items()):
+                if shown >= 5:
+                    remaining = n_fallback_steps - shown
+                    print(f"      ... and {remaining} more steps")
+                    break
+                parts = [f"{col} {info['requested']}->{info['used']}" for col, info in fb_info.items()]
+                print(f"      step {step}: {', '.join(parts)}")
+                shown += 1
+
+        rows_before = len(data)
+        rows_after = len(result)
+        print(f"    Loose filter applied: {rows_before} -> {rows_after} rows")
+
+        return result, fallback_info
+
+    def _extract_columns_from_filter(self, filter_string: str) -> Set[str]:
+        """Extract column names from a filter string."""
+        import re
+        columns = set()
+        parts = re.split(r'\s*&\s*', filter_string.strip())
+        for part in parts:
+            match = re.match(r'(\w+)\s*(==|!=|>=|<=|>|<)', part.strip())
+            if match:
+                columns.add(match.group(1))
+        return columns
+
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load YAML configuration."""
         with open(config_path, 'r') as file:
@@ -375,60 +598,105 @@ class MinimalWandBGenerator:
         return found_runs
     
     def _get_metrics_for_run(self, run_id: str) -> List[str]:
-        """Determine which specific metrics to fetch for a given run based on its group aliases."""
+        """Determine which specific metrics to fetch for a given run based on its group aliases.
+
+        Also includes filter columns from both figure-level and group-level data_filter.
+        """
         for figure_config in self.config['figures']:
             for group_config in figure_config['groups']:
                 run_ids = group_config['run_ids']
                 if isinstance(run_ids, str):
                     run_ids = [run_ids]
-                
+
                 normalized_run_ids = {self._normalize_run_id(rid) for rid in run_ids}
                 if self._normalize_run_id(run_id) in normalized_run_ids:
+                    # Start with base metrics
                     if 'metric_aliases' in group_config:
                         # Use group-specific metric names (values in aliases)
-                        return list(group_config['metric_aliases'].values())
+                        metrics = set(group_config['metric_aliases'].values())
                     else:
                         # Use global metric names
-                        return figure_config['metrics']
-        
+                        metrics = set(figure_config['metrics'])
+
+                    # Add filter columns from figure-level data_filter
+                    figure_filter = figure_config.get('data_filter', '')
+                    if figure_filter:
+                        filter_cols = self._extract_columns_from_filter(figure_filter)
+                        metrics.update(filter_cols)
+
+                    # Add filter columns from group-level data_filter
+                    group_filter = group_config.get('data_filter', '')
+                    if group_filter:
+                        filter_cols = self._extract_columns_from_filter(group_filter)
+                        metrics.update(filter_cols)
+
+                    return list(metrics)
+
         # Fallback: return all global metrics if run not found in any group
         all_global_metrics = set()
         for figure_config in self.config['figures']:
             all_global_metrics.update(figure_config['metrics'])
+            # Also include filter columns from figure-level filters
+            figure_filter = figure_config.get('data_filter', '')
+            if figure_filter:
+                filter_cols = self._extract_columns_from_filter(figure_filter)
+                all_global_metrics.update(filter_cols)
+            # And from group-level filters
+            for group_config in figure_config['groups']:
+                group_filter = group_config.get('data_filter', '')
+                if group_filter:
+                    filter_cols = self._extract_columns_from_filter(group_filter)
+                    all_global_metrics.update(filter_cols)
         return list(all_global_metrics)
     
     def _extract_run_data(
-        self, 
-        run: wandb.apis.public.Run, 
-        metrics: List[str], 
+        self,
+        run: wandb.apis.public.Run,
+        metrics: List[str],
         step_columns: List[str],
         max_retry: int=2,
         eff_run_id: str = None,
     ) -> pd.DataFrame:
         """Extract metrics with fallback strategy for async logging."""
+        # Get metrics specific to this run's group (includes relevant filter columns)
         run_specific_metrics = self._get_metrics_for_run(run.id)
-        
+
         # Try cache first
         cached_data = self._load_run_data_from_cache(run.id, run_specific_metrics, step_columns)
         #if 'dzo' in run.id or 'daa' in run.id:
         #    import ipdb; ipdb.set_trace()
         if not cached_data.empty:
             return cached_data
-    
+
         print(f"    Extracting from W&B: run {run.id}")
         columns_to_extract = list(set(run_specific_metrics + step_columns))
-        
+
         # Try unified extraction first (faster)
+        #if "fw048qur" in run.id:
+        #    import ipdb; ipdb.set_trace()
         df = self._extract_unified_with_fallback(run, columns_to_extract, max_retry)
-        
+
         if df.empty:
             return pd.DataFrame()
-        
+
+        # Check if extracted data is missing expected columns
+        extracted_cols = set(df.columns)
+        expected_cols = set(columns_to_extract)
+        missing_from_extraction = expected_cols - extracted_cols
+        if missing_from_extraction:
+            print(f"    WARNING: Extracted data missing columns for run {run.id}")
+            print(f"    Expected columns: {sorted(expected_cols)}")
+            print(f"    Extracted columns: {sorted(extracted_cols)}")
+            print(f"    Missing columns: {sorted(missing_from_extraction)}")
+            print(f"    The W&B run may not have logged these metrics.")
+            print(f"    Launching debugger for investigation...")
+            import ipdb; ipdb.set_trace()
+
         # Add metadata
         effective_run_id = eff_run_id if eff_run_id else run.id
         df['run_id'] = effective_run_id
         df['group'] = ''
-        
+
         # Cache result
         self._save_run_data_to_cache(effective_run_id, metrics, step_columns, df)
         return df
@@ -482,31 +750,38 @@ class MinimalWandBGenerator:
         return unified_df
     
     def _fetch_unified_from_wandb(
-        self, 
-        run: wandb.apis.public.Run, 
-        columns_to_extract: List[str], 
+        self,
+        run: wandb.apis.public.Run,
+        columns_to_extract: List[str],
         max_retry: int
     ) -> pd.DataFrame:
         """Original unified extraction method."""
         retry = 0
+
+        # Get history sampling config
+        full_history = self.config.get('full_history', False)
+        history_samples = self.config.get('history_samples', 10000)
+
         while retry < max_retry:
             try:
-                if True: #retry > 0:
-                    history = run.history(keys=columns_to_extract, samples=10000)
-                    df = pd.DataFrame(history) #if history else pd.DataFrame()
-                else:
+                if full_history or history_samples is None:
+                    # Fetch all data without sampling
                     history = run.scan_history(keys=columns_to_extract)
                     df = pd.DataFrame(history)
-                
+                else:
+                    # Fetch sampled data (faster but truncates)
+                    history = run.history(keys=columns_to_extract, samples=history_samples)
+                    df = pd.DataFrame(history)
+
                 if not df.empty:
                     print(f"      Unified extraction: {len(df)} rows, {len(df.columns)} columns")
                 return df
-                
+
             except Exception as e:
                 print(f"      Error in unified extraction: {e}")
                 time.sleep(30)
                 retry += 1
-        
+
         return pd.DataFrame()
     
     def _extract_separate_with_batch_merge(
@@ -596,29 +871,36 @@ class MinimalWandBGenerator:
         return data.reset_index()
     
     def _fetch_single_column_from_wandb(
-        self, 
-        run: wandb.apis.public.Run, 
-        column: str, 
+        self,
+        run: wandb.apis.public.Run,
+        column: str,
         max_retry: int
     ) -> pd.DataFrame:
         """Fetch single column (used only in fallback mode)."""
         retry = 0
+
+        # Get history sampling config
+        full_history = self.config.get('full_history', False)
+        history_samples = self.config.get('history_samples', 5000)  # Lower default for single column
+
         while retry < max_retry:
             try:
-                if True: #retry > 0:
-                    history = run.history(keys=[column], samples=5000)  # Reduced samples for speed
-                    df = pd.DataFrame(history) #if history else pd.DataFrame()
-                else:
+                if full_history or history_samples is None:
+                    # Fetch all data without sampling
                     history = run.scan_history(keys=[column])
                     df = pd.DataFrame(history)
-                
+                else:
+                    # Fetch sampled data (faster but truncates)
+                    history = run.history(keys=[column], samples=history_samples)
+                    df = pd.DataFrame(history)
+
                 return df
-                
+
             except Exception as e:
                 print(f"      Error fetching {column}: {e}")
                 time.sleep(10)  # Shorter wait
                 retry += 1
-        
+
         return pd.DataFrame()
   
     def _collect_run_requirements(self) -> Dict[str, Any]:
@@ -651,19 +933,195 @@ class MinimalWandBGenerator:
             'all_projects_runs': list(all_run_ids),
             'project_specific_runs': {k: list(v) for k, v in project_specific_runs.items()}
         }
-    
-    def _group_runs_data(self, data: pd.DataFrame, group_config: Dict[str, Any]) -> pd.DataFrame:
-        """Filter data by run IDs and assign group."""
+
+    def _export_filtered_data_for_verification(
+        self,
+        filtered_data: pd.DataFrame,
+        group_name: str,
+        figure_name: str,
+        output_dir: Path,
+        effective_filter: Optional[str],
+        rows_before_filter: int,
+        run_ids: Set[str],
+        filter_warnings: List[str] = None,
+    ) -> None:
+        """Export filtered data to CSV and metadata to JSON for human verification.
+
+        Creates files in output_dir/filter_diagnostics/:
+        - {figure_name}_{group_name}_filtered_data.csv: The actual filtered DataFrame
+        - {figure_name}_{group_name}_filter_info.json: Metadata about the filtering
+        """
+        diag_dir = output_dir / "filter_diagnostics" / figure_name.replace('/', '+')
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_group_name = group_name.replace('/', '+').replace(' ', '_')
+
+        # Reorder columns: identity cols first, then filter cols, then the rest
+        filter_cols = []
+        if effective_filter:
+            filter_cols = list(self._extract_columns_from_filter(effective_filter))
+
+        # Build column order: run_id, filter columns, then everything else
+        identity_cols = ['run_id']
+        priority_cols = identity_cols + [c for c in filter_cols if c in filtered_data.columns]
+        other_cols = [c for c in filtered_data.columns if c not in priority_cols]
+        ordered_cols = priority_cols + other_cols
+
+        # Reorder the DataFrame for export
+        export_df = filtered_data[ordered_cols].copy()
+
+        # Export the filtered DataFrame to CSV
+        csv_filename = f"{safe_group_name}_filtered_data.csv"
+        csv_path = diag_dir / csv_filename
+        export_df.to_csv(csv_path, index=False)
+
+        # Determine which filter columns are present/missing
+        filter_cols_present = [c for c in filter_cols if c in filtered_data.columns]
+        filter_cols_missing = [c for c in filter_cols if c not in filtered_data.columns]
+
+        # Create filter metadata
+        filter_info = {
+            "figure_name": figure_name,
+            "group_name": group_name,
+            "run_ids": sorted(list(run_ids)),
+            "filter_applied": effective_filter,
+            "filter_columns_requested": filter_cols,
+            "filter_columns_present": filter_cols_present,
+            "filter_columns_missing": filter_cols_missing,
+            "rows_after_run_id_filter": rows_before_filter,
+            "rows_after_data_filter": len(filtered_data),
+            "rows_removed_by_filter": rows_before_filter - len(filtered_data),
+            "csv_column_order": list(ordered_cols),
+            "warnings": filter_warnings or [],
+            "has_errors": any("ERROR" in w or "not found" in w for w in (filter_warnings or [])),
+        }
+
+        # Add summary statistics for filter columns if filter was applied
+        if effective_filter and filter_cols_present:
+            filter_col_stats = {}
+            for col in filter_cols_present:
+                col_data = pd.to_numeric(filtered_data[col], errors='coerce')
+                unique_vals = sorted([v for v in col_data.dropna().unique().tolist() if pd.notna(v)])
+                filter_col_stats[col] = {
+                    "unique_values_in_filtered_data": unique_vals,
+                    "min": float(col_data.min()) if pd.notna(col_data.min()) else None,
+                    "max": float(col_data.max()) if pd.notna(col_data.max()) else None,
+                    "count": int(col_data.notna().sum()),
+                }
+            filter_info["filter_column_stats"] = filter_col_stats
+
+        # Export filter metadata to JSON
+        json_filename = f"{safe_group_name}_filter_info.json"
+        json_path = diag_dir / json_filename
+        with open(json_path, 'w') as f:
+            json.dump(filter_info, f, indent=2)
+
+        print(f"    Exported filter diagnostics: {csv_path.name}, {json_path.name}")
+
+    def _group_runs_data(self, data: pd.DataFrame, group_config: Dict[str, Any],
+                         figure_filter: str = None,
+                         output_dir: Path = None,
+                         figure_name: str = None,
+                         figure_config: Dict[str, Any] = None) -> pd.DataFrame:
+        """Filter data by run IDs, apply filters, and assign group."""
         group_name = group_config['name']
         run_ids = group_config['run_ids']
-        
+
         if isinstance(run_ids, str):
             run_ids = [run_ids]
-        
+
         # Filter by run IDs
         normalized_run_ids = {self._normalize_run_id(rid) for rid in run_ids}
         filtered_data = data[data['run_id'].isin(normalized_run_ids)].copy()
-        
+        rows_after_run_filter = len(filtered_data)
+
+        # Apply data filter: group-level overrides figure-level
+        effective_filter = group_config.get('data_filter', figure_filter)
+        filter_warnings = []
+
+        if effective_filter:
+            print(f"    Applying data filter for group '{group_name}': {effective_filter}")
+
+            # Early check: are all filter columns present in the data?
+            required_filter_cols = self._extract_columns_from_filter(effective_filter)
+            available_cols = set(filtered_data.columns)
+            missing_filter_cols = required_filter_cols - available_cols
+
+            if missing_filter_cols:
+                msg = f"Filter columns missing from data: {sorted(missing_filter_cols)}"
+                print(f"    WARNING: {msg}")
+                print(f"    Filter string: {effective_filter}")
+                print(f"    Required filter columns: {sorted(required_filter_cols)}")
+                print(f"    Available columns in data: {sorted(available_cols)}")
+                print(f"    This may indicate the columns weren't fetched from W&B.")
+                print(f"    Check _collect_all_required_metrics() and W&B run data.")
+                filter_warnings.append(msg)
+
+            conditions = self._parse_filter_string(effective_filter)
+
+            # Determine if loose filtering is enabled (group-level overrides figure-level)
+            loose_filtering = group_config.get(
+                'loose_filtering',
+                figure_config.get('loose_filtering', False) if figure_config else False
+            )
+
+            if loose_filtering:
+                # Apply loose filtering PER-RUN to ensure each run gets fallback independently
+                step_column = figure_config.get('step_column', '_step') if figure_config else '_step'
+                print(f"    Loose filtering enabled (step_column: {step_column}), applying per-run")
+
+                per_run_results = []
+                all_fallback_info = {'steps_with_fallback': {}}
+
+                for run_id in normalized_run_ids:
+                    run_data = filtered_data[filtered_data['run_id'] == run_id]
+                    if run_data.empty:
+                        print(f"      Run {run_id}: no data after run filter")
+                        continue
+
+                    run_filtered, run_fallback = self._apply_loose_filter(
+                        run_data, conditions, step_column
+                    )
+
+                    if not run_filtered.empty:
+                        per_run_results.append(run_filtered)
+                        print(f"      Run {run_id}: {len(run_filtered)} rows after loose filter")
+                    else:
+                        print(f"      Run {run_id}: no data after loose filter")
+
+                    # Merge fallback info with run_id prefix for tracking
+                    for step, fb in run_fallback.get('steps_with_fallback', {}).items():
+                        key = f"{run_id}:{step}"
+                        all_fallback_info['steps_with_fallback'][key] = fb
+
+                if per_run_results:
+                    filtered_data = pd.concat(per_run_results, ignore_index=True)
+                else:
+                    filtered_data = pd.DataFrame()
+
+                if all_fallback_info['steps_with_fallback']:
+                    n_fallbacks = len(all_fallback_info['steps_with_fallback'])
+                    filter_warnings.append(
+                        f"Loose filtering used fallback for {n_fallbacks} run:step combinations"
+                    )
+            else:
+                # Use strict filtering (existing behavior)
+                filtered_data, filter_warnings_from_apply = self._apply_filter_conditions(filtered_data, conditions)
+                filter_warnings.extend(filter_warnings_from_apply)
+
+        # Export filtered data for human verification
+        if output_dir is not None and figure_name is not None:
+            self._export_filtered_data_for_verification(
+                filtered_data,
+                group_name,
+                figure_name,
+                output_dir,
+                effective_filter,
+                rows_after_run_filter,
+                normalized_run_ids,
+                filter_warnings=filter_warnings,
+            )
+
         # Apply metric aliases: rename group-specific metrics to global names
         filtered_data = self._apply_metric_aliases(filtered_data, group_config)
         
@@ -1382,6 +1840,81 @@ class MinimalWandBGenerator:
     
         return stats
 
+    def _export_plot_data_to_json(
+        self,
+        stats_data: pd.DataFrame,
+        metric: str,
+        step_column: str,
+        output_path: Path,
+        group_order: List[str] = None,
+        group_axis: Optional[str] = None,
+    ) -> None:
+        """Export the plotted statistics data to JSON for each group.
+
+        Creates a JSON file with the following structure:
+        {
+            "metric": "metric_name",
+            "step_column": "step_column_name",
+            "groups": {
+                "Group A": {
+                    "x_values": [...],
+                    "mean": [...],
+                    "median": [...],
+                    "std": [...],
+                    "stderr": [...],
+                    "count": [...]
+                },
+                ...
+            }
+        }
+        """
+        if stats_data.empty:
+            return
+
+        # Determine x-axis column
+        x_column = group_axis if group_axis and group_axis in stats_data.columns else step_column
+
+        # Build the export structure
+        export_data = {
+            "metric": metric,
+            "step_column": step_column,
+            "x_axis_column": x_column,
+            "groups": {}
+        }
+
+        # Get groups in specified order
+        if group_order is not None:
+            available_groups = set(stats_data['group'].unique())
+            groups = [g for g in group_order if g in available_groups]
+        else:
+            groups = stats_data['group'].unique().tolist()
+
+        for group in groups:
+            group_data = stats_data[stats_data['group'] == group].sort_values(x_column)
+
+            # Convert to native Python types for JSON serialization
+            group_export = {
+                "x_values": group_data[x_column].tolist(),
+                "mean": [float(v) if pd.notna(v) else None for v in group_data['mean']],
+                "median": [float(v) if pd.notna(v) else None for v in group_data['median']],
+                "std": [float(v) if pd.notna(v) else None for v in group_data['std']],
+                "stderr": [float(v) if pd.notna(v) else None for v in group_data['stderr']],
+                "count": [int(v) if pd.notna(v) else None for v in group_data['count']],
+            }
+
+            # Include the display step column if different from x_axis
+            if step_column in group_data.columns and step_column != x_column:
+                group_export["step_values"] = group_data[step_column].tolist()
+
+            export_data["groups"][group] = group_export
+
+        # Write JSON file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+        print(f"    Saved plot data JSON: {output_path}")
+
     def _create_line_plot(
         self,
         stats_data: pd.DataFrame,
@@ -1675,8 +2208,156 @@ class MinimalWandBGenerator:
         ax.grid(True, axis='y', alpha=0.3)
         plt.tight_layout()
         return fig
-    
-    
+
+    def _create_conditioned_grouped_bar_plot(
+        self,
+        data: pd.DataFrame,
+        metric: str,
+        plot_config: Dict[str, Any],
+        condition_column: str,
+        condition_values: Optional[List[Any]] = None,
+        group_order: Optional[List[str]] = None,
+        group_colors: Optional[Dict[str, str]] = None,
+    ) -> Optional[plt.Figure]:
+        """Create grouped bar plot with bars clustered by condition values.
+
+        X-axis shows condition values (e.g., epochs), with clustered bars for each group.
+        Y-axis shows mean values with stderr error bars.
+        """
+        required_cols = {'group', metric, condition_column}
+        if data.empty or not required_cols.issubset(data.columns):
+            missing = required_cols - set(data.columns)
+            print(f"    Skipping conditioned bar plot for '{metric}': missing columns {missing}")
+            return None
+
+        working = data[['group', condition_column, metric]].copy()
+        working[metric] = pd.to_numeric(working[metric], errors='coerce')
+        working[condition_column] = pd.to_numeric(working[condition_column], errors='coerce')
+        working = working.dropna(subset=[metric, condition_column])
+
+        if working.empty:
+            print(f"    Skipping conditioned bar plot for '{metric}': no numeric values")
+            return None
+
+        # Filter to specified condition values if provided
+        if condition_values is not None:
+            working = working[working[condition_column].isin(condition_values)]
+            if working.empty:
+                print(f"    Skipping conditioned bar plot: no data for specified condition values")
+                return None
+            conditions = [c for c in condition_values if c in working[condition_column].values]
+        else:
+            conditions = sorted(working[condition_column].unique())
+
+        # Determine group order
+        if group_order:
+            groups = [g for g in group_order if g in working['group'].unique()]
+            groups += [g for g in working['group'].unique() if g not in groups]
+        else:
+            groups = sorted(working['group'].unique())
+
+        if not groups or not conditions:
+            print(f"    Skipping conditioned bar plot: no groups or conditions")
+            return None
+
+        # Calculate statistics for each (condition, group) pair
+        stats = (
+            working.groupby([condition_column, 'group'])[metric]
+            .agg(['mean', 'std', 'count'])
+            .reset_index()
+        )
+        stats['stderr'] = stats['std'] / np.sqrt(stats['count'].replace(0, np.nan))
+        stats['stderr'] = stats['stderr'].fillna(0)
+
+        # Prepare figure
+        figsize = plot_config.get('figsize', (10, 6))
+        fig, ax = plt.subplots(figsize=figsize)
+
+        n_groups = len(groups)
+        n_conditions = len(conditions)
+
+        # Calculate bar width
+        bar_width = plot_config.get('bar_width')
+        if bar_width is None:
+            bar_width = 0.8 / n_groups
+
+        x_positions = np.arange(n_conditions)
+
+        # Set up colors
+        if group_colors is None:
+            group_colors = {}
+
+        # Collect text annotation data for later (after axes are configured)
+        text_annotations = []
+
+        # Plot bars for each group
+        for i, group in enumerate(groups):
+            offset = (i - (n_groups - 1) / 2) * bar_width
+            group_x = x_positions + offset
+
+            # Get data for this group across all conditions
+            means = []
+            stderrs = []
+            for cond in conditions:
+                row = stats[(stats[condition_column] == cond) & (stats['group'] == group)]
+                if len(row) > 0:
+                    means.append(row['mean'].values[0])
+                    stderrs.append(row['stderr'].values[0])
+                else:
+                    means.append(np.nan)
+                    stderrs.append(0)
+
+            color = group_colors.get(group, self.color_palette[i % len(self.color_palette)])
+
+            ax.bar(
+                group_x,
+                means,
+                width=bar_width,
+                yerr=stderrs,
+                label=group,
+                color=color,
+                capsize=plot_config.get('capsize', 4),
+                alpha=plot_config.get('alpha', 0.9),
+                edgecolor=plot_config.get('edgecolor', 'black'),
+                linewidth=plot_config.get('linewidth', 1),
+            )
+
+            # Collect text annotation positions for show_values
+            if plot_config.get('show_values', False):
+                for x, mean, stderr in zip(group_x, means, stderrs):
+                    if not np.isnan(mean):
+                        text_annotations.append((x, mean, stderr))
+
+        # Configure axes
+        if plot_config.get('log_scale', False):
+            ax.set_yscale('log')
+
+        if 'ylim' in plot_config:
+            ax.set_ylim(plot_config['ylim'])
+
+        ax.set_xticks(x_positions)
+        condition_labels = [str(c) for c in conditions]
+        ax.set_xticklabels(condition_labels, rotation=plot_config.get('xtick_rotation', 0))
+        ax.set_xlabel(plot_config.get('xlabel', condition_column))
+        ax.set_ylabel(plot_config.get('ylabel', metric))
+        ax.set_title(plot_config.get('title', f"{metric} by {condition_column}"))
+        ax.legend(loc=plot_config.get('legend_loc', 'best'))
+        ax.grid(True, axis='y', alpha=0.3)
+
+        # Add value labels after axes are configured (so we can compute proper padding)
+        if text_annotations:
+            y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+            padding = 0.02 * y_range if y_range > 0 else 0.01
+            for x, mean, stderr in text_annotations:
+                y_pos = mean + stderr + padding
+                ax.text(
+                    x, y_pos, f'{mean:.3f}',
+                    ha='center', va='bottom', fontsize=8, rotation=90
+                )
+
+        plt.tight_layout()
+        return fig
+
     def _compute_group_final_values(
         self,
         data: pd.DataFrame,
@@ -2097,7 +2778,7 @@ class MinimalWandBGenerator:
         
         combined_data = pd.concat(all_data, ignore_index=True)
         print(f"Extracted data: {len(combined_data)} rows from {len(all_runs)} runs")
-        
+
         # Generate figures
         for figure_config in self.config['figures']:
             print(f"\nGenerating figure: {figure_config['name']}")
@@ -2108,8 +2789,19 @@ class MinimalWandBGenerator:
             group_colors = {}  # Maps group name -> custom color (if specified)
             pre_sync_dir = output_dir / "pre_sync_diagnostics" / figure_config['name']
             step_column = figure_config.get('step_column', '_step')
+
+            # Get figure-level default filter
+            figure_filter = figure_config.get('data_filter', None)
+
             for group_config in figure_config['groups']:
-                group_data = self._group_runs_data(combined_data, group_config)
+                group_data = self._group_runs_data(
+                    combined_data,
+                    group_config,
+                    figure_filter=figure_filter,
+                    output_dir=output_dir,
+                    figure_name=figure_config['name'],
+                    figure_config=figure_config,
+                )
                 if not group_data.empty:
                     print(f"Group '{group_config['name']}' raw data stats:")
                     for metric in figure_config['metrics']:
@@ -2333,7 +3025,49 @@ class MinimalWandBGenerator:
                     bar_fig.savefig(bar_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
                     plt.close(bar_fig)
                     print(f"    Saved bar plot: {bar_path}")
-                
+
+                # Handle conditioned grouped bar plot
+                cond_barplot_cfg = figure_config.get('conditioned_barplot_config')
+                if cond_barplot_cfg and cond_barplot_cfg.get('enabled', True):
+                    condition_column = cond_barplot_cfg.get('condition_column')
+                    if condition_column:
+                        cond_barplot_settings = {
+                            k: v for k, v in cond_barplot_cfg.items()
+                            if k not in ('enabled', 'condition_column', 'condition_values')
+                        }
+                        condition_values = cond_barplot_cfg.get('condition_values')
+
+                        cond_bar_fig = self._create_conditioned_grouped_bar_plot(
+                            raw_figure_combined,
+                            metric,
+                            cond_barplot_settings,
+                            condition_column=condition_column,
+                            condition_values=condition_values,
+                            group_order=group_order,
+                            group_colors=group_colors,
+                        )
+
+                        if cond_bar_fig is not None:
+                            cond_bar_filename = f"{figure_config['name']}_{metric}_conditioned_barplot.{self.config.get('output_format', 'png')}"
+                            cond_bar_path = output_dir / cond_bar_filename.replace('/', '+')
+                            cond_bar_fig.savefig(cond_bar_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
+                            plt.close(cond_bar_fig)
+                            print(f"    Saved conditioned bar plot: {cond_bar_path}")
+                    else:
+                        print("    Warning: conditioned_barplot_config enabled but 'condition_column' not specified")
+
+                # Export plot data to JSON
+                json_filename = f"{figure_config['name']}_{metric}_plot_data.json"
+                json_path = output_dir / json_filename.replace('/', '+')
+                self._export_plot_data_to_json(
+                    stats,
+                    metric,
+                    figure_config.get('step_column', '_step'),
+                    json_path,
+                    group_order=group_order,
+                    group_axis=group_axis_column,
+                )
+
                 # Generate and save markdown table
                 # Extract final values from processed data (includes sync + smoothing effects)
                 markdown_table = self._extract_final_values_from_processed_data(
