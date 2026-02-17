@@ -6,14 +6,39 @@ cache_dir: 'wandb_cache'
 full_history: true                                                                                                                                                                          
 
 output_dir: "SmolLM2-135M-2048-GSvsREINFORCEvsBaselines-ablation-LCS-PL80"
-output_format: "png"
+output_format: "pdf"
 dpi: 300
 
 # Style
 plot_style: "seaborn-v0_8"
 color_palette: "pastel"
-font_sizes: 11
 
+font_sizes: 20                    # Single value for all
+# OR
+#font_sizes:
+#  default: 10
+#  title: 14
+#  labels: 12
+#  ticks: 10
+#  legend: 11
+
+# Global default (optional)                                                                                                                                                                 
+legend_export:                                                                                                                                                                              
+  enabled: true                                                                                                                                                                             
+  format: pdf  # output format                                                                                                                                                              
+  fontsize: 10                                                                                                                                                                              
+  figsize: #[8, 1.5]  # [width, height] in inches  
+    width: 6.5 #inches
+    height: 0.5 #inches
+    #aspect_ratio: 1.67 #golden ratio    
+  ncol: 7  # number of columns (0 for auto)                                                                                                                                                 
+  loc: 'center'                                                                                                                                                                             
+  frameon: false                                                                                                                                                                            
+  remove_from_main: true 
+  hide_xlabel: true       # Remove x-axis label from main figures                                                                                                                          
+  hide_ylabel: true       # Remove y-axis label from main figures                                                                                                                          
+  hide_title: true        # Remove title from main figures
+      
 # Configure Kolmogorov-Smirnov tests
 Kolmogorov-Smirnov-anchors:
   #- "REINFORCE"
@@ -24,7 +49,10 @@ Kolmogorov-Smirnov-kwargs:
   alternative: "two-sided"
   mode: "auto"
 
-
+# Global config
+figsize:
+  width: 3.25 #inches for one column spanning
+  aspect_ratio: 1.67 # golden ratio
 
 figures:
   - name: "LCS Ratios"
@@ -47,7 +75,17 @@ figures:
       enabled: true
       condition_column: "k"              # Required: column for x-axis
       condition_values: [1, 6, 11, 16, 21]     # Optional: specific values
-      figsize: [10, 6]
+      # Option A: List format [width, height]
+      #figsize: [10, 6]
+      # Option B: Dict with explicit height
+      #figsize:
+      #  width: 10
+      #  height: 6
+      # Option C: Dict with aspect ratio (width/height)
+      figsize:
+        width: 6.5 # 3.25 #inches
+        aspect_ratio: 1.67 #golden ratio 
+      
       ylabel: "LCS Ratio"
       xlabel: "Inversion Difficulty (Rank k)"
       title: "LCS Ratio vs Difficulty "
@@ -56,7 +94,7 @@ figures:
       ylim: [0, 1]
       log_scale: false
       legend_loc: "best"
-      show_values: true
+      show_values: false
 
     lineplot_config:
       enabled: false
@@ -80,7 +118,7 @@ figures:
     groups:
       - name: "REINFORCE"
         project: "near32/PromptOptimisationSTGS"
-        color: "#ff7f0e"  # Orange
+        color: "#000000" # black / "#ff7f0e"  # Orange
         run_ids:
           - "6dbw9mjf"
           - "1o88kfbp"
@@ -90,9 +128,11 @@ figures:
         #metric_aliases:
         #  "sdlm_grad_variance_max": "stgs_grad_bias_reference_grad_variance_max"
       
-      - name: "GS($\\tau=100$)" # - 2 seeds)"
+      #- name: "GS($\\tau=100$)" # - 2 seeds)"
+      - name: "GBDA($\\tau=100$)" # - 2 seeds)"
         project: "near32/PromptOptimisationSTGS"
-        color: "#2ca02c"  # Green
+        color: "#E69F00" #OI1 "#2ca02c"  # Green
+        lightness: 20    # Optional: L* value (0-100)
         run_ids:
           - "uzxm69ea"
           - "nn1jwdb8"
@@ -103,9 +143,11 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS($\\tau=1$)" # - 4 seeds)"
+      #- name: "GS($\\tau=1$)" # - 4 seeds)"
+      - name: "GBDA($\\tau=1$)" # - 4 seeds)"
         project: "near32/PromptOptimisationSTGS"
-        color: "#37c837"  # lighter Green
+        color: "#E69F00" #OI1 "#37c837"  # lighter Green
+        lightness: 60    # Optional: L* value (0-100)
         run_ids:
           - "5u5sj7u8"
           - "or36l8lt"
@@ -142,7 +184,8 @@ figures:
       
       - name: "SODA"
         project: "near32/LMI-SODA"
-        color: "#9900cc"  # Purple 40%
+        color: "#009E73" # OI3 #9900cc"  # Purple 40%
+        lightness: 20    # Optional: L* value (0-100)
         data_filter: "epoch==2047"  # overrides
         loose_filtering: True
         run_ids:
@@ -150,9 +193,11 @@ figures:
         #metric_aliases:
         #  "sdlm_grad_variance_max": "stgs_grad_bias_reference_grad_variance_max"
       
-      - name: "GS(L-$\\tau=100$)"
+      #- name: "GS(L-$\\tau=100$)"
+      - name: "DLMI($\\tau_0=100$)-TF"
         project: "near32/PromptOptimisationSTGS"
-        color: "#1e72ae"  # Blue
+        color: "#0072B2" #OI5 "#1e72ae"  # Blue
+        lightness: 20    # Optional: L* value (0-100)
         run_ids:
           - "aoukwyb1"
           - "jxcwxnwl"
@@ -163,9 +208,11 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(L-$\\tau=1$)" # - 4 seeds)"
+      #- name: "GS(L-$\\tau=1$)" # - 4 seeds)"
+      - name: "DLMI($\\tau_0=1$)-TF" # - 4 seeds)"
         project: "near32/PromptOptimisationSTGS"
-        color: "#258fda"  # Blue
+        color: "#0072B2" #OI5 "#258fda"  # Blue
+        lightness: 60    # Optional: L* value (0-100)
         run_ids:
           - "nmnb9fhl"
           - "jftyoxc2"
@@ -176,24 +223,28 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(DL-$\\tau=100$)+TF (256 Opt. steps)"
-        project: "near32/PromptOptimisationSTGS"
-        color: "#cc0000"  # Red
-        data_filter: "epoch==255"  # overrides
-        loose_filtering: True
-        run_ids:
-          - "fw048qur"
-          #- "21g4ubll"
-          - "vomcef6s"
-          - "gjv636dz"
-          - "dydh72sy"
+      #- name: "GS(DL-$\\tau=100$)+TF (256 Opt. steps)"
+      #- name: "DLMI($\\tau=100$)+TF (256 Opt. steps)"
+      #  project: "near32/PromptOptimisationSTGS"
+      #  color: "#D55E00" #OI6 "#cc0000"  # Red
+      #  lightness: 20    # Optional: L* value (0-100)
+      #  data_filter: "epoch==255"  # overrides
+      #  loose_filtering: True
+      #  run_ids:
+      #    - "fw048qur"
+      #    #- "21g4ubll"
+      #    - "vomcef6s"
+      #    - "gjv636dz"
+      #    - "dydh72sy"
         #metric_aliases:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(DL-$\\tau=100$)+TF" # (2048 Opt. steps)"
+      #- name: "GS(DL-$\\tau=100$)+TF" # (2048 Opt. steps)"
+      - name: "DLMI($\\tau_0=100$)" # (2048 Opt. steps)"
         project: "near32/PromptOptimisationSTGS"
-        color: "#ff0000"  # Red
+        color: "#D55E00" #OI6 "#ff0000"  # Red
+        lightness: 60    # Optional: L* value (0-100)
         data_filter: "epoch==2047"  # overrides
         loose_filtering: True
         run_ids:

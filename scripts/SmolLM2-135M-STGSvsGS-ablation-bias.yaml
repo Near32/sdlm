@@ -4,14 +4,39 @@ projects:
 cache_dir: 'wandb_cache'
 
 output_dir: "SmolLM2-135M-STGSvsGS-ablation/bias-PL80"
-output_format: "png"
+output_format: "pdf"
 dpi: 300
 
 # Style
 plot_style: "seaborn-v0_8"
 color_palette: "pastel"
-font_sizes: 11
 
+font_sizes: 10 #20 #11
+# OR
+#font_sizes:
+#  default: 10
+#  title: 14
+#  labels: 12
+#  ticks: 10
+#  legend: 11
+
+# Global default (optional)                                                                                                                                                                 
+legend_export:
+  enabled: true
+  format: pdf  # output format
+  fontsize: 10
+  figsize: #[8, 1.5]  # [width, height] in inches  
+    width: 6.5 #inches
+    height: 0.5 #inches
+    #aspect_ratio: 1.67 #golden ratio    
+  ncol: 6  # number of columns (0 for auto)
+  loc: 'center'
+  frameon: false
+  remove_from_main: true 
+  hide_xlabel: true       # Remove x-axis label from main figures
+  hide_ylabel: false #true       # Remove y-axis label from main figures
+  hide_title: true        # Remove title from main figures
+ 
 # Configure Kolmogorov-Smirnov tests
 Kolmogorov-Smirnov-anchors:
   #- "REINFORCE"
@@ -22,7 +47,10 @@ Kolmogorov-Smirnov-kwargs:
   alternative: "two-sided"
   mode: "auto"
 
-
+# Global config
+figsize:
+  width: 3.25 #inches for one column spanning
+  aspect_ratio: 1.67 # golden ratio
 
 figures:
   - name: "Gradient-Max-Abs-Bias"
@@ -32,19 +60,98 @@ figures:
     
     barplot_config:
       enabled: true
+      ylabel: "Gradient Bias"
       figsize: [6,4]
       capsize: 5
       title: "Max Gradient Abs Bias (Mean +/- Std.Err. - PL=80)"
       xtick_rotation: 20
       log_scale: true
       #ylim: [0, 1]
+      hide_xlabel: true       # Remove x-axis label from main figures
+      hide_xticklabels: true       # Remove x-axis label from main figures
+      hide_ylabel: true       # Remove y-axis label from main figures
+      hide_yticklabels: false       # Remove y-axis label from main figures
+      hide_title: true        # Remove title from main figures
+ 
+
+    conditioned_barplot_config:
+      enabled: true
+      condition_column: "k"              # Required: column for x-axis
+      condition_values: [1, 6, 11, 16, 21]     # Optional: specific values
+      # Option A: List format [width, height]
+      #figsize: [10, 6]
+      # Option B: Dict with explicit height
+      #figsize:
+      #  width: 10
+      #  height: 6
+      # Option C: Dict with aspect ratio (width/height)
+      figsize:
+        width: 6.5 # 3.25 #inches
+        aspect_ratio: 1.67 #golden ratio 
+      
+      ylabel: "Gradient Bias"
+      xlabel: "Inversion Difficulty (Rank k)"
+      title: "Grad Bias vs Difficulty"
+      capsize: 4
+      alpha: 0.9
+      ylim: [0, 1]
+      log_scale: false
+      legend_loc: "best"
+      show_values: false
+
+    violinplot_config:
+      enabled: true
+      ylabel: "Gradient Bias"
+      figsize: [6,4]
+      capsize: 5
+      title: "Max Gradient Abs Bias (Mean +/- Std.Err. - PL=80)"
+      xtick_rotation: 20
+      log_scale: true
+      #ylim: [0, 1]
+      cut: 0
+      show_means: true
+      show_medians: false
+      show_extremas: true
+      show_points: true
+      show_values: false
+      hide_xlabel: true       # Remove x-axis label from main figures
+      hide_xticklabels: true       # Remove y-axis label from main figures
+      hide_ylabel: true       # Remove y-axis label from main figures
+      hide_yticklabels: false       # Remove y-axis label from main figures
+      hide_title: true        # Remove title from main figures
+ 
+
+    conditioned_violinplot_config:
+      enabled: true
+      condition_column: "k"              # Required: column for x-axis
+      condition_values: [1, 6, 11, 16, 21]     # Optional: specific values
+      # Option A: List format [width, height]
+      #figsize: [10, 6]
+      # Option B: Dict with explicit height
+      #figsize:
+      #  width: 10
+      #  height: 6
+      # Option C: Dict with aspect ratio (width/height)
+      figsize:
+        width: 6.5 # 3.25 #inches
+        aspect_ratio: 1.67 #golden ratio 
+      
+      ylabel: "Gradient Bias"
+      xlabel: "Inversion Difficulty (Rank k)"
+      title: "Grad Bias vs Difficulty"
+      capsize: 4
+      alpha: 0.9
+      ylim: [0, 1]
+      log_scale: false
+      legend_loc: "best"
+      show_values: false
 
     lineplot_config:
       enabled: false
-      title: "KeyCorridor-S6R3"
-      xlabel: "# Observations"
+      title: ""
+      xlabel: ""
       ylabel: ""
-      xlim: [0, 5000000]
+      xlim: [0, 1]
       ylim: [0, 1]
     
     synchronization:
@@ -59,8 +166,10 @@ figures:
       min_periods: 1
 
     groups:
-      - name: "GS(Tau=100 - 2 seeds)"
+      - name: "GS($\\tau$$=$$100$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#E69F00" #OI1 "#2ca02c"  # Green
+        lightness: 20    # Optional: L* value (0-100)
         run_ids:
           - "1utbi1zz"
           - "yo78ohr7"
@@ -71,8 +180,10 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(Tau=1 - 4 seeds)"
+      - name: "GS($\\tau$$=$$1$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#E69F00" #OI1 "#2ca02c"  # Green
+        lightness: 60    # Optional: L* value (0-100)
         run_ids:
           - "yo78ohr7"
           - "74u1l7w0"
@@ -107,8 +218,10 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
       
-      - name: "GS(LTau=100)"
+      - name: "GS(L$+$$\\tau$$=$$100$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#009E73" # OI3 #9900cc"  # Purple 40%
+        lightness: 20    # Optional: L* value (0-100)
         run_ids:
           - "p3ymxa6s"
           - "gkbj8ddh"
@@ -119,8 +232,11 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(LTau=1 - 4 seeds)"
+      #- name: "GS(LTau=1 - 4 seeds)"
+      - name: "GS(L$+$$\\tau$$=$$1$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#009E73" # OI3 #9900cc"  # Purple 40%
+        lightness: 60    # Optional: L* value (0-100)
         run_ids:
           - "8dqvoghq"
           - "ln03i3cu"
@@ -154,8 +270,10 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
                
-      - name: "GS(DLTau=100)"
+      - name: "GS(D$+$L$+$$\\tau$$=$$100$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#0072B2" #OI5 "#258fda"  # Blue
+        lightness: 20    # Optional: L* value (0-100)
         run_ids:
           - "35c80euk"
           - "vxsnb3ov"
@@ -166,8 +284,10 @@ figures:
         #  "mean_episode_return": "rollout/ep_info_rew_mean"
         #  "obs_count": "time/total_timesteps" 
  
-      - name: "GS(DLTau=1)"
+      - name: "GS(D$+$L$+$$\\tau$$=$$1$)"
         project: "near32/PromptOptimisationSTGS"
+        color: "#0072B2" #OI5 "#258fda"  # Blue
+        lightness: 60    # Optional: L* value (0-100)
         run_ids:
           - "sbjxgre3"
           - "ncojjl0g"
