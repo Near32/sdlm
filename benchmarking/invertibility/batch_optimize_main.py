@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from metrics_registry import compute_all_metrics
 from metrics_aggregator import MetricsAggregator
 from metrics_logging import MetricsLogger
-from evaluation_utils import evaluate_generated_output
+from evaluation_utils import evaluate_generated_output, evaluate_prompt_reconstruction
 from main import optimize_inputs
 
 logger = logging.getLogger("batch_optimize")
@@ -71,26 +71,56 @@ def setup_model_and_tokenizer(model_name: str, device: str = 'cpu', model_precis
 def load_dataset(dataset_path: str) -> Dict[str, Any]:
     """
     Load dataset from a JSON file.
-    
+
+    Auto-detects dataset format (legacy vs SODA) from metadata.
+
     Args:
         dataset_path: Path to the dataset file
-        
+
     Returns:
         Dataset dictionary
     """
     import json
-    
+
     logger.info(f"Loading dataset from {dataset_path}")
-    
+
     try:
         with open(dataset_path, 'r') as f:
             dataset = json.load(f)
-        
-        logger.info(f"Loaded {len(dataset.get('samples', []))} samples")
+
+        num_samples = len(dataset.get('samples', []))
+        logger.info(f"Loaded {num_samples} samples")
+
+        # Detect dataset format
+        metadata = dataset.get("metadata", {})
+        evaluation_type = metadata.get("evaluation_type", "output_match")
+
+        if evaluation_type == "prompt_reconstruction":
+            logger.info("Detected SODA-style prompt reconstruction dataset")
+            logger.info(f"  - Dataset source: {metadata.get('dataset_source', 'unknown')}")
+            logger.info(f"  - Prompt length: {metadata.get('prompt_length', 'unknown')}")
+            logger.info(f"  - Output length: {metadata.get('output_length', 'unknown')}")
+        else:
+            logger.info("Detected legacy output-match dataset")
+
         return dataset
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
         raise
+
+
+def is_prompt_reconstruction_dataset(dataset: Dict[str, Any]) -> bool:
+    """
+    Check if the dataset is a SODA-style prompt reconstruction dataset.
+
+    Args:
+        dataset: The loaded dataset dictionary
+
+    Returns:
+        True if this is a prompt reconstruction dataset
+    """
+    metadata = dataset.get("metadata", {})
+    return metadata.get("evaluation_type") == "prompt_reconstruction"
 
 def prepare_targets(dataset: Dict[str, Any], target_indices: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
@@ -112,8 +142,9 @@ def prepare_targets(dataset: Dict[str, Any], target_indices: Optional[List[int]]
     
     return targets
 
-def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: str, 
-                       config: Dict[str, Any], run_id: str, output_dir: str, metric_groups: List[str] = None) -> Dict[str, Any]:
+def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: str,
+                       config: Dict[str, Any], run_id: str, output_dir: str, metric_groups: List[str] = None,
+                       is_prompt_reconstruction: bool = False) -> Dict[str, Any]:
     """
     Optimize a prompt for a specific target sentence.
     
@@ -126,19 +157,29 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         run_id: Unique identifier for the W&B run
         output_dir: Directory to save results locally
         metric_groups: List of metric groups to compute
-        
+        is_prompt_reconstruction: Whether this is a SODA-style prompt reconstruction evaluation
+
     Returns:
         result: Dictionary containing optimization results
     """
-    
+
     target_id = target_info["id"]
     target_text = target_info["text"]
-    k_target = target_info["k_target"]
-    
+    k_target = target_info.get("k_target", 1)  # Default to 1 for SODA datasets
+
     # Get pre-computed perplexity from dataset if available
     target_perplexity = target_info.get("perplexity", None)
-    
-    logger.info(f"Optimizing prompt for target {target_id}: '{target_text}'")
+
+    # For SODA-style datasets, get ground-truth prompt information
+    ground_truth_prompt = target_info.get("ground_truth_prompt", None)
+    ground_truth_prompt_tokens = target_info.get("ground_truth_prompt_tokens", None)
+
+    if is_prompt_reconstruction:
+        logger.info(f"Optimizing prompt for target {target_id} (prompt reconstruction mode)")
+        if ground_truth_prompt:
+            logger.info(f"  Ground-truth prompt: '{ground_truth_prompt[:50]}...'")
+    else:
+        logger.info(f"Optimizing prompt for target {target_id}: '{target_text}'")
     
     # Create a run name that includes the target information
     run_name = f"{run_id}_target{target_id}_k{k_target}"
@@ -151,8 +192,13 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         "target_k": k_target,
         "target_avg_rank": target_info.get("avg_rank", 0),
         "target_length": target_info.get("length", len(target_text.split())),
-        "target_perplexity": target_perplexity
+        "target_perplexity": target_perplexity,
+        "is_prompt_reconstruction": is_prompt_reconstruction,
     })
+
+    # Add prompt reconstruction specific metadata
+    if is_prompt_reconstruction and ground_truth_prompt_tokens:
+        target_config["ground_truth_prompt_length"] = len(ground_truth_prompt_tokens)
     
     # Setup metrics logger
     metrics_logger = MetricsLogger(
@@ -173,11 +219,15 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
     and not config['learnable_temperature']:
         raise ValueError("decouple_learnable_temperature requires learnable_temperature")
 
+    if config['bptt_decouple_learnable_temperature'] \
+    and not config['bptt_learnable_temperature']:
+        raise ValueError("bptt_decouple_learnable_temperature requires bptt_learnable_temperature")
+
     # Tokenize target for later comparison
     target_tokens = tokenizer(target_text, return_tensors="pt").input_ids[0].cpu().tolist()
     
     # Optimize inputs for this target
-    generated_tokens, optimized_inputs, losses, lcs_ratio_history = optimize_inputs(
+    generated_tokens, optimized_inputs, losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history = optimize_inputs(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -192,6 +242,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         learnable_temperature=config.get("learnable_temperature", False),
         decouple_learnable_temperature=config.get("decouple_learnable_temperature", False),
         bptt_learnable_temperature=config.get("bptt_learnable_temperature", False),
+        bptt_decouple_learnable_temperature=config.get("bptt_decouple_learnable_temperature", False),
         stgs_hard=config.get("stgs_hard", True),
         bptt_stgs_hard=config.get("bptt_stgs_hard", True),
         bptt_hidden_state_conditioning=config.get("bptt_hidden_state_conditioning", False),
@@ -240,25 +291,49 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         gcg_init_strategy=config.get("gcg_init_strategy", "zeros"),
         # Teacher forcing (for faster training)
         teacher_forcing=config.get("teacher_forcing", False),
+        # Prompt reconstruction (SODA-style)
+        ground_truth_prompt_tokens=ground_truth_prompt_tokens if is_prompt_reconstruction else None,
+        ground_truth_prompt=ground_truth_prompt if is_prompt_reconstruction else None,
+        # Semantic metrics (BERT/SentenceBERT) per-epoch tracking
+        semantic_metrics_every_n_epochs=config.get("semantic_metrics_every_n_epochs", 0),
+        bertscore_model_type=config.get("bertscore_model", "distilbert-base-uncased"),
+        sentencebert_model_name=config.get("sentencebert_model", "all-MiniLM-L6-v2"),
         kwargs=config,
     )
     
     # Extract the optimized prompt tokens
     optimized_tokens = torch.argmax(optimized_inputs[0], dim=-1).cpu().tolist()
     optimized_text = tokenizer.decode(optimized_tokens)
-    
+
     # Evaluate the generated output using our centralized metrics system
     evaluation_metrics = evaluate_generated_output(
-        generated_tokens=generated_tokens, 
-        target_tokens=target_tokens, 
+        generated_tokens=generated_tokens,
+        target_tokens=target_tokens,
         tokenizer=tokenizer,
         metric_groups=metric_groups,
         device=device
     )
-    
+
+    # For SODA-style prompt reconstruction, also compute prompt-level metrics
+    prompt_metrics = {}
+    if is_prompt_reconstruction and ground_truth_prompt_tokens:
+        prompt_metrics = evaluate_prompt_reconstruction(
+            optimized_tokens=optimized_tokens,
+            ground_truth_tokens=ground_truth_prompt_tokens,
+            tokenizer=tokenizer,
+            device=device
+        )
+        # Merge prompt metrics into evaluation metrics
+        evaluation_metrics.update(prompt_metrics)
+
+        logger.info(f"Prompt reconstruction metrics for {target_id}:")
+        logger.info(f"  Prompt exact match: {prompt_metrics.get('prompt_exact_match', 0)}")
+        logger.info(f"  Prompt token accuracy: {prompt_metrics.get('prompt_token_accuracy', 0):.4f}")
+        logger.info(f"  Prompt LCS ratio: {prompt_metrics.get('prompt_lcs_ratio', 0):.4f}")
+
     # Log evaluation metrics to W&B
     metrics_logger.log_metrics(evaluation_metrics)
-    
+
     # Create result dictionary
     result = {
         "target_id": target_id,
@@ -274,7 +349,20 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         "loss_history": [float(loss) for loss in losses],
         "lcs_ratio_history": lcs_ratio_history,
     }
-    
+
+    # Add prompt reconstruction specific fields
+    if is_prompt_reconstruction:
+        result["is_prompt_reconstruction"] = True
+        if ground_truth_prompt_tokens:
+            result["ground_truth_prompt_tokens"] = ground_truth_prompt_tokens
+            result["ground_truth_prompt"] = ground_truth_prompt
+        result["prompt_metrics"] = prompt_metrics
+        result["prompt_metrics_history"] = prompt_metrics_history
+
+    # Add semantic metrics history if tracked
+    if semantic_metrics_history and any(len(v) > 0 for v in semantic_metrics_history.values()):
+        result["semantic_metrics_history"] = semantic_metrics_history
+
     # Save results to file
     metrics_logger.save_to_file(result, "result.json")
     
@@ -294,13 +382,14 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
     
     return result
 
-def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, device: str, 
-                              config: Dict[str, Any], run_id: str, output_dir: str, 
+def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, device: str,
+                              config: Dict[str, Any], run_id: str, output_dir: str,
                               metrics_aggregator: MetricsAggregator,
-                              metric_groups: List[str] = None) -> Dict[str, Dict[str, Any]]:
+                              metric_groups: List[str] = None,
+                              is_prompt_reconstruction: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Process targets sequentially.
-    
+
     Args:
         targets: List of target info dictionaries
         model: Language model
@@ -311,12 +400,13 @@ def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, 
         output_dir: Directory to save results
         metrics_aggregator: Metrics aggregator
         metric_groups: List of metric groups to compute
-        
+        is_prompt_reconstruction: Whether this is a SODA-style prompt reconstruction evaluation
+
     Returns:
         results: Dictionary mapping target IDs to optimization results
     """
     results = {}
-    
+
     for target in tqdm(targets, desc="Optimizing for targets"):
         result = optimize_for_target(
             target_info=target,
@@ -326,26 +416,31 @@ def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, 
             config=config,
             run_id=run_id,
             output_dir=output_dir,
-            metric_groups=metric_groups
+            metric_groups=metric_groups,
+            is_prompt_reconstruction=is_prompt_reconstruction
         )
         results[target["id"]] = result
 
         # Add metrics to aggregator
-        metrics_aggregator.add_sample(result["evaluation"], k_value=target["k_target"])
-        # Add per-epoch lcs_ratio history to aggregator
+        k_value = target.get("k_target", 1)
+        metrics_aggregator.add_sample(result["evaluation"], k_value=k_value)
+        # Add per-epoch lcs_ratio history, prompt metrics history, and semantic metrics history to aggregator
         metrics_aggregator.add_epoch_metrics(
             lcs_ratio_history=result["lcs_ratio_history"],
-            k_value=target["k_target"]
+            k_value=k_value,
+            prompt_metrics_history=result.get("prompt_metrics_history"),
+            semantic_metrics_history=result.get("semantic_metrics_history")
         )
 
     return results
 
-def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, config: Dict[str, Any], 
+def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, config: Dict[str, Any],
                            run_id: str, output_dir: str, metrics_aggregator: MetricsAggregator,
-                           num_workers: int, metric_groups: List[str] = None) -> Dict[str, Dict[str, Any]]:
+                           num_workers: int, metric_groups: List[str] = None,
+                           is_prompt_reconstruction: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Process targets in parallel using a ProcessPoolExecutor.
-    
+
     Args:
         targets: List of target info dictionaries
         model: Language model
@@ -356,12 +451,13 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
         metrics_aggregator: Metrics aggregator
         num_workers: Number of parallel workers
         metric_groups: List of metric groups to compute
-        
+        is_prompt_reconstruction: Whether this is a SODA-style prompt reconstruction evaluation
+
     Returns:
         results: Dictionary mapping target IDs to optimization results
     """
     results = {}
-    
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         future_to_target = {
             executor.submit(
@@ -373,12 +469,13 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
                 config=config,
                 run_id=run_id,
                 output_dir=output_dir,
-                metric_groups=metric_groups
+                metric_groups=metric_groups,
+                is_prompt_reconstruction=is_prompt_reconstruction
             ): target for target in targets
         }
-        
-        for future in tqdm(concurrent.futures.as_completed(future_to_target), 
-                         total=len(targets), 
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_target),
+                         total=len(targets),
                          desc="Optimizing for targets"):
             target = future_to_target[future]
             try:
@@ -386,16 +483,19 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
                 results[target["id"]] = result
 
                 # Add metrics to aggregator
-                metrics_aggregator.add_sample(result["evaluation"], k_value=target["k_target"])
-                # Add per-epoch lcs_ratio history to aggregator
+                k_value = target.get("k_target", 1)
+                metrics_aggregator.add_sample(result["evaluation"], k_value=k_value)
+                # Add per-epoch lcs_ratio history, prompt metrics history, and semantic metrics history to aggregator
                 metrics_aggregator.add_epoch_metrics(
                     lcs_ratio_history=result["lcs_ratio_history"],
-                    k_value=target["k_target"]
+                    k_value=k_value,
+                    prompt_metrics_history=result.get("prompt_metrics_history"),
+                    semantic_metrics_history=result.get("semantic_metrics_history")
                 )
 
             except Exception as exc:
                 logger.error(f"Target {target['id']} generated an exception: {exc}")
-    
+
     return results
 
 def batch_optimize(dataset_path: str, model_name: str, output_dir: str, 
@@ -433,48 +533,55 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
     # Load dataset and prepare targets
     dataset = load_dataset(dataset_path)
     targets = prepare_targets(dataset, target_indices)
-    
+
+    # Detect if this is a SODA-style prompt reconstruction dataset
+    prompt_reconstruction_mode = is_prompt_reconstruction_dataset(dataset)
+    if prompt_reconstruction_mode:
+        logger.info("Running in SODA-style prompt reconstruction evaluation mode")
+
     # Initialize model and tokenizer
     model, tokenizer = setup_model_and_tokenizer(
-        model_name, 
-        device, 
+        model_name,
+        device,
         model_precision=config.get("model_precision", "full")
     )
-    
+
     # Create output directory
     full_output_dir = f"{output_dir}/{run_id}"
     output_path = Path(full_output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Initialize the metrics aggregator
     metrics_aggregator = MetricsAggregator()
-    
+
     # Process targets based on number of workers
     if num_workers == 1:
         results = process_targets_sequential(
-            targets=targets, 
-            model=model, 
-            tokenizer=tokenizer, 
-            device=device, 
-            config=config, 
-            run_id=run_id, 
-            output_dir=full_output_dir, 
+            targets=targets,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            config=config,
+            run_id=run_id,
+            output_dir=full_output_dir,
             metrics_aggregator=metrics_aggregator,
-            metric_groups=metric_groups
+            metric_groups=metric_groups,
+            is_prompt_reconstruction=prompt_reconstruction_mode
         )
     else:
         results = process_targets_parallel(
-            targets=targets, 
-            model=model, 
-            tokenizer=tokenizer, 
-            config=config, 
-            run_id=run_id, 
-            output_dir=full_output_dir, 
+            targets=targets,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            run_id=run_id,
+            output_dir=full_output_dir,
             metrics_aggregator=metrics_aggregator,
             num_workers=num_workers,
-            metric_groups=metric_groups
+            metric_groups=metric_groups,
+            is_prompt_reconstruction=prompt_reconstruction_mode
         )
-    
+
     # Initialize the metrics logger
     metrics_logger = MetricsLogger(
         run_id=run_id,
@@ -482,7 +589,7 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
         wandb_project=config.get("wandb_project"),
         wandb_entity=config.get("wandb_entity")
     )
-    
+
     # Initialize W&B for batch coordination
     metrics_logger.init_wandb(
         group=run_id,
@@ -491,12 +598,26 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
             "dataset_path": dataset_path,
             "model_name": model_name,
             "num_targets": len(targets),
-            "metadata": dataset.get("metadata", {})
+            "metadata": dataset.get("metadata", {}),
+            "is_prompt_reconstruction": prompt_reconstruction_mode
         },
         name=f"batch_optimization_{run_id}",
         job_type="batch_coordination"
     )
     
+    # Populate summary table with individual target results
+    for target in targets:
+        target_id = target["id"]
+        if target_id in results:
+            result = results[target_id]
+            metrics_logger.update_summary_table(
+                sample_id=str(target_id),
+                target_info=target,
+                result=result,
+                metrics=result["evaluation"],
+                ground_truth_prompt=target.get("ground_truth_prompt")
+            )
+
     # Get the complete summary
     summary = metrics_aggregator.get_summary()
 
@@ -513,6 +634,32 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
                 "avg_lcs_ratio": avg_lcs,
             }
             metrics_logger.log_metrics(log_entry)
+
+    # Log per-epoch prompt metrics by k-value to W&B (for SODA-style evaluation)
+    if summary.get("has_prompt_metrics_history"):
+        avg_prompt_metrics = summary.get("avg_prompt_metrics_by_epoch_by_k", {})
+        for metric_name, epoch_dict in avg_prompt_metrics.items():
+            for epoch, k_dict in epoch_dict.items():
+                for k_value, avg_value in k_dict.items():
+                    log_entry = {
+                        "epoch": epoch,
+                        "k": k_value,
+                        f"avg_{metric_name}": avg_value,
+                    }
+                    metrics_logger.log_metrics(log_entry)
+
+    # Log per-epoch semantic metrics by k-value to W&B (BERT/SentenceBERT)
+    if summary.get("has_semantic_metrics_history"):
+        avg_semantic_metrics = summary.get("avg_semantic_metrics_by_epoch_by_k", {})
+        for metric_name, epoch_dict in avg_semantic_metrics.items():
+            for epoch, k_dict in epoch_dict.items():
+                for k_value, avg_value in k_dict.items():
+                    log_entry = {
+                        "epoch": epoch,
+                        "k": k_value,
+                        f"avg_{metric_name}": avg_value,
+                    }
+                    metrics_logger.log_metrics(log_entry)
 
     # Add results to summary
     summary["results"] = results
@@ -674,6 +821,8 @@ def parse_args():
                         help="Temperature for BPTT Gumbel-Softmax")
     parser.add_argument("--bptt_learnable_temperature", type=str2bool, default=False,
                         help="Whether to learn the BPTT temperature parameter")
+    parser.add_argument("--bptt_decouple_learnable_temperature", type=str2bool, default=False,
+                        help="Whether to learn multiple decouple temperature parameters, one for each learnable input.")
     parser.add_argument("--bptt_stgs_hard", type=str2bool, default=False,
                         help="Whether to use hard ST-GS for BPTT")
     parser.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False,
@@ -750,7 +899,11 @@ def parse_args():
     # BERTScore parameters
     parser.add_argument("--bertscore_model", type=str, default="distilbert-base-uncased",
                         help="Model to use for BERTScore computation")
-    
+
+    # Per-epoch semantic metrics
+    parser.add_argument("--semantic_metrics_every_n_epochs", type=int, default=128,
+                        help="Compute BERT/SentenceBERT every N epochs (0=disabled)")
+
     return parser.parse_args()
 
 def main():
