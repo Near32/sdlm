@@ -109,9 +109,9 @@ class MetricsLogger:
             
         return wandb.Table(
             columns=[
-                "sample_id", "target_text", "k_value", "target_perplexity", 
-                "generated_text", "final_loss", "exact_match", "token_accuracy",
-                "token_overlap_ratio", "target_hit_ratio", "lcs_ratio", 
+                "sample_id", "target_text", "k_value", "target_perplexity",
+                "generated_text", "ground_truth_prompt", "final_loss", "exact_match", "token_accuracy",
+                "token_overlap_ratio", "target_hit_ratio", "lcs_ratio",
                 "unigram_overlap", "bigram_overlap", "bertscore_f1",
                 "bertscore_precision", "bertscore_recall", "mauve_score",
                 "sentencebert_similarity"
@@ -186,7 +186,7 @@ class MetricsLogger:
             self.wandb_run.log(log_metrics, step=step)
 
         
-    def log_k_metrics(self, k: int, metrics: Dict[str, Any]):
+    def log_k_metrics(self, k: int, metrics: Dict[str, Any], epoch: Optional[int] = None):
         """
         Log metrics for a specific k value, following the original format for plotting.
         
@@ -198,6 +198,9 @@ class MetricsLogger:
             return
             
         log_dict = {}
+
+        if epoch is not None:
+            log_dict["epoch"] = epoch
         
         # First, add metrics with k prefix (matches original format)
         for metric_name, value in metrics.items():
@@ -215,27 +218,29 @@ class MetricsLogger:
         # Log to W&B
         self.wandb_run.log(log_dict)
         
-    def update_summary_table(self, sample_id: str, target_info: Dict[str, Any], 
-                            result: Dict[str, Any], metrics: Dict[str, Any]):
+    def update_summary_table(self, sample_id: str, target_info: Dict[str, Any],
+                            result: Dict[str, Any], metrics: Dict[str, Any],
+                            ground_truth_prompt: str = None):
         """
         Add a row to the summary table.
-        
+
         Args:
             sample_id: Unique identifier for the sample
             target_info: Information about the target
             result: Optimization result for the target
             metrics: Evaluation metrics
+            ground_truth_prompt: Ground truth prompt for SODA-style datasets (optional)
         """
         if not self.summary_table:
             return
-            
+
         # Extract values with safe defaults
         target_text = target_info.get("text", "")
         k_value = target_info.get("k_target", 0)
         target_perplexity = target_info.get("perplexity", 0.0)
         generated_text = result.get("optimized_text", "")
         final_loss = result.get("final_loss", 0.0)
-        
+
         # Add row to table
         self.summary_table.add_data(
             sample_id,
@@ -243,6 +248,7 @@ class MetricsLogger:
             k_value,
             target_perplexity,
             generated_text,
+            ground_truth_prompt or "",
             final_loss,
             metrics.get("exact_match", 0),
             metrics.get("token_accuracy", 0.0),
