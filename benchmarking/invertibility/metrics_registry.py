@@ -27,6 +27,12 @@ METRIC_RANGES = {
     "bertscore_f1": {"min": 0, "max": 1, "higher_is_better": True},
     "mauve_score": {"min": 0, "max": 1, "higher_is_better": True},
     "sentencebert_similarity": {"min": 0, "max": 1, "higher_is_better": True},
+    # Prompt-level metrics for SODA-style evaluation
+    "prompt_exact_match": {"min": 0, "max": 1, "higher_is_better": True},
+    "prompt_token_accuracy": {"min": 0, "max": 1, "higher_is_better": True},
+    "prompt_lcs_ratio": {"min": 0, "max": 1, "higher_is_better": True},
+    "prompt_cosine_similarity": {"min": -1, "max": 1, "higher_is_better": True},
+    "prompt_cosine_similarity_soft": {"min": -1, "max": 1, "higher_is_better": True},
 }
 
 # Define the available metrics and their computation methods
@@ -213,6 +219,187 @@ registry.register(
     compute_fn=compute_lcs_ratio,
     requires=["generated_tokens", "reference_tokens"],
     group="basic"
+)
+
+# Register prompt-level metrics (for SODA-style prompt reconstruction evaluation)
+def compute_prompt_exact_match(optimized_prompt_tokens, ground_truth_prompt_tokens, **kwargs):
+    """Compute exact match for prompt reconstruction (boolean)."""
+    if optimized_prompt_tokens is None or ground_truth_prompt_tokens is None:
+        return None
+    return int(optimized_prompt_tokens == ground_truth_prompt_tokens)
+
+registry.register(
+    name="prompt_exact_match",
+    compute_fn=compute_prompt_exact_match,
+    requires=["optimized_prompt_tokens", "ground_truth_prompt_tokens"],
+    group="prompt_reconstruction"
+)
+
+def compute_prompt_token_accuracy(optimized_prompt_tokens, ground_truth_prompt_tokens, **kwargs):
+    """Compute per-position token accuracy for prompt reconstruction."""
+    if optimized_prompt_tokens is None or ground_truth_prompt_tokens is None:
+        return None
+    if len(ground_truth_prompt_tokens) == 0:
+        return 0.0
+    min_len = min(len(optimized_prompt_tokens), len(ground_truth_prompt_tokens))
+    matching_tokens = sum(
+        optimized_prompt_tokens[i] == ground_truth_prompt_tokens[i]
+        for i in range(min_len)
+    )
+    return matching_tokens / len(ground_truth_prompt_tokens)
+
+registry.register(
+    name="prompt_token_accuracy",
+    compute_fn=compute_prompt_token_accuracy,
+    requires=["optimized_prompt_tokens", "ground_truth_prompt_tokens"],
+    group="prompt_reconstruction"
+)
+
+def compute_prompt_lcs_ratio(optimized_prompt_tokens, ground_truth_prompt_tokens, **kwargs):
+    """Compute LCS ratio for prompt reconstruction."""
+    if optimized_prompt_tokens is None or ground_truth_prompt_tokens is None:
+        return None
+    if len(ground_truth_prompt_tokens) == 0:
+        return 0.0
+    lcs = lcs_length(optimized_prompt_tokens, ground_truth_prompt_tokens)
+    return lcs / len(ground_truth_prompt_tokens)
+
+registry.register(
+    name="prompt_lcs_ratio",
+    compute_fn=compute_prompt_lcs_ratio,
+    requires=["optimized_prompt_tokens", "ground_truth_prompt_tokens"],
+    group="prompt_reconstruction"
+)
+
+def compute_per_position_match(optimized_prompt_tokens, ground_truth_prompt_tokens, **kwargs):
+    """Compute per-position match array for prompt reconstruction."""
+    if optimized_prompt_tokens is None or ground_truth_prompt_tokens is None:
+        return None
+    min_len = min(len(optimized_prompt_tokens), len(ground_truth_prompt_tokens))
+    max_len = max(len(optimized_prompt_tokens), len(ground_truth_prompt_tokens))
+    matches = []
+    for i in range(max_len):
+        if i < min_len:
+            matches.append(int(optimized_prompt_tokens[i] == ground_truth_prompt_tokens[i]))
+        else:
+            matches.append(0)  # Position mismatch
+    return matches
+
+registry.register(
+    name="per_position_match",
+    compute_fn=compute_per_position_match,
+    requires=["optimized_prompt_tokens", "ground_truth_prompt_tokens"],
+    group="prompt_reconstruction"
+)
+
+def compute_prompt_cosine_similarity(
+    optimized_prompt_embeddings=None,
+    ground_truth_prompt_embeddings=None,
+    optimized_prompt_tokens=None,
+    ground_truth_prompt_tokens=None,
+    embedding_layer=None,
+    **kwargs
+):
+    """
+    Compute cosine similarity between optimized and ground-truth prompt embeddings.
+
+    Can accept either pre-computed embeddings or tokens + embedding layer.
+    If embeddings are not provided, will compute them from tokens using embedding_layer.
+
+    Returns average cosine similarity across all token positions.
+    """
+    # If embeddings are provided directly, use them
+    if optimized_prompt_embeddings is not None and ground_truth_prompt_embeddings is not None:
+        opt_emb = optimized_prompt_embeddings
+        gt_emb = ground_truth_prompt_embeddings
+    elif optimized_prompt_tokens is not None and ground_truth_prompt_tokens is not None and embedding_layer is not None:
+        # Compute embeddings from tokens
+        opt_tokens = torch.tensor(optimized_prompt_tokens, dtype=torch.long)
+        gt_tokens = torch.tensor(ground_truth_prompt_tokens, dtype=torch.long)
+
+        if hasattr(embedding_layer, 'weight'):
+            # nn.Embedding layer
+            opt_emb = embedding_layer.weight[opt_tokens]
+            gt_emb = embedding_layer.weight[gt_tokens]
+        else:
+            # Direct embedding call
+            opt_emb = embedding_layer(opt_tokens)
+            gt_emb = embedding_layer(gt_tokens)
+    else:
+        return None
+
+    # Ensure same length
+    min_len = min(opt_emb.shape[0], gt_emb.shape[0])
+    opt_emb = opt_emb[:min_len]
+    gt_emb = gt_emb[:min_len]
+
+    # Normalize embeddings
+    opt_norm = opt_emb / (opt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+    gt_norm = gt_emb / (gt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+
+    # Compute per-position cosine similarity
+    cos_sim = (opt_norm * gt_norm).sum(dim=-1)
+
+    # Return average similarity
+    return cos_sim.mean().item()
+
+registry.register(
+    name="prompt_cosine_similarity",
+    compute_fn=compute_prompt_cosine_similarity,
+    requires=["optimized_prompt_tokens", "ground_truth_prompt_tokens"],
+    group="prompt_reconstruction"
+)
+
+def compute_prompt_cosine_similarity_from_logits(
+    optimized_logits=None,
+    ground_truth_prompt_tokens=None,
+    embedding_layer=None,
+    **kwargs
+):
+    """
+    Compute cosine similarity between soft prompt embeddings (from logits) and ground-truth embeddings.
+
+    This version takes the softmax of logits and multiplies by the embedding matrix
+    to get a "soft" embedding, then compares with the ground-truth discrete embeddings.
+    """
+    if optimized_logits is None or ground_truth_prompt_tokens is None or embedding_layer is None:
+        return None
+
+    # Get embedding weights
+    if hasattr(embedding_layer, 'weight'):
+        emb_weights = embedding_layer.weight  # [vocab_size, emb_dim]
+    else:
+        return None
+
+    # Compute soft embeddings: softmax(logits) @ embedding_weights
+    # optimized_logits: [seq_len, vocab_size]
+    soft_probs = torch.softmax(optimized_logits, dim=-1)  # [seq_len, vocab_size]
+    soft_emb = soft_probs @ emb_weights  # [seq_len, emb_dim]
+
+    # Get ground-truth embeddings
+    gt_tokens = torch.tensor(ground_truth_prompt_tokens, dtype=torch.long, device=emb_weights.device)
+    gt_emb = emb_weights[gt_tokens]  # [seq_len, emb_dim]
+
+    # Ensure same length
+    min_len = min(soft_emb.shape[0], gt_emb.shape[0])
+    soft_emb = soft_emb[:min_len]
+    gt_emb = gt_emb[:min_len]
+
+    # Normalize embeddings
+    soft_norm = soft_emb / (soft_emb.norm(dim=-1, keepdim=True) + 1e-9)
+    gt_norm = gt_emb / (gt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+
+    # Compute per-position cosine similarity
+    cos_sim = (soft_norm * gt_norm).sum(dim=-1)
+
+    # Return average similarity
+    return cos_sim.mean().item()
+
+registry.register(
+    name="prompt_cosine_similarity_soft",
+    compute_fn=compute_prompt_cosine_similarity_from_logits,
+    requires=["optimized_logits", "ground_truth_prompt_tokens", "embedding_layer"],
+    group="prompt_reconstruction"
 )
 
 # Register advanced metrics
