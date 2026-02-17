@@ -17,6 +17,17 @@ except ImportError:
 
 logger = logging.getLogger("evaluation_utils")
 
+# Global caches for semantic models
+_sentencebert_cache = {}
+
+def get_cached_sentencebert(model_name: str, device: str):
+    """Get or create cached SentenceTransformer model."""
+    cache_key = f"{model_name}_{device}"
+    if cache_key not in _sentencebert_cache:
+        from sentence_transformers import SentenceTransformer
+        _sentencebert_cache[cache_key] = SentenceTransformer(model_name, device=device)
+    return _sentencebert_cache[cache_key]
+
 
 def _to_serializable(obj: Any) -> Any:
     """
@@ -254,12 +265,18 @@ def evaluate_generated_output(
     
     # Use the centralized metrics computation if available
     if REGISTRY_AVAILABLE:
+        # Always skip prompt_reconstruction group - those metrics are computed separately
+        # via per-epoch tracking in the optimization loop
+        effective_skip_groups = list(skip_metric_groups) if skip_metric_groups else []
+        if "prompt_reconstruction" not in effective_skip_groups:
+            effective_skip_groups.append("prompt_reconstruction")
+
         metrics = compute_all_metrics(
             generated_tokens=generated_tokens,
             reference_tokens=target_tokens,
             tokenizer=tokenizer,
             compute_groups=metric_groups,
-            skip_groups=skip_metric_groups,
+            skip_groups=effective_skip_groups,
             device=device,
             bertscore_model_type=bertscore_model,
             sentencebert_model_name=sentencebert_model
@@ -294,6 +311,100 @@ def evaluate_generated_output(
     metrics["target_text"] = target_text
     
     return _to_serializable(metrics)
+
+def evaluate_prompt_reconstruction(
+    optimized_tokens: List[int],
+    ground_truth_tokens: List[int],
+    tokenizer,
+    device=None
+) -> Dict[str, Any]:
+    """
+    Evaluate prompt reconstruction performance (SODA-style evaluation).
+
+    Computes metrics comparing the optimized prompt tokens against
+    the ground-truth prompt tokens.
+
+    Args:
+        optimized_tokens: Optimized prompt token IDs
+        ground_truth_tokens: Ground-truth prompt token IDs
+        tokenizer: Tokenizer for decoding texts
+        device: Device to run on (unused, for API consistency)
+
+    Returns:
+        Dictionary containing prompt-level evaluation metrics:
+        - prompt_exact_match: Binary (1 if optimized == ground-truth)
+        - prompt_token_accuracy: Per-position token accuracy
+        - prompt_lcs_ratio: LCS ratio on prompt tokens
+        - per_position_match: List of per-position match indicators
+        - optimized_prompt_text: Decoded optimized prompt
+        - ground_truth_prompt_text: Decoded ground-truth prompt
+    """
+    metrics = {}
+
+    # Compute prompt-level metrics using registry if available
+    if REGISTRY_AVAILABLE:
+        from metrics_registry import registry
+
+        # Compute each prompt metric
+        prompt_metrics = ["prompt_exact_match", "prompt_token_accuracy",
+                         "prompt_lcs_ratio", "per_position_match"]
+
+        for metric_name in prompt_metrics:
+            result = registry.compute_metric(
+                metric_name,
+                optimized_prompt_tokens=optimized_tokens,
+                ground_truth_prompt_tokens=ground_truth_tokens
+            )
+            if result is not None:
+                metrics[metric_name] = result
+    else:
+        # Fallback implementation
+        # Exact match
+        metrics["prompt_exact_match"] = int(optimized_tokens == ground_truth_tokens)
+
+        # Token accuracy
+        if len(ground_truth_tokens) > 0:
+            min_len = min(len(optimized_tokens), len(ground_truth_tokens))
+            matching = sum(
+                optimized_tokens[i] == ground_truth_tokens[i]
+                for i in range(min_len)
+            )
+            metrics["prompt_token_accuracy"] = matching / len(ground_truth_tokens)
+        else:
+            metrics["prompt_token_accuracy"] = 0.0
+
+        # LCS ratio
+        if len(ground_truth_tokens) > 0:
+            m, n = len(optimized_tokens), len(ground_truth_tokens)
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if optimized_tokens[i-1] == ground_truth_tokens[j-1]:
+                        dp[i][j] = dp[i-1][j-1] + 1
+                    else:
+                        dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+            lcs = dp[m][n]
+            metrics["prompt_lcs_ratio"] = lcs / len(ground_truth_tokens)
+        else:
+            metrics["prompt_lcs_ratio"] = 0.0
+
+        # Per-position match
+        min_len = min(len(optimized_tokens), len(ground_truth_tokens))
+        max_len = max(len(optimized_tokens), len(ground_truth_tokens))
+        per_pos = []
+        for i in range(max_len):
+            if i < min_len:
+                per_pos.append(int(optimized_tokens[i] == ground_truth_tokens[i]))
+            else:
+                per_pos.append(0)
+        metrics["per_position_match"] = per_pos
+
+    # Add decoded texts
+    metrics["optimized_prompt_text"] = tokenizer.decode(optimized_tokens, skip_special_tokens=False)
+    metrics["ground_truth_prompt_text"] = tokenizer.decode(ground_truth_tokens, skip_special_tokens=False)
+
+    return _to_serializable(metrics)
+
 
 def evaluate_batch_outputs(
     generated_batch, 
