@@ -3,7 +3,7 @@
 Minimal W&B Figure Generator
 Focuses on run ID specification and synchronization with local caching.
 """
-from typing import Tuple, Dict, Set, Optional
+from typing import Tuple, Dict, Set, Optional, Union
 import argparse
 import yaml
 import wandb
@@ -19,6 +19,8 @@ import hashlib
 import json
 from tqdm import tqdm
 import time
+from colorspacious import cspace_convert
+from matplotlib.colors import to_hex, to_rgb
 warnings.filterwarnings('ignore')
 
 
@@ -49,6 +51,9 @@ class MinimalWandBGenerator:
    
         self._setup_font_sizes()
 
+        # Set up default figure size
+        self.default_figsize = self._setup_default_figsize()
+
         # Set up color palette
         self.color_palette = self._setup_color_palette()
 
@@ -64,6 +69,9 @@ class MinimalWandBGenerator:
         else:
             print("Warning: Kolmogorov-Smirnov-kwargs must be a mapping; ignoring provided value.")
             self.ks_kwargs = {}
+
+        # Track which runs we've already printed history keys for
+        self._history_keys_printed: Set[str] = set()
         
     def _setup_font_sizes(self):
         """Set up font sizes from config."""
@@ -105,7 +113,64 @@ class MinimalWandBGenerator:
         
         else:
             print("Using default font sizes")
-    
+
+    def _parse_figsize(
+        self,
+        figsize_config: Optional[Union[List, Tuple, Dict]],
+        default: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[float, float]:
+        """Parse figsize from various config formats.
+
+        Supports multiple formats:
+        - List/Tuple: [10, 6] or (10, 6)
+        - Dict with width/height: {width: 10, height: 6}
+        - Dict with width/aspect_ratio: {width: 10, aspect_ratio: 1.67}
+
+        Args:
+            figsize_config: The figsize configuration value.
+            default: Default figsize to use if config is invalid/None.
+                     If None, uses self.default_figsize if available, else (10, 6).
+
+        Returns:
+            Tuple of (width, height) for figure size.
+        """
+        # Determine the fallback default
+        if default is None:
+            default = getattr(self, 'default_figsize', (10, 6))
+
+        if figsize_config is None:
+            return default
+
+        if isinstance(figsize_config, (list, tuple)) and len(figsize_config) == 2:
+            return (float(figsize_config[0]), float(figsize_config[1]))
+
+        if isinstance(figsize_config, dict):
+            width = float(figsize_config.get('width', 10))
+            if 'height' in figsize_config:
+                height = float(figsize_config['height'])
+            elif 'aspect_ratio' in figsize_config:
+                height = width / float(figsize_config['aspect_ratio'])
+            else:
+                height = default[1] if default else 6
+            return (width, height)
+
+        return default
+
+    def _setup_default_figsize(self) -> Tuple[float, float]:
+        """Set up default figure size from config.
+
+        Returns:
+            Tuple of (width, height) for figure size.
+        """
+        figsize_config = self.config.get('figsize', None)
+        # Use hardcoded default since self.default_figsize isn't set yet
+        result = self._parse_figsize(figsize_config, default=(10, 6))
+
+        if figsize_config is not None:
+            print(f"Using global figure size: {result}")
+
+        return result
+
     def _setup_color_palette(self):
         """Set up color palette from config."""
         color_config = self.config.get('color_palette', 'Set1')
@@ -136,13 +201,167 @@ class MinimalWandBGenerator:
             print("Warning: Invalid color palette config, using default 'Set1'")
             return sns.color_palette("Set1", n_colors=10)
 
+    def _apply_lightness(self, color, lightness: float) -> str:
+        """Adjust a color's lightness in CIELab space.
+
+        Args:
+            color: Hex string (e.g., "#ff7f0e") or RGB tuple (e.g., (1.0, 0.5, 0.06))
+            lightness: Target L* value in CIELab (0-100)
+
+        Returns:
+            Hex color string with adjusted lightness
+        """
+        # Convert to RGB array [0, 1]
+        if isinstance(color, str):
+            rgb = np.array(to_rgb(color))
+        else:
+            rgb = np.array(color)
+
+        # Convert to CIELab
+        lab = cspace_convert(rgb, "sRGB1", "CIELab")
+
+        # Set the lightness component
+        lab[0] = lightness
+
+        # Convert back to sRGB
+        rgb_out = cspace_convert(lab, "CIELab", "sRGB1")
+        rgb_out = np.clip(rgb_out, 0, 1)
+
+        return to_hex(rgb_out)
+
+    def _get_legend_export_config(self, figure_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Get legend export configuration with defaults merged from global and figure-level."""
+        global_config = self.config.get('legend_export', {})
+        figure_config_override = figure_config.get('legend_export', {})
+
+        defaults = {
+            'enabled': False,
+            'format': 'pdf',
+            'fontsize': 12,
+            'figsize': [8, 1.5],
+            'ncol': 4,
+            'loc': 'center',
+            'frameon': False,
+            'remove_from_main': False,
+            'hide_xlabel': False,
+            'hide_xticklabels': False,
+            'hide_ylabel': False,
+            'hide_yticklabels': False,
+            'hide_title': False,
+        }
+
+        # Merge: defaults < global < figure-level
+        result = {**defaults, **global_config, **figure_config_override}
+        return result
+
+    def _export_legend_to_file(
+        self,
+        handles: List,
+        labels: List[str],
+        output_path: Path,
+        config: Dict[str, Any],
+    ) -> None:
+        """Export legend as a separate figure file.
+
+        Args:
+            handles: Legend handles from the main plot
+            labels: Legend labels from the main plot
+            output_path: Path to save the legend figure
+            config: Legend export configuration dict
+        """
+        #figsize = config.get('figsize', [8, 1.5])
+        #if isinstance(figsize, list):
+        #    figsize = tuple(figsize)
+        figsize = self._parse_figsize(config.get('figsize'))
+
+        fontsize = config.get('fontsize', 12)
+        ncol = config.get('ncol', 4)
+        loc = config.get('loc', 'center')
+        frameon = config.get('frameon', False)
+
+        # Create a new figure for the legend
+        fig = plt.figure(figsize=figsize)
+
+        # Use ncol=0 as signal for auto (default matplotlib behavior)
+        legend_kwargs = {
+            'handles': handles,
+            'labels': labels,
+            'loc': loc,
+            'frameon': frameon,
+            'fontsize': fontsize,
+        }
+        if ncol > 0:
+            legend_kwargs['ncol'] = ncol
+
+        fig.legend(**legend_kwargs)
+
+        # Remove axes
+        fig.gca().set_axis_off()
+
+        # Ensure the output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save the figure
+        fig.savefig(output_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
+        plt.close(fig)
+        print(f"    Saved legend: {output_path}")
+
+    def _apply_legend_export_modifications(
+        self,
+        fig: plt.Figure,
+        config: Dict[str, Any],
+    ) -> None:
+        """Apply legend export modifications to a figure (remove legend, hide labels/title).
+
+        Args:
+            fig: The matplotlib figure to modify
+            config: Legend export configuration dict
+        """
+        ax = fig.gca()
+
+        # Remove legend from main figure if requested
+        if config.get('remove_from_main', False):
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.remove()
+
+        # Hide axis labels if requested
+        if config.get('hide_xlabel', False):
+            ax.set_xlabel('')
+        if config.get('hide_xticklabels', False):
+            ax.tick_params(axis='x', labelbottom=False)
+
+        if config.get('hide_ylabel', False):
+            ax.set_ylabel('')
+        if config.get('hide_yticklabels', False):
+            ax.tick_params(axis='y', labelleft=False)
+
+        # Hide title if requested
+        if config.get('hide_title', False):
+            ax.set_title('')
+
+    def _apply_plot_label_visibility(self, fig: plt.Figure, plot_config: Dict[str, Any]) -> None:
+        """Apply per-plot label/title visibility settings."""
+        ax = fig.gca()
+        if plot_config.get('hide_xlabel', False):
+            ax.set_xlabel('')
+        if plot_config.get('hide_xticklabels', False):
+            ax.tick_params(axis='x', labelbottom=False)
+        if plot_config.get('hide_ylabel', False):
+            ax.set_ylabel('')
+        if plot_config.get('hide_yticklabels', False):
+            ax.tick_params(axis='y', labelleft=False)
+        if plot_config.get('hide_title', False):
+            ax.set_title('')
+
     def _collect_all_required_metrics(self) -> Tuple[Set[str], Set[str]]:
         """
         Collect all unique metrics and step columns needed across all figures and groups.
         Returns (all_metrics, all_step_columns)
         """
         all_metrics = set()
-        all_step_columns = set()
+        #all_step_columns = set() 
+        all_step_columns = {'_step'}
 
         for figure_config in self.config['figures']:
             # Add global figure metrics
@@ -173,6 +392,22 @@ class MinimalWandBGenerator:
                 if group_filter:
                     filter_cols = self._extract_columns_from_filter(group_filter)
                     all_metrics.update(filter_cols)
+
+                # Add recovery keys if epoch recovery is enabled
+                recover_epoch_by_rank = group_config.get(
+                    'recover_epoch_by_rank',
+                    figure_config.get('recover_epoch_by_rank', False)
+                )
+                if recover_epoch_by_rank:
+                    recovery_keys = group_config.get(
+                        'recover_epoch_target_keys',
+                        figure_config.get('recover_epoch_target_keys', None)
+                    )
+                    if recovery_keys is None:
+                        recovery_keys = ['target_text', 'target_tokens_str', 'target_tokens']
+                    elif isinstance(recovery_keys, str):
+                        recovery_keys = [recovery_keys]
+                    all_metrics.update([k for k in recovery_keys if k])
 
         return all_metrics, all_step_columns
     
@@ -389,7 +624,8 @@ class MinimalWandBGenerator:
         if result_rows:
             result = pd.concat(result_rows, ignore_index=True)
         else:
-            result = pd.DataFrame()
+            # Preserve schema to avoid downstream KeyErrors.
+            result = data.iloc[0:0].copy()
 
         # Log summary of fallbacks
         n_fallback_steps = len(fallback_info['steps_with_fallback'])
@@ -630,6 +866,22 @@ class MinimalWandBGenerator:
                         filter_cols = self._extract_columns_from_filter(group_filter)
                         metrics.update(filter_cols)
 
+                    # Add recovery keys if epoch recovery is enabled
+                    recover_epoch_by_rank = group_config.get(
+                        'recover_epoch_by_rank',
+                        figure_config.get('recover_epoch_by_rank', False)
+                    )
+                    if recover_epoch_by_rank:
+                        recovery_keys = group_config.get(
+                            'recover_epoch_target_keys',
+                            figure_config.get('recover_epoch_target_keys', None)
+                        )
+                        if recovery_keys is None:
+                            recovery_keys = ['target_text', 'target_tokens_str', 'target_tokens']
+                        elif isinstance(recovery_keys, str):
+                            recovery_keys = [recovery_keys]
+                        metrics.update([k for k in recovery_keys if k])
+
                     return list(metrics)
 
         # Fallback: return all global metrics if run not found in any group
@@ -660,6 +912,7 @@ class MinimalWandBGenerator:
         """Extract metrics with fallback strategy for async logging."""
         # Get metrics specific to this run's group (includes relevant filter columns)
         run_specific_metrics = self._get_metrics_for_run(run.id)
+        self._print_history_keys(run)
 
         # Try cache first
         cached_data = self._load_run_data_from_cache(run.id, run_specific_metrics, step_columns)
@@ -670,6 +923,8 @@ class MinimalWandBGenerator:
 
         print(f"    Extracting from W&B: run {run.id}")
         columns_to_extract = list(set(run_specific_metrics + step_columns))
+        if '_step' not in columns_to_extract:
+            columns_to_extract.append('_step')
 
         # Try unified extraction first (faster)
         #if "fw048qur" in run.id:
@@ -700,6 +955,40 @@ class MinimalWandBGenerator:
         # Cache result
         self._save_run_data_to_cache(effective_run_id, metrics, step_columns, df)
         return df
+
+    def _print_history_keys(self, run: wandb.apis.public.Run) -> None:
+        """Print available history keys once per run when debug_history_keys is enabled."""
+        if not self.config.get('debug_history_keys', False):
+            return
+
+        run_id = run.id
+        if run_id in self._history_keys_printed:
+            return
+
+        keys: List[str] = []
+        try:
+            df = run.history(samples=1)
+            if df is not None and not df.empty:
+                keys = list(df.columns)
+        except Exception as e:
+            print(f"    Warning: run.history failed for {run_id}: {e}")
+
+        if not keys:
+            try:
+                history = run.scan_history(page_size=1)
+                first_row = next(iter(history), None)
+                if isinstance(first_row, dict):
+                    keys = list(first_row.keys())
+            except Exception as e:
+                print(f"    Warning: run.scan_history failed for {run_id}: {e}")
+
+        if keys:
+            keys_sorted = sorted(keys)
+            print(f"    History keys for run {run_id} ({len(keys_sorted)}): {keys_sorted}")
+        else:
+            print(f"    Warning: Could not read history keys for run {run_id}")
+
+        self._history_keys_printed.add(run_id)
     
     def _extract_unified_with_fallback(
         self, 
@@ -961,14 +1250,22 @@ class MinimalWandBGenerator:
         if effective_filter:
             filter_cols = list(self._extract_columns_from_filter(effective_filter))
 
-        # Build column order: run_id, filter columns, then everything else
+        # Build column order: run_id, _step, filter columns, then everything else
         identity_cols = ['run_id']
-        priority_cols = identity_cols + [c for c in filter_cols if c in filtered_data.columns]
+        step_cols = ['_step'] if '_step' in filtered_data.columns else []
+        priority_cols = identity_cols + step_cols + [c for c in filter_cols if c in filtered_data.columns]
         other_cols = [c for c in filtered_data.columns if c not in priority_cols]
         ordered_cols = priority_cols + other_cols
 
         # Reorder the DataFrame for export
-        export_df = filtered_data[ordered_cols].copy()
+        if not ordered_cols:
+            export_df = filtered_data.copy()
+        else:
+            export_df = filtered_data.copy()
+            missing_cols = [c for c in ordered_cols if c not in export_df.columns]
+            for col in missing_cols:
+                export_df[col] = np.nan
+            export_df = export_df[ordered_cols].copy()
 
         # Export the filtered DataFrame to CSV
         csv_filename = f"{safe_group_name}_filtered_data.csv"
@@ -1038,6 +1335,7 @@ class MinimalWandBGenerator:
         # Apply data filter: group-level overrides figure-level
         effective_filter = group_config.get('data_filter', figure_filter)
         filter_warnings = []
+        used_artifact_fallback = False
 
         if effective_filter:
             print(f"    Applying data filter for group '{group_name}': {effective_filter}")
@@ -1056,6 +1354,44 @@ class MinimalWandBGenerator:
                 print(f"    This may indicate the columns weren't fetched from W&B.")
                 print(f"    Check _collect_all_required_metrics() and W&B run data.")
                 filter_warnings.append(msg)
+
+            # Optionally recover missing epoch values before applying drop_missing/filters.
+            recover_epoch_by_rank = group_config.get(
+                'recover_epoch_by_rank',
+                figure_config.get('recover_epoch_by_rank', False) if figure_config else False
+            )
+            if recover_epoch_by_rank and 'epoch' in required_filter_cols and 'epoch' in filtered_data.columns:
+                target_keys = group_config.get(
+                    'recover_epoch_target_keys',
+                    figure_config.get('recover_epoch_target_keys', None) if figure_config else None
+                )
+                step_col = figure_config.get('step_column', '_step') if figure_config else '_step'
+                filtered_data = self._recover_epoch_by_rank(
+                    filtered_data,
+                    step_column=step_col,
+                    target_keys=target_keys,
+                    filter_warnings=filter_warnings,
+                )
+
+            # Optionally drop rows with missing filter variables before applying filters.
+            drop_missing = group_config.get(
+                'drop_missing',
+                figure_config.get('drop_missing', False) if figure_config else False
+            )
+            if drop_missing and required_filter_cols:
+                if missing_filter_cols:
+                    msg = "drop_missing requested but filter columns are missing from data"
+                    print(f"    WARNING: {msg}")
+                    filter_warnings.append(msg)
+                else:
+                    rows_before_drop = len(filtered_data)
+                    filtered_data = filtered_data.dropna(subset=list(required_filter_cols))
+                    rows_after_drop = len(filtered_data)
+                    dropped = rows_before_drop - rows_after_drop
+                    if dropped > 0:
+                        msg = f"drop_missing removed {dropped} rows with missing filter columns"
+                        print(f"    INFO: {msg}")
+                        filter_warnings.append(msg)
 
             conditions = self._parse_filter_string(effective_filter)
 
@@ -1108,6 +1444,25 @@ class MinimalWandBGenerator:
                 # Use strict filtering (existing behavior)
                 filtered_data, filter_warnings_from_apply = self._apply_filter_conditions(filtered_data, conditions)
                 filter_warnings.extend(filter_warnings_from_apply)
+
+            # If drop_missing leaves no data, try to recover from artifacts.
+            if drop_missing and filtered_data.empty:
+                print(f"    drop_missing resulted in 0 rows for group '{group_name}', trying artifact fallback")
+                artifact_data = self._load_group_data_from_artifacts(
+                    group_config=group_config,
+                    figure_config=figure_config,
+                )
+                if not artifact_data.empty:
+                    # Apply the same filter strictly to recovered data.
+                    if effective_filter:
+                        artifact_data, filter_warnings_from_apply = self._apply_filter_conditions(
+                            artifact_data, conditions
+                        )
+                        filter_warnings.extend(filter_warnings_from_apply)
+                    if not artifact_data.empty:
+                        filtered_data = artifact_data
+                        used_artifact_fallback = True
+                        filter_warnings.append("Used artifact fallback due to empty data after drop_missing")
 
         # Export filtered data for human verification
         if output_dir is not None and figure_name is not None:
@@ -1196,6 +1551,208 @@ class MinimalWandBGenerator:
                     print(f"  ========================================\n")
     
         return filtered_data
+
+    def _recover_epoch_by_rank(
+        self,
+        data: pd.DataFrame,
+        step_column: str = '_step',
+        target_keys: Optional[List[str]] = None,
+        filter_warnings: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Recover missing epoch values by ranking rows per run/target/k."""
+        if data.empty or 'epoch' not in data.columns:
+            return data
+
+        if target_keys is None:
+            target_keys = ['target_text', 'target_tokens_str', 'target_tokens']
+
+        target_key = next((k for k in target_keys if k in data.columns), None)
+        if target_key is None:
+            msg = "recover_epoch_by_rank enabled but no target key found in data"
+            print(f"    WARNING: {msg}")
+            if filter_warnings is not None:
+                filter_warnings.append(msg)
+            return data
+
+        step_col = step_column if step_column in data.columns else ('_step' if '_step' in data.columns else None)
+        if step_col is None:
+            msg = "recover_epoch_by_rank enabled but no step column available"
+            print(f"    WARNING: {msg}")
+            if filter_warnings is not None:
+                filter_warnings.append(msg)
+            return data
+
+        df = data.copy()
+        original_index = df.index
+
+        def _normalize_target(val: Any) -> Optional[str]:
+            if pd.isna(val):
+                return None
+            if isinstance(val, (list, dict)):
+                try:
+                    return json.dumps(val, ensure_ascii=True, sort_keys=True)
+                except Exception:
+                    return str(val)
+            return str(val)
+
+        df['__target_id__'] = df[target_key].apply(_normalize_target)
+        if 'run_id' in df.columns:
+            df = df.sort_values(['run_id', step_col])
+            df['__target_id__'] = df.groupby('run_id')['__target_id__'].ffill().bfill()
+        else:
+            df = df.sort_values(step_col)
+            df['__target_id__'] = df['__target_id__'].ffill().bfill()
+
+        missing_mask = df['epoch'].isna()
+        if not missing_mask.any():
+            df = df.loc[original_index]
+            df.drop(columns=['__target_id__'], inplace=True, errors='ignore')
+            return df
+
+        group_cols = []
+        if 'run_id' in df.columns:
+            group_cols.append('run_id')
+        if '__target_id__' in df.columns:
+            group_cols.append('__target_id__')
+        if 'k' in df.columns:
+            group_cols.append('k')
+
+        if not group_cols:
+            msg = "recover_epoch_by_rank enabled but no grouping columns available"
+            print(f"    WARNING: {msg}")
+            if filter_warnings is not None:
+                filter_warnings.append(msg)
+            df = df.loc[original_index]
+            df.drop(columns=['__target_id__'], inplace=True, errors='ignore')
+            return df
+
+        df = df.sort_values(group_cols + [step_col])
+        df['__epoch_rank__'] = df.groupby(group_cols).cumcount() + 1
+        df.loc[missing_mask, 'epoch'] = df.loc[missing_mask, '__epoch_rank__']
+
+        filled = int(missing_mask.sum())
+        msg = f"recover_epoch_by_rank filled {filled} missing epoch values using {target_key}"
+        print(f"    INFO: {msg}")
+        if filter_warnings is not None:
+            filter_warnings.append(msg)
+
+        df.drop(columns=['__target_id__', '__epoch_rank__'], inplace=True, errors='ignore')
+        df = df.loc[original_index]
+        return df
+
+    def _load_group_data_from_artifacts(
+        self,
+        group_config: Dict[str, Any],
+        figure_config: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        """Attempt to recover metrics from local/W&B artifacts for the group's runs."""
+        group_name = group_config['name']
+        run_ids = group_config.get('run_ids', [])
+        if isinstance(run_ids, str):
+            run_ids = [run_ids]
+
+        # Normalize run IDs to match artifact naming conventions.
+        normalized_run_ids = [self._normalize_run_id(rid) for rid in run_ids]
+
+        metrics = figure_config.get('metrics', []) if figure_config else []
+        if not metrics:
+            return pd.DataFrame()
+
+        recovered_frames = []
+        for run_id in normalized_run_ids:
+            summary = self._load_summary_from_artifact(run_id)
+            if not summary:
+                continue
+            run_frame = self._build_epoch_k_metrics_frame(summary, metrics)
+            if run_frame.empty:
+                continue
+            run_frame['run_id'] = run_id
+            run_frame['group'] = group_name
+            recovered_frames.append(run_frame)
+
+        if not recovered_frames:
+            return pd.DataFrame()
+
+        return pd.concat(recovered_frames, ignore_index=True)
+
+    def _load_summary_from_artifact(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load summary dict from local artifacts or W&B if available."""
+        # Attempt W&B artifact download as a fallback.
+        try:
+            api = wandb.Api()
+        except Exception as e:
+            print(f"    Warning: W&B API unavailable for artifact recovery: {e}")
+            return None
+
+        projects = self.config.get('projects', [])
+        artifact_basenames = ["evaluation_summary", "batch_results"]
+        cache_root = Path(self.config.get('cache_dir', 'wandb_cache')) / "artifacts"
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        for project in projects:
+            for base in artifact_basenames:
+                artifact_name = f"{base}-{run_id}"
+                artifact_ref = f"{project}/{artifact_name}:latest"
+                try:
+                    artifact = api.artifact(artifact_ref, type="results")
+                    download_dir = cache_root / artifact_name
+                    artifact.download(root=str(download_dir))
+                    candidate = download_dir / f"{base}.json"
+                    if candidate.exists():
+                        with open(candidate, 'r') as f:
+                            data = json.load(f)
+                        if isinstance(data, dict) and isinstance(data.get('summary'), dict):
+                            return data['summary']
+                        if isinstance(data, dict):
+                            return data
+                except Exception:
+                    continue
+
+        return None
+
+    def _build_epoch_k_metrics_frame(
+        self,
+        summary: Dict[str, Any],
+        metrics: List[str],
+    ) -> pd.DataFrame:
+        """Build a DataFrame with epoch/k grids for requested metrics from summary dict."""
+        rows_by_key: Dict[Tuple[float, float], Dict[str, Any]] = {}
+
+        for metric in metrics:
+            metric_map = None
+            if metric == "avg_lcs_ratio":
+                metric_map = summary.get("avg_lcs_ratio_by_epoch_by_k")
+            elif metric.startswith("avg_"):
+                base_metric = metric[len("avg_"):]
+                prompt_map = summary.get("avg_prompt_metrics_by_epoch_by_k", {})
+                semantic_map = summary.get("avg_semantic_metrics_by_epoch_by_k", {})
+                metric_map = prompt_map.get(base_metric) or semantic_map.get(base_metric)
+
+            if not metric_map:
+                continue
+
+            for epoch_key, k_dict in metric_map.items():
+                try:
+                    epoch_val = float(epoch_key)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(k_dict, dict):
+                    continue
+                for k_key, value in k_dict.items():
+                    try:
+                        k_val = float(k_key)
+                    except (TypeError, ValueError):
+                        continue
+                    if value is None:
+                        continue
+                    key = (epoch_val, k_val)
+                    row = rows_by_key.setdefault(key, {"epoch": epoch_val, "k": k_val})
+                    row[metric] = value
+
+        if not rows_by_key:
+            return pd.DataFrame()
+
+        return pd.DataFrame(list(rows_by_key.values()))
         
     def _synchronize_data(self, data: pd.DataFrame, sync_config: Dict[str, Any], 
                         step_column: str = '_step') -> pd.DataFrame:
@@ -1924,10 +2481,14 @@ class MinimalWandBGenerator:
         group_order: list[str]=None,
         group_axis: Optional[str]=None,
         group_colors: Optional[Dict[str, str]] = None,
-    ) -> plt.Figure:
-        """Create line plot with mean ± standard error."""
-        fig, ax = plt.subplots(figsize=plot_config.get('figsize', (10, 6)))
-        
+    ) -> Tuple[plt.Figure, List, List[str]]:
+        """Create line plot with mean ± standard error.
+
+        Returns:
+            Tuple of (figure, legend_handles, legend_labels)
+        """
+        fig, ax = plt.subplots(figsize=self._parse_figsize(plot_config.get('figsize')))
+
         # Use specified group order, or fall back to data order
         if group_order is not None:
             # Only include groups that actually exist in the data
@@ -1973,9 +2534,13 @@ class MinimalWandBGenerator:
         ax.set_xlabel(plot_config.get('xlabel', step_column))
         ax.set_ylabel(plot_config.get('ylabel', metric))
         ax.set_title(plot_config.get('title', f'{metric} over {step_column}'))
+
+        # Capture handles/labels before creating legend
+        handles, labels = ax.get_legend_handles_labels()
+
         ax.legend(loc=plot_config.get('legend_loc', 'best'))
         ax.grid(True, alpha=0.3)
-        
+
         if 'xlim' in plot_config:
             ax.set_xlim(plot_config['xlim'])
         if 'ylim' in plot_config:
@@ -1984,10 +2549,11 @@ class MinimalWandBGenerator:
             ax.set_xscale('log')
         if plot_config.get('yscale') == 'log':
             ax.set_yscale('log')
-        
+
         plt.tight_layout()
-        return fig
-    
+        self._apply_plot_label_visibility(fig, plot_config)
+        return fig, handles, labels
+
     def _create_count_plot(
         self,
         stats_data: pd.DataFrame,
@@ -1997,10 +2563,14 @@ class MinimalWandBGenerator:
         group_order: list[str] = None,
         group_axis: Optional[str] = None,
         group_colors: Optional[Dict[str, str]] = None,
-    ) -> plt.Figure:
-        """Plot the number of contributing runs per datapoint for each group."""
-        fig, ax = plt.subplots(figsize=plot_config.get('figsize', (10, 6)))
-        
+    ) -> Tuple[plt.Figure, List, List[str]]:
+        """Plot the number of contributing runs per datapoint for each group.
+
+        Returns:
+            Tuple of (figure, legend_handles, legend_labels)
+        """
+        fig, ax = plt.subplots(figsize=self._parse_figsize(plot_config.get('figsize')))
+
         if group_order is not None:
             available_groups = set(stats_data['group'].unique())
             groups = [group for group in group_order if group in available_groups]
@@ -2060,17 +2630,22 @@ class MinimalWandBGenerator:
         ax.set_ylabel("# runs contributing (offset for visibility)")
         base_title = plot_config.get('title', f"{metric} over {step_column}")
         ax.set_title(f"{base_title} — sample counts")
+
+        # Capture handles/labels before creating legend
+        handles, labels = ax.get_legend_handles_labels()
+
         ax.legend(loc=plot_config.get('legend_loc', 'best'))
         ax.grid(True, alpha=0.3)
-        
+
         if 'xlim' in plot_config:
             ax.set_xlim(plot_config['xlim'])
         if plot_config.get('xscale') == 'log':
             ax.set_xscale('log')
-        
+
         plt.tight_layout()
-        return fig
-    
+        self._apply_plot_label_visibility(fig, plot_config)
+        return fig, handles, labels
+
     def _create_pre_sync_group_plot(
         self,
         stats_data: pd.DataFrame,
@@ -2084,10 +2659,10 @@ class MinimalWandBGenerator:
         """Create a diagnostic plot for a single group's raw (pre-sync) data."""
         if stats_data.empty:
             return
-        
+
         plot_cfg = dict(plot_config) if plot_config else {}
-        fig, ax = plt.subplots(figsize=plot_cfg.get('figsize', (10, 6)))
-        
+        fig, ax = plt.subplots(figsize=self._parse_figsize(plot_cfg.get('figsize')))
+
         group_stats = stats_data.sort_values(step_column)
         x = group_stats[step_column]
         mean = group_stats['mean']
@@ -2173,7 +2748,7 @@ class MinimalWandBGenerator:
 
         stats = stats.set_index('group').loc[ordered].reset_index()
 
-        fig, ax = plt.subplots(figsize=plot_config.get('figsize', (8, 5)))
+        fig, ax = plt.subplots(figsize=self._parse_figsize(plot_config.get('figsize')))
         positions = np.arange(len(ordered))
         # Use custom colors if specified, otherwise fall back to palette
         if group_colors is None:
@@ -2207,6 +2782,7 @@ class MinimalWandBGenerator:
         ax.set_title(plot_config.get('title', f"{metric} — mean ± SE"))
         ax.grid(True, axis='y', alpha=0.3)
         plt.tight_layout()
+        self._apply_plot_label_visibility(fig, plot_config)
         return fig
 
     def _create_conditioned_grouped_bar_plot(
@@ -2270,7 +2846,7 @@ class MinimalWandBGenerator:
         stats['stderr'] = stats['stderr'].fillna(0)
 
         # Prepare figure
-        figsize = plot_config.get('figsize', (10, 6))
+        figsize = self._parse_figsize(plot_config.get('figsize'))
         fig, ax = plt.subplots(figsize=figsize)
 
         n_groups = len(groups)
@@ -2356,6 +2932,335 @@ class MinimalWandBGenerator:
                 )
 
         plt.tight_layout()
+        self._apply_plot_label_visibility(fig, plot_config)
+        return fig
+
+    def _create_group_violin_plot(
+        self,
+        data: pd.DataFrame,
+        metric: str,
+        plot_config: Dict[str, Any],
+        group_order: Optional[List[str]] = None,
+        group_colors: Optional[Dict[str, str]] = None,
+    ) -> Optional[plt.Figure]:
+        """Create violin plot showing distribution of metric values across groups."""
+        required_cols = {'group', metric}
+        if data.empty or not required_cols.issubset(data.columns):
+            print(f"    Skipping violin plot for '{metric}': missing columns {required_cols - set(data.columns)}")
+            return None
+
+        working = data[['group', metric]].copy()
+        working[metric] = pd.to_numeric(working[metric], errors='coerce')
+        working = working.dropna(subset=[metric])
+        if working.empty:
+            print(f"    Skipping violin plot for '{metric}': no numeric values")
+            return None
+
+        log_scale = plot_config.get('log_scale', False)
+        if log_scale:
+            n_before = len(working)
+            working = working[working[metric] > 0]
+            n_dropped = n_before - len(working)
+            if n_dropped > 0:
+                print(f"    Warning: dropped {n_dropped} non-positive values for log-scale violin plot")
+            if working.empty:
+                print(f"    Skipping violin plot for '{metric}': no positive values for log scale")
+                return None
+
+        if group_order:
+            ordered = [g for g in group_order if g in working['group'].unique()]
+            ordered += [g for g in working['group'].unique() if g not in ordered]
+        else:
+            ordered = list(working['group'].unique())
+
+        if not ordered:
+            print(f"    Skipping violin plot for '{metric}': no groups with data")
+            return None
+
+        # Collect raw values per group
+        group_values = []
+        valid_groups = []
+        for g in ordered:
+            vals = working[working['group'] == g][metric].values
+            if len(vals) > 0:
+                group_values.append(vals)
+                valid_groups.append(g)
+
+        if not valid_groups:
+            print(f"    Skipping violin plot for '{metric}': no groups with data")
+            return None
+
+        fig, ax = plt.subplots(figsize=self._parse_figsize(plot_config.get('figsize')))
+
+        if log_scale:
+            ax.set_yscale('log')
+
+        positions = np.arange(len(valid_groups))
+
+        if group_colors is None:
+            group_colors = {}
+        colors = [
+            group_colors.get(g, self.color_palette[i % len(self.color_palette)])
+            for i, g in enumerate(valid_groups)
+        ]
+
+        show_means = plot_config.get('show_means', True)
+        show_medians = plot_config.get('show_medians', True)
+        show_extrema = plot_config.get('show_extrema', True)
+        show_points = plot_config.get('show_points', False)
+        point_size = plot_config.get('point_size', 3)
+        cut = plot_config.get('cut', 0)
+        bw_method = plot_config.get('bw_method', 'scott')
+        alpha = plot_config.get('alpha', 0.7)
+        edgecolor = plot_config.get('edgecolor', 'black')
+        linewidth = plot_config.get('linewidth', 1)
+
+        # Build violinplot kwargs
+        vp_kwargs: Dict[str, Any] = {
+            'positions': positions,
+            'showmeans': show_means,
+            'showmedians': show_medians,
+            'showextrema': show_extrema,
+            'bw_method': bw_method,
+        }
+
+        vp = ax.violinplot(group_values, **vp_kwargs)
+
+        # Style each violin body individually
+        for i, body in enumerate(vp['bodies']):
+            body.set_facecolor(colors[i])
+            body.set_alpha(alpha)
+            body.set_edgecolor(edgecolor)
+            body.set_linewidth(linewidth)
+
+            # Clip to data range if cut=0
+            if cut == 0 and i < len(group_values):
+                v_min = group_values[i].min()
+                v_max = group_values[i].max()
+                for path in body.get_paths():
+                    path.vertices[:, 1] = np.clip(path.vertices[:, 1], v_min, v_max)
+
+        # Style the statistical lines
+        for partname in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+            if partname in vp:
+                vp[partname].set_edgecolor('black')
+                vp[partname].set_linewidth(1)
+
+        # Overlay individual data points if requested
+        if show_points:
+            for i, (pos, vals) in enumerate(zip(positions, group_values)):
+                jitter = np.random.default_rng(42).uniform(-0.05, 0.05, size=len(vals))
+                ax.scatter(
+                    pos + jitter, vals,
+                    s=point_size, color=colors[i], alpha=0.5, zorder=3, edgecolors='none',
+                )
+
+        if 'ylim' in plot_config:
+            ax.set_ylim(plot_config['ylim'])
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(valid_groups, rotation=plot_config.get('xtick_rotation', 30), ha='right')
+        ax.set_xlabel(plot_config.get('xlabel', ''))
+        ax.set_ylabel(plot_config.get('ylabel', metric))
+        ax.set_title(plot_config.get('title', f"{metric} — distribution"))
+        ax.grid(True, axis='y', alpha=0.3)
+        plt.tight_layout()
+        self._apply_plot_label_visibility(fig, plot_config)
+        return fig
+
+    def _create_conditioned_grouped_violin_plot(
+        self,
+        data: pd.DataFrame,
+        metric: str,
+        plot_config: Dict[str, Any],
+        condition_column: str,
+        condition_values: Optional[List[Any]] = None,
+        group_order: Optional[List[str]] = None,
+        group_colors: Optional[Dict[str, str]] = None,
+    ) -> Optional[plt.Figure]:
+        """Create grouped violin plot with violins clustered by condition values.
+
+        X-axis shows condition values (e.g., epochs), with clustered violins for each group.
+        Y-axis shows the full distribution of metric values.
+        """
+        required_cols = {'group', metric, condition_column}
+        if data.empty or not required_cols.issubset(data.columns):
+            missing = required_cols - set(data.columns)
+            print(f"    Skipping conditioned violin plot for '{metric}': missing columns {missing}")
+            return None
+
+        working = data[['group', condition_column, metric]].copy()
+        working[metric] = pd.to_numeric(working[metric], errors='coerce')
+        working[condition_column] = pd.to_numeric(working[condition_column], errors='coerce')
+        working = working.dropna(subset=[metric, condition_column])
+
+        if working.empty:
+            print(f"    Skipping conditioned violin plot for '{metric}': no numeric values")
+            return None
+
+        log_scale = plot_config.get('log_scale', False)
+        if log_scale:
+            n_before = len(working)
+            working = working[working[metric] > 0]
+            n_dropped = n_before - len(working)
+            if n_dropped > 0:
+                print(f"    Warning: dropped {n_dropped} non-positive values for log-scale violin plot")
+            if working.empty:
+                print(f"    Skipping conditioned violin plot for '{metric}': no positive values for log scale")
+                return None
+
+        # Filter to specified condition values if provided
+        if condition_values is not None:
+            working = working[working[condition_column].isin(condition_values)]
+            if working.empty:
+                print(f"    Skipping conditioned violin plot: no data for specified condition values")
+                return None
+            conditions = [c for c in condition_values if c in working[condition_column].values]
+        else:
+            conditions = sorted(working[condition_column].unique())
+
+        # Determine group order
+        if group_order:
+            groups = [g for g in group_order if g in working['group'].unique()]
+            groups += [g for g in working['group'].unique() if g not in groups]
+        else:
+            groups = sorted(working['group'].unique())
+
+        if not groups or not conditions:
+            print(f"    Skipping conditioned violin plot: no groups or conditions")
+            return None
+
+        # Prepare figure
+        figsize = self._parse_figsize(plot_config.get('figsize'))
+        fig, ax = plt.subplots(figsize=figsize)
+
+        if log_scale:
+            ax.set_yscale('log')
+
+        n_groups = len(groups)
+        n_conditions = len(conditions)
+
+        # Calculate violin width
+        violin_width = plot_config.get('violin_width')
+        if violin_width is None:
+            violin_width = 0.8 / n_groups
+
+        x_positions = np.arange(n_conditions)
+
+        # Set up colors
+        if group_colors is None:
+            group_colors = {}
+
+        alpha = plot_config.get('alpha', 0.7)
+        edgecolor = plot_config.get('edgecolor', 'black')
+        linewidth = plot_config.get('linewidth', 1)
+        show_means = plot_config.get('show_means', True)
+        show_medians = plot_config.get('show_medians', True)
+        show_extrema = plot_config.get('show_extrema', True)
+        show_points = plot_config.get('show_points', False)
+        point_size = plot_config.get('point_size', 3)
+        cut = plot_config.get('cut', 0)
+        bw_method = plot_config.get('bw_method', 'scott')
+
+        # Collect text annotation data
+        text_annotations = []
+        legend_patches = []
+
+        # Plot violins for each group
+        for i, group in enumerate(groups):
+            offset = (i - (n_groups - 1) / 2) * violin_width
+            color = group_colors.get(group, self.color_palette[i % len(self.color_palette)])
+
+            group_data_per_cond = []
+            group_positions = []
+            for j, cond in enumerate(conditions):
+                vals = working[(working[condition_column] == cond) & (working['group'] == group)][metric].values
+                if len(vals) >= 2:  # Need at least 2 points for KDE
+                    group_data_per_cond.append(vals)
+                    group_positions.append(x_positions[j] + offset)
+
+            if not group_data_per_cond:
+                continue
+
+            vp = ax.violinplot(
+                group_data_per_cond,
+                positions=group_positions,
+                widths=violin_width * 0.9,
+                showmeans=show_means,
+                showmedians=show_medians,
+                showextrema=show_extrema,
+                bw_method=bw_method,
+            )
+
+            # Style each violin body and clip to data range if cut=0
+            for body_idx, body in enumerate(vp['bodies']):
+                body.set_facecolor(color)
+                body.set_alpha(alpha)
+                body.set_edgecolor(edgecolor)
+                body.set_linewidth(linewidth)
+
+                if cut == 0 and body_idx < len(group_data_per_cond):
+                    v_min = group_data_per_cond[body_idx].min()
+                    v_max = group_data_per_cond[body_idx].max()
+                    for path in body.get_paths():
+                        path.vertices[:, 1] = np.clip(path.vertices[:, 1], v_min, v_max)
+
+            # Style statistical lines
+            for partname in ('cmeans', 'cmedians', 'cmins', 'cmaxes', 'cbars'):
+                if partname in vp:
+                    vp[partname].set_edgecolor('black')
+                    vp[partname].set_linewidth(1)
+
+            # Overlay individual data points if requested
+            if show_points:
+                rng = np.random.default_rng(42 + i)
+                for pos, vals in zip(group_positions, group_data_per_cond):
+                    jitter = rng.uniform(-violin_width * 0.15, violin_width * 0.15, size=len(vals))
+                    ax.scatter(
+                        pos + jitter, vals,
+                        s=point_size, color=color, alpha=0.5, zorder=3, edgecolors='none',
+                    )
+
+            # Collect show_values annotations
+            if plot_config.get('show_values', False):
+                for pos, vals in zip(group_positions, group_data_per_cond):
+                    mean_val = np.mean(vals)
+                    text_annotations.append((pos, mean_val))
+
+            # Create legend patch for this group
+            import matplotlib.patches as mpatches
+            legend_patches.append(mpatches.Patch(facecolor=color, edgecolor=edgecolor, alpha=alpha, label=group))
+
+        if not legend_patches:
+            print(f"    Skipping conditioned violin plot for '{metric}': no plottable data")
+            plt.close(fig)
+            return None
+
+        if 'ylim' in plot_config:
+            ax.set_ylim(plot_config['ylim'])
+
+        ax.set_xticks(x_positions)
+        condition_labels = [str(c) for c in conditions]
+        ax.set_xticklabels(condition_labels, rotation=plot_config.get('xtick_rotation', 0))
+        ax.set_xlabel(plot_config.get('xlabel', condition_column))
+        ax.set_ylabel(plot_config.get('ylabel', metric))
+        ax.set_title(plot_config.get('title', f"{metric} by {condition_column}"))
+        ax.legend(handles=legend_patches, loc=plot_config.get('legend_loc', 'best'))
+        ax.grid(True, axis='y', alpha=0.3)
+
+        # Add value labels after axes are configured
+        if text_annotations:
+            y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+            padding = 0.02 * y_range if y_range > 0 else 0.01
+            for x, mean_val in text_annotations:
+                y_pos = mean_val + padding
+                ax.text(
+                    x, y_pos, f'{mean_val:.3f}',
+                    ha='center', va='bottom', fontsize=8, rotation=90,
+                )
+
+        plt.tight_layout()
+        self._apply_plot_label_visibility(fig, plot_config)
         return fig
 
     def _compute_group_final_values(
@@ -2824,11 +3729,16 @@ class MinimalWandBGenerator:
                     # Use custom color if specified, otherwise use palette
                     if 'color' in group_config:
                         group_color = group_config['color']
-                        group_colors[group_config['name']] = group_color
                     else:
                         color_idx = (len(group_order) - 1) % len(self.color_palette)
                         group_color = self.color_palette[color_idx]
 
+                    # Apply lightness adjustment if specified
+                    if 'lightness' in group_config:
+                        group_color = self._apply_lightness(group_color, group_config['lightness'])
+                        print(f"    Applied lightness={group_config['lightness']} to '{group_config['name']}'")
+
+                    group_colors[group_config['name']] = group_color
 
                     for metric in figure_config['metrics']:
                         if metric not in group_data.columns:
@@ -2871,7 +3781,17 @@ class MinimalWandBGenerator:
             elif isinstance(barplot_cfg, dict):
                 barplot_enabled = barplot_cfg.get('enabled', True)
                 barplot_settings = {k: v for k, v in barplot_cfg.items() if k != 'enabled'}
-            
+
+            # Parse violinplot_config
+            violin_cfg = figure_config.get('violinplot_config')
+            violin_enabled = False
+            violin_settings: Dict[str, Any] = {}
+            if isinstance(violin_cfg, bool):
+                violin_enabled = violin_cfg
+            elif isinstance(violin_cfg, dict):
+                violin_enabled = violin_cfg.get('enabled', True)
+                violin_settings = {k: v for k, v in violin_cfg.items() if k != 'enabled'}
+
             # Apply synchronization if specified
             sync_config = figure_config.get('synchronization', {})
             if sync_config:
@@ -2890,7 +3810,7 @@ class MinimalWandBGenerator:
                     print(f"    Metric {metric} not found in data")
                     continue
 
-                raw_plot_config = figure_config.get('plot_config', {}) or {}
+                raw_plot_config = figure_config.get('lineplot_config', {}) or {}
                 plot_config = dict(raw_plot_config)
                 
                 # Apply smoothing if specified
@@ -2979,16 +3899,19 @@ class MinimalWandBGenerator:
                 
                 plot_config['ylabel'] = plot_config.get('ylabel', metric)
                 plot_config['title'] = plot_config.get('title', f"{figure_config['name']}: {metric}")
-                
-                fig = self._create_line_plot(
+
+                # Get legend export configuration
+                legend_export_config = self._get_legend_export_config(figure_config)
+
+                fig, handles, labels = self._create_line_plot(
                     stats, metric, plot_config,
                     figure_config.get('step_column', '_step'),
                     group_order=group_order,
                     group_axis=group_axis_column,
                     group_colors=group_colors,
                 )
-                
-                count_fig = self._create_count_plot(
+
+                count_fig, count_handles, count_labels = self._create_count_plot(
                     stats,
                     metric,
                     plot_config,
@@ -3008,18 +3931,36 @@ class MinimalWandBGenerator:
                     )
                 else:
                     bar_fig = None
-                
+
+                # Handle legend export for line plot
+                if legend_export_config.get('enabled', False) and handles and labels:
+                    legend_format = legend_export_config.get('format', 'pdf')
+                    legend_filename = f"{figure_config['name']}_{metric}_legend.{legend_format}"
+                    legend_path = output_dir / legend_filename.replace('/', '+')
+                    self._export_legend_to_file(handles, labels, legend_path, legend_export_config)
+
+                    # Apply modifications to main figure (remove legend, hide labels/title)
+                    self._apply_legend_export_modifications(fig, legend_export_config)
+
                 filename = f"{figure_config['name']}_{metric}.{self.config.get('output_format', 'png')}"
                 filepath = output_dir / filename.replace('/','+')
                 fig.savefig(filepath, dpi=self.config.get('dpi', 300), bbox_inches='tight')
                 plt.close(fig)
-                
+
+                # Apply legend export modifications to count plot if enabled
+                if legend_export_config.get('enabled', False):
+                    self._apply_legend_export_modifications(count_fig, legend_export_config)
+
                 count_filename = f"{figure_config['name']}_{metric}_counts.{self.config.get('output_format', 'png')}"
                 count_path = output_dir / count_filename.replace('/','+')
                 count_fig.savefig(count_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
                 plt.close(count_fig)
 
                 if bar_fig is not None:
+                    # Apply legend export modifications if enabled
+                    if legend_export_config.get('enabled', False):
+                        self._apply_legend_export_modifications(bar_fig, legend_export_config)
+
                     bar_filename = f"{figure_config['name']}_{metric}_barplot.{self.config.get('output_format', 'png')}"
                     bar_path = output_dir / bar_filename.replace('/','+')
                     bar_fig.savefig(bar_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
@@ -3048,6 +3989,10 @@ class MinimalWandBGenerator:
                         )
 
                         if cond_bar_fig is not None:
+                            # Apply legend export modifications if enabled
+                            if legend_export_config.get('enabled', False):
+                                self._apply_legend_export_modifications(cond_bar_fig, legend_export_config)
+
                             cond_bar_filename = f"{figure_config['name']}_{metric}_conditioned_barplot.{self.config.get('output_format', 'png')}"
                             cond_bar_path = output_dir / cond_bar_filename.replace('/', '+')
                             cond_bar_fig.savefig(cond_bar_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
@@ -3055,6 +4000,63 @@ class MinimalWandBGenerator:
                             print(f"    Saved conditioned bar plot: {cond_bar_path}")
                     else:
                         print("    Warning: conditioned_barplot_config enabled but 'condition_column' not specified")
+
+                # Handle simple violin plot
+                if violin_enabled:
+                    violin_fig = self._create_group_violin_plot(
+                        raw_figure_combined,
+                        metric,
+                        violin_settings,
+                        group_order=group_order,
+                        group_colors=group_colors,
+                    )
+                else:
+                    violin_fig = None
+
+                if violin_fig is not None:
+                    # Apply legend export modifications if enabled
+                    if legend_export_config.get('enabled', False):
+                        self._apply_legend_export_modifications(violin_fig, legend_export_config)
+
+                    violin_filename = f"{figure_config['name']}_{metric}_violinplot.{self.config.get('output_format', 'png')}"
+                    violin_path = output_dir / violin_filename.replace('/', '+')
+                    violin_fig.savefig(violin_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
+                    plt.close(violin_fig)
+                    print(f"    Saved violin plot: {violin_path}")
+
+                # Handle conditioned grouped violin plot
+                cond_violin_cfg = figure_config.get('conditioned_violinplot_config')
+                if cond_violin_cfg and cond_violin_cfg.get('enabled', True):
+                    condition_column = cond_violin_cfg.get('condition_column')
+                    if condition_column:
+                        cond_violin_settings = {
+                            k: v for k, v in cond_violin_cfg.items()
+                            if k not in ('enabled', 'condition_column', 'condition_values')
+                        }
+                        condition_values = cond_violin_cfg.get('condition_values')
+
+                        cond_violin_fig = self._create_conditioned_grouped_violin_plot(
+                            raw_figure_combined,
+                            metric,
+                            cond_violin_settings,
+                            condition_column=condition_column,
+                            condition_values=condition_values,
+                            group_order=group_order,
+                            group_colors=group_colors,
+                        )
+
+                        if cond_violin_fig is not None:
+                            # Apply legend export modifications if enabled
+                            if legend_export_config.get('enabled', False):
+                                self._apply_legend_export_modifications(cond_violin_fig, legend_export_config)
+
+                            cond_violin_filename = f"{figure_config['name']}_{metric}_conditioned_violinplot.{self.config.get('output_format', 'png')}"
+                            cond_violin_path = output_dir / cond_violin_filename.replace('/', '+')
+                            cond_violin_fig.savefig(cond_violin_path, dpi=self.config.get('dpi', 300), bbox_inches='tight')
+                            plt.close(cond_violin_fig)
+                            print(f"    Saved conditioned violin plot: {cond_violin_path}")
+                    else:
+                        print("    Warning: conditioned_violinplot_config enabled but 'condition_column' not specified")
 
                 # Export plot data to JSON
                 json_filename = f"{figure_config['name']}_{metric}_plot_data.json"
