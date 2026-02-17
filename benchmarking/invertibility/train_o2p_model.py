@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train O2P inverse model for LLM prompt inversion"
+        description="Train O2P inverse model for LLM prompt reconstruction"
     )
 
     # Model configuration

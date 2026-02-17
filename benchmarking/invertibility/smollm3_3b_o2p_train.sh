@@ -2,7 +2,7 @@
 
 # O2P Training Script for SmolLM3-3B
 #
-# This script trains a T5-based inverse model for prompt inversion
+# This script trains a T5-based inverse model for prompt reconstruction
 # on the SmolLM3-3B subject LLM.
 #
 # After training, use smollm3_3b_o2p_batch_k1-5-25-run.sh for evaluation.

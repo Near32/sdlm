@@ -1,7 +1,7 @@
 """
 O2P optimization using HuggingFace transformers - evaluation implementation.
 
-This implements the O2P (Output-to-Prompt) method for prompt inversion
+This implements the O2P (Output-to-Prompt) method for prompt reconstruction
 using a pre-trained T5-based inverse model with HuggingFace models.
 """
 
@@ -32,7 +32,7 @@ def o2p_optimize_inputs_hf(
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
     """
-    O2P prompt inversion using HuggingFace models.
+    O2P prompt reconstruction using HuggingFace models.
 
     O2P works by:
     1. Tokenizing the target text with the LLM tokenizer

@@ -1,11 +1,11 @@
 """
 O2P (Output-to-Prompt) module.
 
-Provides a unified interface for O2P prompt inversion using a pre-trained
+Provides a unified interface for O2P prompt reconstruction using a pre-trained
 T5-based inverse model.
 
 Unlike SODA/GCG which optimize iteratively, O2P uses a pre-trained inverse
-model for one-shot prompt inversion.
+model for one-shot prompt reconstruction.
 """
 
 from typing import List, Tuple, Dict, Any, Optional, Union
@@ -25,7 +25,7 @@ def o2p_optimize_inputs(
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
     """
-    O2P prompt inversion using a pre-trained inverse model.
+    O2P prompt reconstruction using a pre-trained inverse model.
 
     Unlike SODA/GCG, O2P uses a pre-trained T5-based inverse model to
     generate prompts in one-shot rather than iteratively optimizing.
