@@ -14,18 +14,38 @@ class MetricsAggregator:
     """
     Class for aggregating and processing metrics across multiple samples.
     """
-    
+
     def __init__(self):
         """Initialize the metrics aggregator."""
         self.metrics_by_k = defaultdict(lambda: defaultdict(list))
         self.all_metrics = defaultdict(list)
         # For per-epoch metrics: epoch -> k_value -> list of lcs_ratio values
         self.lcs_ratio_by_epoch_by_k = defaultdict(lambda: defaultdict(list))
+        # For per-position prompt metrics: position -> list of match indicators (0 or 1)
+        self.per_position_matches = defaultdict(list)
+        # For per-epoch prompt metrics: metric_name -> epoch -> k_value -> list of values
+        self.prompt_metrics_by_epoch_by_k = {
+            "prompt_token_accuracy": defaultdict(lambda: defaultdict(list)),
+            "prompt_exact_match": defaultdict(lambda: defaultdict(list)),
+            "prompt_lcs_ratio": defaultdict(lambda: defaultdict(list)),
+            "prompt_cosine_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        # For per-epoch semantic metrics (BERT/SentenceBERT): metric_name -> epoch -> k_value -> list of values
+        self.semantic_metrics_by_epoch_by_k = {
+            "output_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "output_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "prompt_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+        }
         
     def add_sample(self, metrics: Dict[str, Any], k_value: Optional[int] = None):
         """
         Add a sample's metrics to the aggregator.
-        
+
         Args:
             metrics: Dictionary of metric values
             k_value: Optional k value to categorize the metrics
@@ -34,12 +54,19 @@ class MetricsAggregator:
         for name, value in metrics.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 self.all_metrics[name].append(value)
-        
+
         # Add to k-specific metrics if provided
         if k_value is not None:
             for name, value in metrics.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     self.metrics_by_k[k_value][name].append(value)
+
+        # Handle per_position_match for prompt reconstruction metrics
+        if "per_position_match" in metrics:
+            per_pos = metrics["per_position_match"]
+            if isinstance(per_pos, list):
+                for pos, match in enumerate(per_pos):
+                    self.per_position_matches[pos].append(match)
     
     def add_batch(self, batch_metrics: List[Dict[str, Any]], k_values: Optional[List[int]] = None):
         """
@@ -57,16 +84,34 @@ class MetricsAggregator:
             for metrics, k in zip(batch_metrics, k_values):
                 self.add_sample(metrics, k)
 
-    def add_epoch_metrics(self, lcs_ratio_history: List[float], k_value: int):
+    def add_epoch_metrics(self, lcs_ratio_history: List[float], k_value: int,
+                          prompt_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          semantic_metrics_history: Optional[Dict[str, List[float]]] = None):
         """
-        Add per-epoch lcs_ratio values for a sample.
+        Add per-epoch lcs_ratio values, prompt metrics, and semantic metrics for a sample.
 
         Args:
             lcs_ratio_history: List of lcs_ratio values, one per epoch
             k_value: The k value for this sample
+            prompt_metrics_history: Dict mapping metric_name -> list of values per epoch
+            semantic_metrics_history: Dict mapping metric_name -> list of values per epoch (BERT/SentenceBERT)
         """
         for epoch, lcs_ratio in enumerate(lcs_ratio_history):
             self.lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
+
+        # Add prompt metrics history if provided
+        if prompt_metrics_history:
+            for metric_name, history in prompt_metrics_history.items():
+                if metric_name in self.prompt_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.prompt_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+
+        # Add semantic metrics history if provided
+        if semantic_metrics_history:
+            for metric_name, history in semantic_metrics_history.items():
+                if metric_name in self.semantic_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.semantic_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
 
     def compute_avg_lcs_ratio_by_epoch_by_k(self) -> Dict[int, Dict[int, float]]:
         """
@@ -81,6 +126,76 @@ class MetricsAggregator:
             for k_value, values in k_dict.items():
                 result[epoch][k_value] = sum(values) / len(values) if values else 0.0
         return result
+
+    def compute_avg_prompt_metrics_by_epoch_by_k(self) -> Dict[str, Dict[int, Dict[int, float]]]:
+        """
+        Compute average prompt metrics for each (metric, epoch, k_value) combination.
+
+        Returns:
+            Dictionary mapping metric_name -> epoch -> k_value -> avg_value
+        """
+        result = {}
+        for metric_name, epoch_dict in self.prompt_metrics_by_epoch_by_k.items():
+            result[metric_name] = {}
+            for epoch, k_dict in epoch_dict.items():
+                result[metric_name][epoch] = {}
+                for k_value, values in k_dict.items():
+                    result[metric_name][epoch][k_value] = sum(values) / len(values) if values else 0.0
+        return result
+
+    def has_prompt_metrics_history(self) -> bool:
+        """Check if per-epoch prompt metrics have been collected."""
+        for metric_dict in self.prompt_metrics_by_epoch_by_k.values():
+            if metric_dict:
+                return True
+        return False
+
+    def compute_avg_semantic_metrics_by_epoch_by_k(self) -> Dict[str, Dict[int, Dict[int, float]]]:
+        """
+        Compute average semantic metrics (BERT/SentenceBERT) for each (metric, epoch, k_value) combination.
+
+        Returns:
+            Dictionary mapping metric_name -> epoch -> k_value -> avg_value
+        """
+        result = {}
+        for metric_name, epoch_dict in self.semantic_metrics_by_epoch_by_k.items():
+            result[metric_name] = {}
+            for epoch, k_dict in epoch_dict.items():
+                result[metric_name][epoch] = {}
+                for k_value, values in k_dict.items():
+                    result[metric_name][epoch][k_value] = sum(values) / len(values) if values else 0.0
+        return result
+
+    def has_semantic_metrics_history(self) -> bool:
+        """Check if per-epoch semantic metrics (BERT/SentenceBERT) have been collected."""
+        for metric_dict in self.semantic_metrics_by_epoch_by_k.values():
+            if metric_dict:
+                return True
+        return False
+
+    def compute_per_position_success_rate(self) -> List[float]:
+        """
+        Compute per-position success rate for prompt reconstruction.
+
+        Returns:
+            List of success rates, one per position
+        """
+        if not self.per_position_matches:
+            return []
+
+        max_position = max(self.per_position_matches.keys())
+        success_rates = []
+        for pos in range(max_position + 1):
+            matches = self.per_position_matches.get(pos, [])
+            if matches:
+                success_rates.append(sum(matches) / len(matches))
+            else:
+                success_rates.append(0.0)
+        return success_rates
+
+    def has_prompt_reconstruction_metrics(self) -> bool:
+        """Check if prompt reconstruction metrics have been collected."""
+        return bool(self.per_position_matches)
 
     def compute_average(self, metric_name: str) -> float:
         """
@@ -260,7 +375,7 @@ class MetricsAggregator:
     def get_summary(self) -> Dict[str, Any]:
         """
         Get a complete summary of all computed metrics.
-        
+
         Returns:
             Dictionary with all aggregated metrics and AUC results
         """
@@ -273,5 +388,26 @@ class MetricsAggregator:
             "total_samples": self.get_sample_count(),
             "avg_lcs_ratio_by_epoch_by_k": self.compute_avg_lcs_ratio_by_epoch_by_k(),
         }
+
+        # Add prompt reconstruction specific metrics if available
+        if self.has_prompt_reconstruction_metrics():
+            per_pos_success = self.compute_per_position_success_rate()
+            summary["per_position_success_rate"] = per_pos_success
+            summary["has_prompt_reconstruction_metrics"] = True
+
+            # Add summary prompt metrics to overall
+            if "prompt_exact_match" in self.all_metrics:
+                values = self.all_metrics["prompt_exact_match"]
+                summary["overall"]["prompt_success_rate"] = sum(values) / len(values) if values else 0.0
+
+        # Add per-epoch prompt metrics if available
+        if self.has_prompt_metrics_history():
+            summary["avg_prompt_metrics_by_epoch_by_k"] = self.compute_avg_prompt_metrics_by_epoch_by_k()
+            summary["has_prompt_metrics_history"] = True
+
+        # Add per-epoch semantic metrics (BERT/SentenceBERT) if available
+        if self.has_semantic_metrics_history():
+            summary["avg_semantic_metrics_by_epoch_by_k"] = self.compute_avg_semantic_metrics_by_epoch_by_k()
+            summary["has_semantic_metrics_history"] = True
 
         return summary
