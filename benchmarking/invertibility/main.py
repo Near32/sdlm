@@ -469,6 +469,7 @@ def optimize_inputs(
     learnable_temperature=False,
     decouple_learnable_temperature=False,
     bptt_learnable_temperature=False,
+    bptt_decouple_learnable_temperature=False,
     stgs_hard=True,
     bptt_stgs_hard=True,
     bptt_hidden_state_conditioning=False,
@@ -518,6 +519,13 @@ def optimize_inputs(
     gcg_init_strategy="zeros",
     # Teacher forcing (for faster training)
     teacher_forcing=False,
+    # Prompt reconstruction evaluation (SODA-style)
+    ground_truth_prompt_tokens=None,  # List[int] - ground truth prompt for prompt reconstruction metrics
+    ground_truth_prompt=None,  # str - ground truth prompt string for logging
+    # Semantic metrics (BERT/SentenceBERT) per-epoch tracking
+    semantic_metrics_every_n_epochs: int = 0,  # 0=disabled, N=compute every N epochs
+    bertscore_model_type: str = "distilbert-base-uncased",
+    sentencebert_model_name: str = "all-MiniLM-L6-v2",
     kwargs={},
 ):
     """
@@ -534,9 +542,32 @@ def optimize_inputs(
     # Dispatch to SODA/GCG if requested
     method_lower = method.lower() if method else "stgs"
 
+    # Helper to wrap baseline returns with empty prompt_metrics_history and semantic_metrics_history
+    def _wrap_baseline_result(result):
+        """Wrap baseline result to include empty prompt_metrics_history and semantic_metrics_history for compatibility.
+
+        If the result is a 4-tuple (old-style baseline), add empty prompt_metrics_history and semantic_metrics_history.
+        If the result is a 5-tuple (old-style with prompt_metrics_history), add empty semantic_metrics_history.
+        If the result is a 6-tuple (new-style with both), return as-is.
+        """
+        empty_prompt_metrics = {"prompt_token_accuracy": [], "prompt_exact_match": [], "prompt_lcs_ratio": [], "prompt_cosine_similarity": []}
+        empty_semantic_metrics = {
+            "output_bertscore_f1": [], "output_bertscore_precision": [], "output_bertscore_recall": [],
+            "output_sentencebert_similarity": [], "prompt_bertscore_f1": [], "prompt_bertscore_precision": [],
+            "prompt_bertscore_recall": [], "prompt_sentencebert_similarity": [],
+        }
+        if len(result) == 4:
+            # Baseline returned (generated_tokens, optimized_inputs, losses, lcs_ratio_history)
+            return (*result, empty_prompt_metrics, empty_semantic_metrics)
+        elif len(result) == 5:
+            # Baseline returned 5-tuple with prompt_metrics_history
+            return (*result, empty_semantic_metrics)
+        # 6-tuple already includes both
+        return result
+
     if method_lower == "soda":
         from baselines.soda import soda_optimize_inputs
-        return soda_optimize_inputs(
+        result = soda_optimize_inputs(
             model=model,
             model_name=baseline_model_name,
             tokenizer=tokenizer,
@@ -557,12 +588,14 @@ def optimize_inputs(
             init_strategy=soda_init_strategy,
             init_std=soda_init_std,
             batch_size=batch_size,
+            ground_truth_prompt_tokens=ground_truth_prompt_tokens,
             kwargs=kwargs,
         )
+        return _wrap_baseline_result(result)
 
     elif method_lower == "gcg":
         from baselines.gcg import gcg_optimize_inputs
-        return gcg_optimize_inputs(
+        result = gcg_optimize_inputs(
             model=model,
             model_name=baseline_model_name,
             tokenizer=tokenizer,
@@ -581,10 +614,11 @@ def optimize_inputs(
             batch_size=batch_size,
             kwargs=kwargs,
         )
+        return _wrap_baseline_result(result)
 
     elif method_lower == "o2p":
         from baselines.o2p import o2p_optimize_inputs
-        return o2p_optimize_inputs(
+        result = o2p_optimize_inputs(
             model=model,
             tokenizer=tokenizer,
             device=device,
@@ -596,6 +630,7 @@ def optimize_inputs(
             batch_size=batch_size,
             kwargs=kwargs,
         )
+        return _wrap_baseline_result(result)
 
     # Continue with STGS/REINFORCE for other methods
 
@@ -655,6 +690,7 @@ def optimize_inputs(
         "learnable_temperature": learnable_temperature,
         "decouple_learnable_temperature": decouple_learnable_temperature,
         "bptt_learnable_temperature": bptt_learnable_temperature,
+        "bptt_decouple_learnable_temperature": bptt_decouple_learnable_temperature,
         "stgs_hard": stgs_hard,
         "bptt_stgs_hard": bptt_stgs_hard,
         "bptt_hidden_state_conditioning":bptt_hidden_state_conditioning,
@@ -681,11 +717,12 @@ def optimize_inputs(
         "teacher_forcing": teacher_forcing,
     })
     wandb_table = wandb.Table(columns=[
-        "epoch", 
-        "target_output_str", 
-        "learned_input_ids", 
-        "learned_input_str", 
-        "generated_output_ids", 
+        "epoch",
+        "target_output_str",
+        "ground_truth_prompt",
+        "learned_input_ids",
+        "learned_input_str",
+        "generated_output_ids",
         "generated_output_str",
         "token_overlap_ratio",
         "target_hit_ratio",
@@ -752,6 +789,7 @@ def optimize_inputs(
                 stgs_hard=bptt_stgs_hard,
                 init_temperature=bptt_temperature,
                 learnable_temperature=bptt_learnable_temperature,
+                nbr_learnable_temperatures=target_length if bptt_decouple_learnable_temperature else None,
                 eps=bptt_eps,
                 conditioning_dim=hidden_state_dim if bptt_hidden_state_conditioning else 0,
                 device=device,
@@ -814,6 +852,27 @@ def optimize_inputs(
     # Training loop
     losses = []
     lcs_ratio_history = []
+    # Per-epoch prompt reconstruction metrics (SODA-style)
+    prompt_metrics_history = {
+        "prompt_token_accuracy": [],
+        "prompt_exact_match": [],
+        "prompt_lcs_ratio": [],
+        "prompt_cosine_similarity": [],
+    }
+    track_prompt_metrics = ground_truth_prompt_tokens is not None
+
+    # Per-epoch semantic metrics (BERT/SentenceBERT)
+    semantic_metrics_history = {
+        "output_bertscore_f1": [],
+        "output_bertscore_precision": [],
+        "output_bertscore_recall": [],
+        "output_sentencebert_similarity": [],
+        "prompt_bertscore_f1": [],
+        "prompt_bertscore_precision": [],
+        "prompt_bertscore_recall": [],
+        "prompt_sentencebert_similarity": [],
+    }
+    track_semantic_metrics = semantic_metrics_every_n_epochs > 0
     pbar = tqdm(range(epochs))
     for epoch in pbar:
         optimizer.zero_grad()
@@ -991,6 +1050,9 @@ def optimize_inputs(
                         wandb_log[f"effective_temperature_{sidx}"] = eff_temperature[:, sidx].mean().item()
             if torch.is_tensor(bptt_eff_temperature):
                 wandb_log["bptt_effective_temperature"] = bptt_eff_temperature.mean().item()
+                if bptt_decouple_learnable_temperature:
+                    for sidx in range(bptt_eff_temperature.shape[1]):
+                        wandb_log[f"bptt_effective_temperature_{sidx}"] = bptt_eff_temperature[:, sidx].mean().item()
             elif isinstance(bptt_eff_temperature, (float, int)):
                 wandb_log["bptt_effective_temperature"] = float(bptt_eff_temperature)
             wandb_log.update(estimator_metrics)
@@ -1025,6 +1087,84 @@ def optimize_inputs(
         wandb_log['lcs_ratio'] = lcs_ratio
         lcs_ratio_history.append(lcs_ratio)
 
+        # Compute prompt reconstruction metrics (SODA-style) if ground truth is available
+        if track_prompt_metrics:
+            optimized_prompt_tokens = learnable_input_ids.cpu().tolist()
+            gt_prompt_len = len(ground_truth_prompt_tokens)
+
+            # Prompt token accuracy (partial match)
+            min_len = min(len(optimized_prompt_tokens), gt_prompt_len)
+            matching = sum(
+                optimized_prompt_tokens[i] == ground_truth_prompt_tokens[i]
+                for i in range(min_len)
+            )
+            prompt_token_acc = matching / gt_prompt_len if gt_prompt_len > 0 else 0.0
+            prompt_metrics_history["prompt_token_accuracy"].append(prompt_token_acc)
+            wandb_log['prompt_token_accuracy'] = prompt_token_acc
+
+            # Prompt exact match
+            prompt_exact = int(optimized_prompt_tokens[:gt_prompt_len] == ground_truth_prompt_tokens)
+            prompt_metrics_history["prompt_exact_match"].append(prompt_exact)
+            wandb_log['prompt_exact_match'] = prompt_exact
+
+            # Prompt LCS ratio
+            prompt_lcs = lcs_length(optimized_prompt_tokens, ground_truth_prompt_tokens)
+            prompt_lcs_ratio = prompt_lcs / gt_prompt_len if gt_prompt_len > 0 else 0.0
+            prompt_metrics_history["prompt_lcs_ratio"].append(prompt_lcs_ratio)
+            wandb_log['prompt_lcs_ratio'] = prompt_lcs_ratio
+
+            # Prompt cosine similarity (using embeddings)
+            with torch.no_grad():
+                opt_tokens_tensor = torch.tensor(optimized_prompt_tokens[:gt_prompt_len], dtype=torch.long, device=device)
+                gt_tokens_tensor = torch.tensor(ground_truth_prompt_tokens, dtype=torch.long, device=device)
+
+                embedding_layer = model.get_input_embeddings()
+                opt_emb = embedding_layer(opt_tokens_tensor)
+                gt_emb = embedding_layer(gt_tokens_tensor)
+
+                # Normalize and compute cosine similarity
+                opt_norm = opt_emb / (opt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+                gt_norm = gt_emb / (gt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+                cos_sim = (opt_norm * gt_norm).sum(dim=-1).mean().item()
+
+            prompt_metrics_history["prompt_cosine_similarity"].append(cos_sim)
+            wandb_log['prompt_cosine_similarity'] = cos_sim
+
+        # Compute semantic metrics (BERT/SentenceBERT) at specified intervals
+        if track_semantic_metrics and (epoch % semantic_metrics_every_n_epochs == 0 or epoch == epochs - 1):
+            from evaluation_utils import compute_bertscore, compute_sentencebert_similarity, get_cached_sentencebert
+
+            # Ensure SentenceBERT model is cached on first call
+            _ = get_cached_sentencebert(sentencebert_model_name, str(device))
+
+            # Output metrics: generated vs target
+            output_bert = compute_bertscore(generated_output_str, target_text,
+                                             model_type=bertscore_model_type, device=str(device))
+            output_sbert = compute_sentencebert_similarity(generated_output_str, target_text,
+                                                            model_name=sentencebert_model_name, device=str(device))
+
+            for key, val in output_bert.items():
+                semantic_metrics_history[f"output_{key}"].append(float(val))
+                wandb_log[f"output_{key}"] = float(val)
+            output_sbert_val = float(output_sbert["sentencebert_similarity"])
+            semantic_metrics_history["output_sentencebert_similarity"].append(output_sbert_val)
+            wandb_log["output_sentencebert_similarity"] = output_sbert_val
+
+            # Prompt metrics: optimized prompt vs ground-truth (if available)
+            if track_prompt_metrics and ground_truth_prompt is not None:
+                optimized_prompt_text = tokenizer.decode(learnable_input_ids, skip_special_tokens=True)
+                prompt_bert = compute_bertscore(optimized_prompt_text, ground_truth_prompt,
+                                                 model_type=bertscore_model_type, device=str(device))
+                prompt_sbert = compute_sentencebert_similarity(optimized_prompt_text, ground_truth_prompt,
+                                                                model_name=sentencebert_model_name, device=str(device))
+
+                for key, val in prompt_bert.items():
+                    semantic_metrics_history[f"prompt_{key}"].append(float(val))
+                    wandb_log[f"prompt_{key}"] = float(val)
+                prompt_sbert_val = float(prompt_sbert["sentencebert_similarity"])
+                semantic_metrics_history["prompt_sentencebert_similarity"].append(prompt_sbert_val)
+                wandb_log["prompt_sentencebert_similarity"] = prompt_sbert_val
+
         metrics_dict = token_overlap_metric.measure(
             prompt_tokens=learnable_input_ids,
         )
@@ -1032,8 +1172,9 @@ def optimize_inputs(
             wandb_log[k] = v
 
         wandb_table.add_data(
-            epoch+1, 
+            epoch+1,
             target_text,
+            ground_truth_prompt or "",
             learnable_input_ids.tolist(),
             learnable_input_str,
             table_generated_output_ids[0].tolist(),
@@ -1084,7 +1225,8 @@ def optimize_inputs(
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
 
-    return generated_tokens, learnable_inputs, losses, lcs_ratio_history
+    # Return prompt_metrics_history and semantic_metrics_history
+    return generated_tokens, learnable_inputs, losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history
 
 
 def str2bool(instr):
