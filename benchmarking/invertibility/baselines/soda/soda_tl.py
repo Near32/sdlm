@@ -48,8 +48,9 @@ def soda_optimize_inputs_tl(
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
     model: Optional[Any] = None,  # Pre-loaded model
+    ground_truth_prompt_tokens: Optional[List[int]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
+) -> Tuple[List[int], torch.Tensor, List[float], List[float], Dict[str, List[float]]]:
     """
     Single-target SODA optimization using transformer_lens.
 
@@ -84,6 +85,7 @@ def soda_optimize_inputs_tl(
             - optimized_inputs: Optimized learnable parameter tensor
             - losses: List of loss values per epoch
             - lcs_ratio_history: List of LCS ratios per epoch
+            - prompt_metrics_history: Dict of prompt reconstruction metrics per epoch
     """
     kwargs = kwargs or {}
 
@@ -160,6 +162,17 @@ def soda_optimize_inputs_tl(
     # Lists to track metrics
     losses = []
     lcs_ratio_history = []
+
+    # Initialize prompt metrics history for per-epoch tracking
+    prompt_metrics_history = {
+        "prompt_token_accuracy": [],
+        "prompt_exact_match": [],
+        "prompt_lcs_ratio": [],
+        "prompt_cosine_similarity": [],
+    }
+    track_prompt_metrics = ground_truth_prompt_tokens is not None
+    if track_prompt_metrics:
+        gt_prompt_len = len(ground_truth_prompt_tokens)
 
     # Main optimization loop
     pbar = tqdm(range(epochs), desc="SODA TL Optimization")
@@ -241,6 +254,36 @@ def soda_optimize_inputs_tl(
                 torch.tensor(learned_input_ids), target_tokens[0].cpu()
             )
 
+            # Compute prompt reconstruction metrics if ground truth is available
+            if track_prompt_metrics:
+                # Prompt token accuracy (partial match)
+                min_len = min(len(learned_input_ids), gt_prompt_len)
+                matching = sum(
+                    learned_input_ids[i] == ground_truth_prompt_tokens[i]
+                    for i in range(min_len)
+                )
+                prompt_token_acc = matching / gt_prompt_len if gt_prompt_len > 0 else 0.0
+                prompt_metrics_history["prompt_token_accuracy"].append(prompt_token_acc)
+
+                # Prompt exact match
+                prompt_exact = int(learned_input_ids[:gt_prompt_len] == ground_truth_prompt_tokens[:gt_prompt_len])
+                prompt_metrics_history["prompt_exact_match"].append(prompt_exact)
+
+                # Prompt LCS ratio
+                prompt_lcs = compute_lcs_ratio(learned_input_ids, ground_truth_prompt_tokens)
+                prompt_metrics_history["prompt_lcs_ratio"].append(prompt_lcs)
+
+                # Prompt cosine similarity (using embeddings)
+                opt_len = min(len(learned_input_ids), gt_prompt_len)
+                opt_tokens_tensor = torch.tensor(learned_input_ids[:opt_len], dtype=torch.long, device=device)
+                gt_tokens_tensor = torch.tensor(ground_truth_prompt_tokens[:opt_len], dtype=torch.long, device=device)
+                opt_emb = embedding_weights[opt_tokens_tensor]
+                gt_emb = embedding_weights[gt_tokens_tensor]
+                opt_norm = opt_emb / (opt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+                gt_norm = gt_emb / (gt_emb.norm(dim=-1, keepdim=True) + 1e-9)
+                cos_sim = (opt_norm * gt_norm).sum(dim=-1).mean().item()
+                prompt_metrics_history["prompt_cosine_similarity"].append(cos_sim)
+
         losses.append(loss.item())
         lcs_ratio_history.append(lcs_ratio)
 
@@ -253,6 +296,14 @@ def soda_optimize_inputs_tl(
             "target_hit_ratio": target_hit_ratio,
             "temperature": temperature,
         }
+
+        # Add prompt metrics to wandb_log if tracking
+        if track_prompt_metrics:
+            wandb_log['prompt_token_accuracy'] = prompt_token_acc
+            wandb_log['prompt_exact_match'] = prompt_exact
+            wandb_log['prompt_lcs_ratio'] = prompt_lcs
+            wandb_log['prompt_cosine_similarity'] = cos_sim
+
         wandb.log(wandb_log)
 
         # Add to wandb table
@@ -302,4 +353,4 @@ def soda_optimize_inputs_tl(
         final_generated = final_logits[:, seq_len - 1:, :].argmax(dim=-1)
         generated_tokens_list = final_generated[0].cpu().tolist()
 
-    return generated_tokens_list, final_one_hot, losses, lcs_ratio_history
+    return generated_tokens_list, final_one_hot, losses, lcs_ratio_history, prompt_metrics_history

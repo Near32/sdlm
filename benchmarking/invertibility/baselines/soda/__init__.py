@@ -35,8 +35,9 @@ def soda_optimize_inputs(
     early_stop_on_exact_match: bool = True,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
+    ground_truth_prompt_tokens: Optional[List[int]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Union[Tuple[List[int], torch.Tensor, List[float], List[float]], Dict[str, Any]]:
+) -> Union[Tuple[List[int], torch.Tensor, List[float], List[float], Dict[str, List[float]]], Dict[str, Any]]:
     """
     Unified SODA interface with backend and batching dispatch.
 
@@ -75,7 +76,7 @@ def soda_optimize_inputs(
 
     Returns:
         For batching="single":
-            Tuple of (generated_tokens, optimized_inputs, losses, lcs_ratio_history)
+            Tuple of (generated_tokens, optimized_inputs, losses, lcs_ratio_history, prompt_metrics_history)
         For batching="internal":
             Dict with results, elapsed_time, etc.
 
@@ -133,6 +134,7 @@ def soda_optimize_inputs(
             early_stop_on_exact_match=early_stop_on_exact_match,
             lcs_ratio_threshold=lcs_ratio_threshold,
             batch_size=batch_size,
+            ground_truth_prompt_tokens=ground_truth_prompt_tokens,
             kwargs=kwargs,
         )
 
@@ -182,6 +184,7 @@ def soda_optimize_inputs(
             lcs_ratio_threshold=lcs_ratio_threshold,
             batch_size=batch_size,
             model=model,
+            ground_truth_prompt_tokens=ground_truth_prompt_tokens,
             kwargs=kwargs,
         )
 
