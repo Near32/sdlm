@@ -12,11 +12,11 @@ metric:
   goal: minimize 
 parameters:
   dataset_path:
-    values: ["./data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+    values: ["./data/qwen3-4b_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
   output_dir:
-    values: ["results/qwen3_600m_2048ep_grid_sweep"]
+    values: ["results/qwen3_4b_2048ep_grid_stgs_tf_sweep"]
   model_name:
-    values: ["Qwen/Qwen3-0.6B"]
+    values: ["Qwen/Qwen3-4B"]
   model_precision:
     values: ["full"]
   gradient_checkpointing:

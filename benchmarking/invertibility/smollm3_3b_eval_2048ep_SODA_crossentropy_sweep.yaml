@@ -1,0 +1,59 @@
+project: LMI-SODA
+entity: kevin-near32-org
+program: batch_optimize_main.py
+command:
+  - ${env}
+  - ./venv/bin/python
+  - ${program}
+  - ${args}
+method: grid
+metric:
+  name: loss
+  goal: minimize
+parameters:
+  dataset_path:
+    values: ["./data/smollm3-3b-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+  output_dir:
+    values: ["results/smollm3_3b_2048ep_SODA_grid_sweep"]
+  model_name:
+    values: ["HuggingFaceTB/SmolLM3-3B-Base"]
+  model_precision:
+    values: ["full"]
+  gradient_checkpointing:
+    values: ["False"]
+  losses:
+    values: ["crossentropy"]
+  seq_len:
+    values: [10, 80]
+  method:
+    values: ["soda"]
+  baseline_backend:
+    values: ["hf"]
+  soda_decay_rate:
+    values: [0.98]
+  soda_beta1:
+    values: [0.9]
+  soda_beta2:
+    values: [0.995]
+  soda_reset_epoch:
+    values: [50]
+  soda_reinit_epoch:
+    values: [1500]
+  soda_bias_correction:
+    values: [False]
+  soda_init_strategy:
+    values: ["zeros"]
+  epochs:
+    values: [2048]
+  temperature:
+    values: [0.05]
+  plot_every:
+    values: [100000]
+  seed:
+    values: [10, 20, 30, 40, 50]
+  batch_size:
+    values: [8]
+  learning_rate:
+    values: [0.03]
+  num_workers:
+    values: [1]

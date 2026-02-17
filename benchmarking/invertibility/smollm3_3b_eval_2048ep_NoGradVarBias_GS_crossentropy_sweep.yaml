@@ -11,22 +11,26 @@ metric:
   name: loss
   goal: minimize 
 parameters:
+  seed:
+    values: [10, 20, 30, 40, 50]
+  temperature:
+    values: [100, 1]
   dataset_path:
-    values: ["./data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+    values: ["data/smollm3-3b-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
   output_dir:
-    values: ["results/qwen3_600m_2048ep_grid_sweep"]
+    values: ["results/smollm3_3b_2048ep_grid_sweep"]
   model_name:
-    values: ["Qwen/Qwen3-0.6B"]
+    values: ["HuggingFaceTB/SmolLM3-3B-Base"]
   model_precision:
     values: ["full"]
   gradient_checkpointing:
     values: ["False"]
+  teacher_forcing:
+    values: [False]
   losses:
     values: ["crossentropy"]
-  teacher_forcing:
-    values: [True]
   seq_len:
-    values: [10, 80]
+    values: [80, 10]
   gradient_estimator:
     values: ['stgs']
   stgs_grad_variance_samples:
@@ -47,8 +51,6 @@ parameters:
     values: [0.9]
   epochs:
     values: [2048]
-  temperature:
-    values: [1.0, 100]
   decouple_learnable_temperature:
     values: [True, False]
   learnable_temperature:
@@ -67,8 +69,6 @@ parameters:
     values: [False]
   plot_every:
     values: [100000]
-  seed:
-    values: [10, 20, 30, 40, 50]
   batch_size:
     values: [8]
   learning_rate:
