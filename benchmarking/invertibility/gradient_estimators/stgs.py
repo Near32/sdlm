@@ -216,6 +216,7 @@ def stgs_forward_pass(
             next_token_id, next_token_one_hot, bptt_eff_temperature, bptt_y_soft = bptt_stgs(
                 all_logits[-1],
                 hidden_states=outputs.hidden_states,
+                temperature_param_indices=[current_length-1],
             )
             next_token_embedding = torch.matmul(next_token_one_hot, embedding_weights_subset)
         else:

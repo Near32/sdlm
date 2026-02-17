@@ -68,6 +68,7 @@ class STGS(nn.Module):
         temperature: Optional[float] = None,
         hidden_states: Optional[Tensor] = None,
         dropout: Optional[float] = None,
+        temperature_param_indices: Optional[List[int]] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with STGS sampling.
@@ -109,6 +110,8 @@ class STGS(nn.Module):
                 if self.nbr_learnable_temperatures==1 \
                 and self.nbr_learnable_temperatures != seq_len:
                     eff_temperature = eff_temperature.repeat(1, seq_len, 1)
+            if self.nbr_learnable_temperatures > 1 and temperature_param_indices is not None:
+                eff_temperature = eff_temperature[:,temperature_param_indices,...]
         else:
             eff_temperature = torch.tensor([self.init_temperature], device=self.device)
         
