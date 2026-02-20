@@ -45,15 +45,137 @@ def setup_model_and_tokenizer(model_name="HuggingFaceM4/tiny-random-LlamaForCaus
 
     return model, tokenizer
 
-def initialize_learnable_inputs(vocab_size, seq_len, device, batch_size=1):
-    """
-    Initialize learnable input as one-hot encoded vectors
-    """
-    # Create learnable input parameters (random initialization)
-    # Perform the multiplication *before* passing it to nn.Parameter.
-    learnable_inputs = torch.randn((batch_size, seq_len, vocab_size), requires_grad=True, device=device)
+def _init_mlm_mask(vocab_size, seq_len, device, batch_size,
+                   mlm_model_name, target_text, causal_tokenizer, init_std, top_k=50):
+    """Build init logits using a masked LM to predict a masked prefix."""
+    from transformers import AutoTokenizer as AT, AutoModelForMaskedLM as AMLM
 
-    return learnable_inputs
+    mlm_tokenizer = AT.from_pretrained(mlm_model_name)
+    mlm_model = AMLM.from_pretrained(mlm_model_name).eval()
+
+    mask_id = mlm_tokenizer.mask_token_id
+    masks = [mask_id] * seq_len
+
+    # Build input: [CLS] MASK*seq_len [SEP] target [SEP]
+    target_enc = mlm_tokenizer.encode(target_text, add_special_tokens=False)
+    max_target = 512 - seq_len - 3
+    target_enc = target_enc[:max_target]
+
+    input_ids = torch.tensor(
+        [mlm_tokenizer.cls_token_id] + masks +
+        [mlm_tokenizer.sep_token_id] + target_enc +
+        [mlm_tokenizer.sep_token_id]
+    ).unsqueeze(0)  # (1, L)
+
+    with torch.no_grad():
+        mlm_out = mlm_model(input_ids)
+        # MASK positions are indices 1 .. seq_len
+        mlm_logits = mlm_out.logits[0, 1:seq_len + 1, :]  # (seq_len, mlm_vocab_size)
+        #mlm_probs = mlm_logits.softmax(dim=-1)
+
+    # Build causal-LM logit tensor via vocab mapping
+    min_logit = mlm_logits.min()
+    causal_logits = min_logit*torch.ones((seq_len, vocab_size), device=device)
+    if seq_len > 0:
+        #top_ids = mlm_probs.topk(min(top_k, mlm_probs.shape[-1]), dim=-1).indices  # (seq_len, top_k)
+        top_ids = mlm_logits.topk(min(top_k, mlm_logits.shape[-1]), dim=-1).indices  # (seq_len, top_k)
+        mismatch_tokens = []
+        for pos in range(seq_len):
+            for mlm_id in top_ids[pos].tolist():
+                token_str = mlm_tokenizer.decode([mlm_id])
+                causal_ids = causal_tokenizer.encode(token_str, add_special_tokens=False)
+                # If an mlm token result into many causal tokens, then we use the offset on position:
+                if len(causal_ids) > 1 and token_str not in mismatch_tokens:
+                    mismatch_tokens.append(token_str)
+                    print(f"WARNING: using mlm_mask initialization: '{token_str}' -> {len(causal_ids)} causal tokens.")
+                for offset, causal_id in enumerate(causal_ids):
+                    eff_pos = min(pos+offset, causal_logits.shape[0]-1)
+                    causal_logits[eff_pos, causal_id] = mlm_logits[pos, mlm_id].item()
+                '''
+                if len(causal_ids) == 1 and causal_ids[0] < vocab_size:
+                    #causal_logits[pos, causal_ids[0]] = mlm_probs[pos, mlm_id].item()
+                    causal_logits[pos, causal_ids[0]] = mlm_logits[pos, mlm_id].item()
+                '''
+
+    logits = causal_logits.unsqueeze(0).expand(batch_size, -1, -1).clone()
+    if init_std > 0:
+        logits = logits + torch.randn_like(logits) * init_std
+    return logits
+
+
+def initialize_learnable_inputs(
+    vocab_size, seq_len, device, batch_size=1,
+    init_strategy="randn", init_std=0.0,
+    # for "embedding_similarity"
+    embedding_weights=None, target_token_ids=None,
+    # for "lm_target_prior"
+    model=None, target_input_ids=None, allowed_tokens=None,
+    # for "mlm_mask"
+    mlm_model_name="distilbert-base-uncased", 
+    mlm_top_k=50,
+    target_text=None, tokenizer=None,
+):
+    """
+    Initialize learnable logits using the specified strategy.
+
+    Strategies:
+        "randn"               : Standard normal (current default, backward-compat).
+        "zeros"               : All-zero logits → exactly uniform softmax.
+        "normal"              : Normal with configurable init_std.
+        "one_hot_random"      : Each position gets a +10 spike on a random token.
+        "embedding_similarity": Logits ∝ cosine similarity of each token's embedding
+                                with the mean target embedding.
+        "lm_target_prior"     : Base logits = next-token logits of the LM conditioned
+                                on the target text; per-position noise of init_std added.
+        "mlm_mask"            : Use a masked LM to predict a masked prefix given the
+                                target text; vocab-mapped to causal-LM token indices.
+    """
+    if init_strategy == "zeros":
+        logits = torch.zeros((batch_size, seq_len, vocab_size), device=device)
+
+    elif init_strategy == "normal":
+        logits = torch.empty((batch_size, seq_len, vocab_size), device=device)
+        torch.nn.init.normal_(logits, std=init_std)
+
+    elif init_strategy == "one_hot_random":
+        logits = torch.zeros((batch_size, seq_len, vocab_size), device=device)
+        if seq_len > 0:
+            idx = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            logits.scatter_(-1, idx.unsqueeze(-1), 10.0)
+
+    elif init_strategy == "embedding_similarity":
+        # embedding_weights: (vocab_size, embed_dim) — allowed-vocab subset
+        # target_token_ids:  (target_length,)        — mapped to allowed-vocab indices
+        target_embeds = embedding_weights[target_token_ids]  # (target_length, embed_dim)
+        mean_embed = target_embeds.mean(dim=0)               # (embed_dim,)
+        norm_e = embedding_weights / (embedding_weights.norm(dim=1, keepdim=True) + 1e-9)
+        norm_m = mean_embed / (mean_embed.norm() + 1e-9)
+        sims = (norm_e @ norm_m).clamp(min=0)                # (vocab_size,)
+        logits = sims.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1).clone()
+
+    elif init_strategy == "lm_target_prior":
+        # Run the causal LM on the target text and use the next-token logits as a prior.
+        with torch.no_grad():
+            out = model(target_input_ids.to(device))
+            base_logits = out.logits[0, -1, :]          # (full_vocab_size,)
+            if allowed_tokens is not None:
+                base_logits = base_logits[allowed_tokens]  # (vocab_size,)
+        base = base_logits.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1).clone()
+        if init_std > 0:
+            base = base + torch.randn_like(base) * init_std
+        logits = base
+
+    elif init_strategy == "mlm_mask":
+        logits = _init_mlm_mask(
+            vocab_size, seq_len, device, batch_size,
+            mlm_model_name, target_text, tokenizer, init_std,
+            top_k=mlm_top_k,
+        )
+
+    else:  # "randn" — current default, kept for backward compat
+        logits = torch.randn((batch_size, seq_len, vocab_size), device=device)
+
+    return logits.detach().requires_grad_(True)
 
 def filter_vocabulary(embedding_weights, seed_vector, target_token_ids, threshold=0.5):
     """
@@ -688,6 +810,11 @@ def optimize_inputs(
     filter_vocab=False,
     max_gradient_norm=0.0,
     batch_size=1,
+    # STGS initialization strategy
+    init_strategy="randn",
+    init_std=0.0,
+    init_mlm_model="distilbert-base-uncased",
+    init_mlm_top_k=50,
     # Method selection (NEW)
     method="stgs",  # "stgs", "reinforce", "soda", "gcg"
     # Backend selection for SODA/GCG (NEW)
@@ -725,6 +852,8 @@ def optimize_inputs(
     fixed_gt_suffix_rank2_n: int = 0, # fix last N positions (before rank-1 suffix), GT at rank 2
     fixed_prefix_text: str = None,    # text whose tokens become a fixed prefix
     fixed_suffix_text: str = None,    # text whose tokens become a fixed suffix
+    early_stop_on_exact_match: bool = True,
+    early_stop_loss_threshold: float = 0.01,
     kwargs={},
 ):
     """
@@ -970,6 +1099,18 @@ def optimize_inputs(
         "target_hit_ratio",
     ])
 
+    exact_match_hits_table = wandb.Table(columns=[
+        "epoch",
+        "target_text",
+        "generated_output_str",
+        "learned_input_str",
+        "loss",
+        "lcs_ratio",
+        "PLX-prompt",
+        "PLX-completion",
+        "PLX-prompt-tf-completion",
+    ])
+
     if filter_vocab:
       # Build a mapping from full-vocab token id to allowed index
       allowed_list = allowed_tokens.tolist()
@@ -989,7 +1130,20 @@ def optimize_inputs(
 
     # Initialize learnable inputs (free positions only; fixed parts are separate)
     parameters = []
-    free_logits = initialize_learnable_inputs(allowed_vocab_size, n_free, device)
+    free_logits = initialize_learnable_inputs(
+        allowed_vocab_size, n_free, device,
+        init_strategy=init_strategy,
+        init_std=init_std,
+        embedding_weights=embedding_weights_subset,
+        target_token_ids=target_tokens_mapped[0],
+        model=model,
+        target_input_ids=target_tokens,
+        allowed_tokens=allowed_tokens,
+        mlm_model_name=init_mlm_model,
+        mlm_top_k=init_mlm_top_k,
+        target_text=target_text,
+        tokenizer=tokenizer,
+    )
     parameters.append(free_logits)
 
     # Assembly function: build the full (1, seq_len, allowed_vocab_size) logits each step.
@@ -1510,9 +1664,25 @@ def optimize_inputs(
                 print(f"\nEpoch {epoch} intermediate output: {intermediate_text}")
                 print(f"Target: {target_text}")
 
+        # Track exact-match hits regardless of early-stopping
+        if generated_output_str == target_text:
+            exact_match_hits_table.add_data(
+                epoch + 1,
+                target_text,
+                generated_output_str,
+                learnable_input_str,
+                loss.item(),
+                lcs_ratio,
+                losses_dict["PLX-prompt"].item(),
+                losses_dict["PLX-completion"].item(),
+                losses_dict["PLX-prompt-tf-completion"].item()
+                    if "PLX-prompt-tf-completion" in losses_dict else None,
+            )
+            wandb.log({"exact_match_hits": copy.deepcopy(exact_match_hits_table)})
+
         # Optional: early stopping condition
-        if loss.item() < 0.01 \
-        or generated_output_str == target_text:
+        if (early_stop_loss_threshold > 0.0 and loss.item() < early_stop_loss_threshold) \
+        or (early_stop_on_exact_match and generated_output_str == target_text):
             print(f"Converged at epoch {epoch+1} with loss: {loss.item():.6f}")
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
@@ -1600,6 +1770,10 @@ def main():
     parser.add_argument("--vocab_threshold", type=float, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=True,
+                        help="Stop optimization when generated output exactly matches target (default: True)")
+    parser.add_argument("--early_stop_loss_threshold", type=float, default=0.01,
+                        help="Stop optimization when loss drops below this threshold (0 or negative to disable)")
 
     # Fixed logit distribution parameters
     parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
@@ -1683,6 +1857,8 @@ def main():
         fixed_gt_suffix_rank2_n=config.get('fixed_gt_suffix_rank2_n', 0),
         fixed_prefix_text=config.get('fixed_prefix_text'),
         fixed_suffix_text=config.get('fixed_suffix_text'),
+        early_stop_on_exact_match=config.get('early_stop_on_exact_match', True),
+        early_stop_loss_threshold=config.get('early_stop_loss_threshold', 0.01),
         kwargs=config,
     )
 

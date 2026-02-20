@@ -305,6 +305,13 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         fixed_gt_suffix_rank2_n=config.get("fixed_gt_suffix_rank2_n", 0),
         fixed_prefix_text=config.get("fixed_prefix_text"),
         fixed_suffix_text=config.get("fixed_suffix_text"),
+        # STGS initialization strategy
+        init_strategy=config.get("init_strategy", "randn"),
+        init_std=config.get("init_std", 0.0),
+        init_mlm_model=config.get("init_mlm_model", "distilbert-base-uncased"),
+        init_mlm_top_k=config.get("init_mlm_top_k", 50),
+        early_stop_on_exact_match=config.get("early_stop_on_exact_match", True),
+        early_stop_loss_threshold=config.get("early_stop_loss_threshold", 0.01),
         kwargs=config,
     )
     
@@ -913,6 +920,12 @@ def parse_args():
     parser.add_argument("--semantic_metrics_every_n_epochs", type=int, default=128,
                         help="Compute BERT/SentenceBERT every N epochs (0=disabled)")
 
+    # Early stopping parameters
+    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=True,
+                        help="Stop optimization when generated output exactly matches target (default: True)")
+    parser.add_argument("--early_stop_loss_threshold", type=float, default=0.01,
+                        help="Stop optimization when loss drops below this threshold (0 or negative to disable)")
+
     # Fixed logit distribution parameters
     parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
                         help="Fix first N prompt positions to GT token at rank 1 (prompt reconstruction only)")
@@ -926,6 +939,18 @@ def parse_args():
                         help="Text string whose tokens form a fixed one-hot prefix")
     parser.add_argument("--fixed_suffix_text", type=str, default=None,
                         help="Text string whose tokens form a fixed one-hot suffix")
+
+    # STGS initialization strategy
+    parser.add_argument("--init_strategy", type=str, default="randn",
+                        choices=["randn", "zeros", "normal", "one_hot_random",
+                                 "embedding_similarity", "lm_target_prior", "mlm_mask"],
+                        help="Initialization strategy for STGS learnable logits")
+    parser.add_argument("--init_std", type=float, default=0.0,
+                        help="Noise std for structured init strategies (normal, lm_target_prior, mlm_mask)")
+    parser.add_argument("--init_mlm_model", type=str, default="distilbert-base-uncased",
+                        help="MLM checkpoint for 'mlm_mask' initialization strategy")
+    parser.add_argument("--init_mlm_top_k", type=int, default=1000,
+                        help="Top k indices that are initialized for 'mlm_mask' initialization strategy")
 
     return parser.parse_args()
 

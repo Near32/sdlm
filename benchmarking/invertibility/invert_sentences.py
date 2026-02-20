@@ -267,6 +267,12 @@ def parse_args():
         choices=["full", "half"],
         help="Model precision (default: full)",
     )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        type=str2bool,
+        default=False,
+        help="Whether to use gradient checkpointing",
+    )
 
     # Optimization parameters
     parser.add_argument(
@@ -312,6 +318,60 @@ def parse_args():
         choices=["stgs", "reinforce", "soda", "gcg", "o2p"],
         help="Optimization method (default: stgs)",
     )
+
+    # Backend selection for SODA/GCG
+    parser.add_argument("--baseline_backend", type=str, default="hf",
+                        choices=["hf", "tl"],
+                        help="Model backend for SODA/GCG: 'hf' (HuggingFace) or 'tl' (transformer_lens)")
+    parser.add_argument("--baseline_model_name", type=str, default=None,
+                        help="Model name for transformer_lens backend (defaults to --model_name)")
+
+    # SODA-specific parameters
+    parser.add_argument("--soda_decay_rate", type=float, default=0.9,
+                        help="SODA: embedding decay rate per epoch")
+    parser.add_argument("--soda_beta1", type=float, default=0.9,
+                        help="SODA: Adam beta1 parameter")
+    parser.add_argument("--soda_beta2", type=float, default=0.995,
+                        help="SODA: Adam beta2 parameter")
+    parser.add_argument("--soda_reset_epoch", type=int, default=50,
+                        help="SODA: optimizer state reset frequency")
+    parser.add_argument("--soda_reinit_epoch", type=int, default=1500,
+                        help="SODA: embedding reinitialization frequency")
+    parser.add_argument("--soda_reg_weight", type=float, default=None,
+                        help="SODA: fluency regularization weight (None = disabled)")
+    parser.add_argument("--soda_bias_correction", type=str2bool, default=False,
+                        help="SODA: use standard Adam bias correction")
+    parser.add_argument("--soda_init_strategy", type=str, default="zeros",
+                        choices=["zeros", "normal"],
+                        help="SODA: embedding initialization strategy")
+    parser.add_argument("--soda_init_std", type=float, default=0.05,
+                        help="SODA: standard deviation for normal initialization")
+
+    # GCG-specific parameters
+    parser.add_argument("--gcg_num_candidates", type=int, default=704,
+                        help="GCG: number of mutation candidates per epoch")
+    parser.add_argument("--gcg_top_k", type=int, default=128,
+                        help="GCG: vocabulary size limit for candidates")
+    parser.add_argument("--gcg_num_mutations", type=int, default=1,
+                        help="GCG: number of token positions to mutate")
+    parser.add_argument("--gcg_pos_choice", type=str, default="uniform",
+                        choices=["uniform", "weighted", "greedy"],
+                        help="GCG: position selection strategy")
+    parser.add_argument("--gcg_token_choice", type=str, default="uniform",
+                        choices=["uniform", "weighted"],
+                        help="GCG: token selection strategy")
+    parser.add_argument("--gcg_init_strategy", type=str, default="zeros",
+                        choices=["zeros", "random"],
+                        help="GCG: token initialization strategy")
+
+    # O2P-specific parameters
+    parser.add_argument("--o2p_model_path", type=str, default=None,
+                        help="O2P: path to trained O2P inverse model (required for method='o2p')")
+    parser.add_argument("--o2p_num_beams", type=int, default=4,
+                        help="O2P: beam size for T5 generation")
+    parser.add_argument("--o2p_max_length", type=int, default=32,
+                        help="O2P: maximum generation length for T5 decoder")
+
     parser.add_argument(
         "--losses",
         type=str,
@@ -335,7 +395,7 @@ def parse_args():
     parser.add_argument(
         "--promptTfComplLambda",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Weight for prompt + teacher-forced completion perplexity loss (default: 0.0)",
     )
 
@@ -433,6 +493,53 @@ def parse_args():
     parser.add_argument("--reinforce_grad_variance_samples", type=int, default=0)
     parser.add_argument("--reinforce_grad_variance_period", type=int, default=1)
 
+    # Metrics parameters
+    parser.add_argument("--metric_groups", type=str, default=None,
+                        help="Comma-separated list of metric groups to compute (None = all)")
+    parser.add_argument("--skip_metric_groups", type=str, default=None,
+                        help="Comma-separated list of metric groups to skip")
+
+    # SentenceBERT / BERTScore parameters
+    parser.add_argument("--sentencebert_model", type=str, default="all-MiniLM-L6-v2",
+                        help="SentenceBERT model to use for semantic similarity")
+    parser.add_argument("--bertscore_model", type=str, default="distilbert-base-uncased",
+                        help="Model to use for BERTScore computation")
+    parser.add_argument("--semantic_metrics_every_n_epochs", type=int, default=128,
+                        help="Compute BERT/SentenceBERT every N epochs (0=disabled)")
+
+    # Early stopping parameters
+    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=True,
+                        help="Stop optimization when generated output exactly matches target (default: True)")
+    parser.add_argument("--early_stop_loss_threshold", type=float, default=0.01,
+                        help="Stop optimization when loss drops below this threshold (0 or negative to disable)")
+
+    # Fixed logit distribution parameters
+    parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
+                        help="Fix first N prompt positions to GT token at rank 1 (prompt reconstruction only)")
+    parser.add_argument("--fixed_gt_suffix_n", type=int, default=0,
+                        help="Fix last N prompt positions to GT token at rank 1 (prompt reconstruction only)")
+    parser.add_argument("--fixed_gt_prefix_rank2_n", type=int, default=0,
+                        help="Fix next N prefix positions to GT token at rank 2 (after fixed_gt_prefix_n)")
+    parser.add_argument("--fixed_gt_suffix_rank2_n", type=int, default=0,
+                        help="Fix N positions before fixed_gt_suffix_n to GT token at rank 2")
+    parser.add_argument("--fixed_prefix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot prefix")
+    parser.add_argument("--fixed_suffix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot suffix")
+
+    # STGS initialization strategy
+    parser.add_argument("--init_strategy", type=str, default="randn",
+                        choices=["randn", "zeros", "normal", "one_hot_random",
+                                 "embedding_similarity", "lm_target_prior", "mlm_mask"],
+                        help="Initialization strategy for STGS learnable logits")
+    parser.add_argument("--init_std", type=float, default=0.0,
+                        help="Noise std for structured init strategies (normal, lm_target_prior, mlm_mask)")
+    parser.add_argument("--init_mlm_model", type=str, default="distilbert-base-uncased",
+                        help="MLM checkpoint for 'mlm_mask' initialization strategy")
+    parser.add_argument("--init_mlm_top_k", type=int, default=1000000,
+                        help="Top k indices that are initialized for 'mlm_mask' initialization strategy")
+
+    
     return parser.parse_args()
 
 
