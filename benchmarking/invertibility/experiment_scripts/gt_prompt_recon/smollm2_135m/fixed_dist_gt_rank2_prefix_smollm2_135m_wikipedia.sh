@@ -1,20 +1,22 @@
 #!/bin/bash
-# Fixed-distribution evaluation — Mode 1: GT rank-1 suffix
+# Fixed-distribution evaluation — Mode 2: GT rank-2 prefix
 #
-# Last N positions of the learnable prompt are held constant with the GT
-# token set to rank 1 (logit = +100, all others = -100).  The remaining
-# (seq_len - N) free positions are gradient-optimised as usual.
+# First N positions of the learnable prompt are initialised with the GT
+# token placed at rank 2: the logits are random-initialised and the GT
+# logit is clamped to (max_logit - 1.0), so the optimiser starts with
+# "almost correct" prefix positions.  The remaining (seq_len - N) free
+# positions are gradient-optimised from scratch.
 #
-# Usage: bash scripts/fixed_dist_gt_rank1_suffix_smollm2_135m_wikipedia.sh
+# Usage: bash experiment_scripts/gt_prompt_recon/smollm2_135m/fixed_dist_gt_rank2_prefix_smollm2_135m_wikipedia.sh
 #
 # The script iterates over:
 #   - prompt lengths: 10, 20, 80
-#   - fixed suffix sizes: 25 % and 50 % of the prompt length
+#   - fixed prefix sizes: 25 % and 50 % of the prompt length
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+PARENT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 cd "$PARENT_DIR"
 
 MODEL_NAME="HuggingFaceTB/SmolLM2-135M"
@@ -27,9 +29,7 @@ EPOCHS=2048
 LR=0.1
 BATCH_SIZE=8
 
-# --- Dataset / suffix-size sweep ---
-#
-# Each entry: "PROMPT_LENGTH DATASET_FILE_TAG FIXED_N_25pct FIXED_N_50pct"
+# --- Dataset / prefix-size sweep ---
 declare -a CONFIGS=(
     "10  PL10_OL20  3  5"
     "20  PL20_TL20  5  10"
@@ -47,14 +47,14 @@ for CFG in "${CONFIGS[@]}"; do
     fi
 
     for FIXED_N in $N_25 $N_50; do
-        OUTPUT_DIR="results/fixed_dist_gt_rank1_suffix_${MODEL_KEY}_${DATASET_SOURCE}_PL${PROMPT_LENGTH}_FN${FIXED_N}_EP${EPOCHS}_LR${LR}_SEED${SEED}"
+        OUTPUT_DIR="results/fixed_dist_gt_rank2_prefix_${MODEL_KEY}_${DATASET_SOURCE}_PL${PROMPT_LENGTH}_FN${FIXED_N}_EP${EPOCHS}_LR${LR}_SEED${SEED}"
 
         echo ""
         echo "=============================================="
-        echo " Fixed-distribution: GT rank-1 suffix"
+        echo " Fixed-distribution: GT rank-2 prefix"
         echo "  Model : ${MODEL_NAME}"
         echo "  Dataset: ${DATASET_PATH}"
-        echo "  seq_len=${PROMPT_LENGTH}  fixed_gt_suffix_n=${FIXED_N}  n_free=$((PROMPT_LENGTH - FIXED_N))"
+        echo "  seq_len=${PROMPT_LENGTH}  fixed_gt_prefix_rank2_n=${FIXED_N}  n_free=$((PROMPT_LENGTH - FIXED_N))"
         echo "  Output : ${OUTPUT_DIR}"
         echo "=============================================="
 
@@ -78,12 +78,12 @@ for CFG in "${CONFIGS[@]}"; do
             --teacher_forcing=True \
             --bptt=False \
             --num_workers=1 \
-            --fixed_gt_suffix_n=${FIXED_N} \
-            --wandb_project="fixed-dist-gt-rank1-suffix-Wikipedia-SmolLM2-135M"
+            --fixed_gt_prefix_rank2_n=${FIXED_N} \
+            --wandb_project="fixed-dist-gt-rank2-prefix-Wikipedia-SmolLM2-135M"
 
         echo "Completed: ${OUTPUT_DIR}"
     done
 done
 
 echo ""
-echo "All fixed GT rank-1 suffix evaluations completed!"
+echo "All fixed GT rank-2 prefix evaluations completed!"

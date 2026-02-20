@@ -14,12 +14,12 @@
 #   "According to"           ->  2 tokens
 #   "Wikipedia states that"  ->  3 tokens
 #
-# Usage: bash scripts/fixed_dist_text_affixes_smollm2_135m_wikipedia.sh
+# Usage: bash experiment_scripts/gt_prompt_recon/smollm2_135m/fixed_dist_text_affixes_smollm2_135m_wikipedia.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+PARENT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 cd "$PARENT_DIR"
 
 MODEL_NAME="HuggingFaceTB/SmolLM2-135M"
