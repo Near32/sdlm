@@ -298,6 +298,13 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         semantic_metrics_every_n_epochs=config.get("semantic_metrics_every_n_epochs", 0),
         bertscore_model_type=config.get("bertscore_model", "distilbert-base-uncased"),
         sentencebert_model_name=config.get("sentencebert_model", "all-MiniLM-L6-v2"),
+        # Fixed logit distribution parameters
+        fixed_gt_prefix_n=config.get("fixed_gt_prefix_n", 0),
+        fixed_gt_suffix_n=config.get("fixed_gt_suffix_n", 0),
+        fixed_gt_prefix_rank2_n=config.get("fixed_gt_prefix_rank2_n", 0),
+        fixed_gt_suffix_rank2_n=config.get("fixed_gt_suffix_rank2_n", 0),
+        fixed_prefix_text=config.get("fixed_prefix_text"),
+        fixed_suffix_text=config.get("fixed_suffix_text"),
         kwargs=config,
     )
     
@@ -903,6 +910,20 @@ def parse_args():
     # Per-epoch semantic metrics
     parser.add_argument("--semantic_metrics_every_n_epochs", type=int, default=128,
                         help="Compute BERT/SentenceBERT every N epochs (0=disabled)")
+
+    # Fixed logit distribution parameters
+    parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
+                        help="Fix first N prompt positions to GT token at rank 1 (prompt reconstruction only)")
+    parser.add_argument("--fixed_gt_suffix_n", type=int, default=0,
+                        help="Fix last N prompt positions to GT token at rank 1 (prompt reconstruction only)")
+    parser.add_argument("--fixed_gt_prefix_rank2_n", type=int, default=0,
+                        help="Fix next N prefix positions to GT token at rank 2 (after fixed_gt_prefix_n)")
+    parser.add_argument("--fixed_gt_suffix_rank2_n", type=int, default=0,
+                        help="Fix N positions before fixed_gt_suffix_n to GT token at rank 2")
+    parser.add_argument("--fixed_prefix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot prefix")
+    parser.add_argument("--fixed_suffix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot suffix")
 
     return parser.parse_args()
 

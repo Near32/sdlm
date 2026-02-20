@@ -29,6 +29,7 @@ class MetricsAggregator:
             "prompt_exact_match": defaultdict(lambda: defaultdict(list)),
             "prompt_lcs_ratio": defaultdict(lambda: defaultdict(list)),
             "prompt_cosine_similarity": defaultdict(lambda: defaultdict(list)),
+            "prompt_gt_token_rank_mean": defaultdict(lambda: defaultdict(list)),
         }
         # For per-epoch semantic metrics (BERT/SentenceBERT): metric_name -> epoch -> k_value -> list of values
         self.semantic_metrics_by_epoch_by_k = {

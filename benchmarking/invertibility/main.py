@@ -453,6 +453,173 @@ class TokenOverlapMetric(object):
         return output_dict
 
 
+def build_fixed_logits_spec(
+    ground_truth_prompt_tokens,
+    allowed_token_to_idx,
+    allowed_vocab_size,
+    tokenizer,
+    device,
+    seq_len,
+    fixed_gt_prefix_n=0,
+    fixed_gt_suffix_n=0,
+    fixed_gt_prefix_rank2_n=0,
+    fixed_gt_suffix_rank2_n=0,
+    fixed_prefix_text=None,
+    fixed_suffix_text=None,
+):
+    """
+    Build fixed logit tensors for partially fixed prompt optimization (Approach B: Split Tensor).
+
+    Assembly order: [fixed_prefix | free_middle | fixed_suffix]
+
+    Returns:
+        (fixed_prefix_logits, fixed_suffix_logits, n_free)
+        fixed_prefix_logits: (1, n_prefix, allowed_vocab_size) or None, requires_grad=False
+        fixed_suffix_logits: (1, n_suffix, allowed_vocab_size) or None, requires_grad=False
+        n_free: seq_len - n_prefix - n_suffix  (must be >= 0)
+    """
+    BIG = 100.0
+    prefix_parts = []
+    suffix_parts = []
+
+    has_gt_prefix = fixed_gt_prefix_n > 0 or fixed_gt_prefix_rank2_n > 0
+    has_gt_suffix = fixed_gt_suffix_n > 0 or fixed_gt_suffix_rank2_n > 0
+    if fixed_prefix_text and has_gt_prefix:
+        logging.warning("build_fixed_logits_spec: combining fixed_prefix_text with GT-based prefix; rank alignment may be inconsistent.")
+    if fixed_suffix_text and has_gt_suffix:
+        logging.warning("build_fixed_logits_spec: combining fixed_suffix_text with GT-based suffix; rank alignment may be inconsistent.")
+
+    # ---- PREFIX ----
+
+    # Text prefix (leftmost part of prefix)
+    if fixed_prefix_text:
+        tok_ids = tokenizer(fixed_prefix_text, add_special_tokens=False, return_tensors="pt").input_ids[0].tolist()
+        n = len(tok_ids)
+        if n > 0:
+            logits = torch.full((1, n, allowed_vocab_size), -BIG, device=device)
+            for pos, tok_id in enumerate(tok_ids):
+                if tok_id in allowed_token_to_idx:
+                    logits[0, pos, allowed_token_to_idx[tok_id]] = BIG
+                else:
+                    logging.warning(
+                        f"build_fixed_logits_spec: fixed_prefix_text token {tok_id} "
+                        f"('{tokenizer.decode([tok_id])}') not in allowed vocab; using index 0."
+                    )
+                    logits[0, pos, 0] = BIG
+            prefix_parts.append(logits.detach())
+
+    # GT rank-1 prefix: first fixed_gt_prefix_n GT positions fixed at rank 1
+    if fixed_gt_prefix_n > 0:
+        if ground_truth_prompt_tokens is None:
+            logging.warning("build_fixed_logits_spec: fixed_gt_prefix_n > 0 but ground_truth_prompt_tokens is None; skipping.")
+        else:
+            n = min(fixed_gt_prefix_n, len(ground_truth_prompt_tokens))
+            logits = torch.full((1, n, allowed_vocab_size), -BIG, device=device)
+            for pos in range(n):
+                gt_tok = ground_truth_prompt_tokens[pos]
+                if gt_tok in allowed_token_to_idx:
+                    logits[0, pos, allowed_token_to_idx[gt_tok]] = BIG
+            prefix_parts.append(logits.detach())
+
+    # GT rank-2 prefix: next fixed_gt_prefix_rank2_n GT positions fixed at rank 2
+    if fixed_gt_prefix_rank2_n > 0:
+        if ground_truth_prompt_tokens is None:
+            logging.warning("build_fixed_logits_spec: fixed_gt_prefix_rank2_n > 0 but ground_truth_prompt_tokens is None; skipping.")
+        else:
+            start_pos = fixed_gt_prefix_n
+            n = min(fixed_gt_prefix_rank2_n, max(0, len(ground_truth_prompt_tokens) - start_pos))
+            if n > 0:
+                logits = torch.randn((1, n, allowed_vocab_size), device=device)
+                eps_gap = 1.0
+                for pos in range(n):
+                    gt_tok = ground_truth_prompt_tokens[start_pos + pos]
+                    if gt_tok in allowed_token_to_idx:
+                        allowed_idx = allowed_token_to_idx[gt_tok]
+                        current_max = logits[0, pos].max().item()
+                        gt_val = logits[0, pos, allowed_idx].item()
+                        if gt_val >= current_max:
+                            # GT is rank 1 → make a different token rank 1
+                            rank1_idx = (allowed_idx + 1) % allowed_vocab_size
+                            logits[0, pos, rank1_idx] = gt_val + eps_gap
+                        elif gt_val < current_max - eps_gap:
+                            # GT is too far below rank 1 → clamp to rank 2
+                            logits[0, pos, allowed_idx] = current_max - eps_gap
+                prefix_parts.append(logits.detach())
+
+    # ---- SUFFIX ----
+
+    # GT rank-2 suffix: positions just before the rank-1 suffix
+    if fixed_gt_suffix_rank2_n > 0:
+        if ground_truth_prompt_tokens is None:
+            logging.warning("build_fixed_logits_spec: fixed_gt_suffix_rank2_n > 0 but ground_truth_prompt_tokens is None; skipping.")
+        else:
+            gt_len = len(ground_truth_prompt_tokens)
+            end_pos = gt_len - fixed_gt_suffix_n
+            start_pos = max(0, end_pos - fixed_gt_suffix_rank2_n)
+            n = end_pos - start_pos
+            if n > 0:
+                logits = torch.randn((1, n, allowed_vocab_size), device=device)
+                eps_gap = 1.0
+                for pos in range(n):
+                    gt_tok = ground_truth_prompt_tokens[start_pos + pos]
+                    if gt_tok in allowed_token_to_idx:
+                        allowed_idx = allowed_token_to_idx[gt_tok]
+                        current_max = logits[0, pos].max().item()
+                        gt_val = logits[0, pos, allowed_idx].item()
+                        if gt_val >= current_max:
+                            rank1_idx = (allowed_idx + 1) % allowed_vocab_size
+                            logits[0, pos, rank1_idx] = gt_val + eps_gap
+                        elif gt_val < current_max - eps_gap:
+                            logits[0, pos, allowed_idx] = current_max - eps_gap
+                suffix_parts.append(logits.detach())
+
+    # GT rank-1 suffix: last fixed_gt_suffix_n GT positions fixed at rank 1
+    if fixed_gt_suffix_n > 0:
+        if ground_truth_prompt_tokens is None:
+            logging.warning("build_fixed_logits_spec: fixed_gt_suffix_n > 0 but ground_truth_prompt_tokens is None; skipping.")
+        else:
+            gt_len = len(ground_truth_prompt_tokens)
+            n = min(fixed_gt_suffix_n, gt_len)
+            logits = torch.full((1, n, allowed_vocab_size), -BIG, device=device)
+            for pos in range(n):
+                gt_tok = ground_truth_prompt_tokens[gt_len - n + pos]
+                if gt_tok in allowed_token_to_idx:
+                    logits[0, pos, allowed_token_to_idx[gt_tok]] = BIG
+            suffix_parts.append(logits.detach())
+
+    # Text suffix (rightmost part of suffix)
+    if fixed_suffix_text:
+        tok_ids = tokenizer(fixed_suffix_text, add_special_tokens=False, return_tensors="pt").input_ids[0].tolist()
+        n = len(tok_ids)
+        if n > 0:
+            logits = torch.full((1, n, allowed_vocab_size), -BIG, device=device)
+            for pos, tok_id in enumerate(tok_ids):
+                if tok_id in allowed_token_to_idx:
+                    logits[0, pos, allowed_token_to_idx[tok_id]] = BIG
+                else:
+                    logging.warning(
+                        f"build_fixed_logits_spec: fixed_suffix_text token {tok_id} "
+                        f"('{tokenizer.decode([tok_id])}') not in allowed vocab; using index 0."
+                    )
+                    logits[0, pos, 0] = BIG
+            suffix_parts.append(logits.detach())
+
+    fixed_prefix = torch.cat(prefix_parts, dim=1) if prefix_parts else None
+    fixed_suffix = torch.cat(suffix_parts, dim=1) if suffix_parts else None
+
+    n_prefix = fixed_prefix.shape[1] if fixed_prefix is not None else 0
+    n_suffix = fixed_suffix.shape[1] if fixed_suffix is not None else 0
+    n_free = seq_len - n_prefix - n_suffix
+
+    if n_free < 0:
+        raise ValueError(
+            f"build_fixed_logits_spec: total fixed positions ({n_prefix} prefix + {n_suffix} suffix) "
+            f"exceed seq_len ({seq_len}). Reduce fixed position counts."
+        )
+
+    return fixed_prefix, fixed_suffix, n_free
+
+
 def optimize_inputs(
     model,
     tokenizer,
@@ -526,6 +693,13 @@ def optimize_inputs(
     semantic_metrics_every_n_epochs: int = 0,  # 0=disabled, N=compute every N epochs
     bertscore_model_type: str = "distilbert-base-uncased",
     sentencebert_model_name: str = "all-MiniLM-L6-v2",
+    # Fixed logit distribution parameters (Approach B: Split Tensor)
+    fixed_gt_prefix_n: int = 0,       # fix first N positions, GT at rank 1
+    fixed_gt_suffix_n: int = 0,       # fix last N positions, GT at rank 1
+    fixed_gt_prefix_rank2_n: int = 0, # fix first N positions (after rank-1 prefix), GT at rank 2
+    fixed_gt_suffix_rank2_n: int = 0, # fix last N positions (before rank-1 suffix), GT at rank 2
+    fixed_prefix_text: str = None,    # text whose tokens become a fixed prefix
+    fixed_suffix_text: str = None,    # text whose tokens become a fixed suffix
     kwargs={},
 ):
     """
@@ -662,6 +836,49 @@ def optimize_inputs(
       allowed_tokens = torch.arange(vocab_size, device=device)
       allowed_vocab_size = vocab_size
     print(f"Restricted vocabulary size: {allowed_vocab_size} tokens (from full vocab size {full_embedding_weights.shape[0]})")
+    # Inverse mapping: original_token_id -> index in allowed_vocab (for rank metric)
+    allowed_token_to_idx = {
+        token_id: idx
+        for idx, token_id in enumerate(allowed_tokens.tolist())
+    }
+
+    # --- Fixed logit distribution spec (Approach B: Split Tensor) ---
+    has_fixed_spec = any([
+        fixed_gt_prefix_n > 0, fixed_gt_suffix_n > 0,
+        fixed_gt_prefix_rank2_n > 0, fixed_gt_suffix_rank2_n > 0,
+        fixed_prefix_text, fixed_suffix_text,
+    ])
+    if has_fixed_spec:
+        is_prompt_reconstruction = ground_truth_prompt_tokens is not None
+        gt_needed = (fixed_gt_prefix_n > 0 or fixed_gt_suffix_n > 0 or
+                     fixed_gt_prefix_rank2_n > 0 or fixed_gt_suffix_rank2_n > 0)
+        if gt_needed and not is_prompt_reconstruction:
+            logging.warning(
+                "optimize_inputs: GT-based fixed distribution params are set but "
+                "ground_truth_prompt_tokens is None; these will be skipped."
+            )
+        fixed_prefix, fixed_suffix, n_free = build_fixed_logits_spec(
+            ground_truth_prompt_tokens=ground_truth_prompt_tokens,
+            allowed_token_to_idx=allowed_token_to_idx,
+            allowed_vocab_size=allowed_vocab_size,
+            tokenizer=tokenizer,
+            device=device,
+            seq_len=seq_len,
+            fixed_gt_prefix_n=fixed_gt_prefix_n,
+            fixed_gt_suffix_n=fixed_gt_suffix_n,
+            fixed_gt_prefix_rank2_n=fixed_gt_prefix_rank2_n,
+            fixed_gt_suffix_rank2_n=fixed_gt_suffix_rank2_n,
+            fixed_prefix_text=fixed_prefix_text,
+            fixed_suffix_text=fixed_suffix_text,
+        )
+        logging.info(
+            f"optimize_inputs: fixed spec built — prefix={fixed_prefix.shape[1] if fixed_prefix is not None else 0}, "
+            f"suffix={fixed_suffix.shape[1] if fixed_suffix is not None else 0}, n_free={n_free}"
+        )
+    else:
+        fixed_prefix = None
+        fixed_suffix = None
+        n_free = seq_len
 
     # W&B log a table of the allowed tokens and the target_text tokens:
     allowed_tokens_list = allowed_tokens.tolist()
@@ -745,10 +962,26 @@ def optimize_inputs(
     # Check shape:
     #print(f"Target tokens mapped shape: {target_tokens_mapped.shape}")
 
-    # Initialize learnable inputs
+    # Initialize learnable inputs (free positions only; fixed parts are separate)
     parameters = []
-    learnable_inputs = initialize_learnable_inputs(allowed_vocab_size, seq_len, device)
-    parameters.append(learnable_inputs)
+    free_logits = initialize_learnable_inputs(allowed_vocab_size, n_free, device)
+    parameters.append(free_logits)
+
+    # Assembly function: build the full (1, seq_len, allowed_vocab_size) logits each step.
+    # When no fixed parts exist, returns free_logits directly (zero overhead).
+    if fixed_prefix is None and fixed_suffix is None:
+        def assemble_logits():
+            return free_logits
+    else:
+        def assemble_logits():
+            parts = []
+            if fixed_prefix is not None:
+                parts.append(fixed_prefix)
+            if n_free > 0:
+                parts.append(free_logits)
+            if fixed_suffix is not None:
+                parts.append(fixed_suffix)
+            return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
     
     token_overlap_metric = TokenOverlapMetric(
         target_text=target_text,
@@ -809,12 +1042,11 @@ def optimize_inputs(
     optimizer = optim.Adam(parameters, lr=learning_rate)
 
     if estimator_choice == "stgs":
-        forward_pass_callable = partial(
+        _stgs_base = partial(
             stgs_forward_pass,
             model=model,
             tokenizer=tokenizer,
             loss_instance=loss_instance,
-            learnable_inputs=learnable_inputs,
             stgs_module=stgs_module,
             embedding_weights_subset=embedding_weights_subset,
             allowed_tokens=allowed_tokens,
@@ -829,13 +1061,14 @@ def optimize_inputs(
             teacher_forcing=teacher_forcing,
             target_tokens=target_tokens_mapped,
         )
+        def forward_pass_callable():
+            return _stgs_base(learnable_inputs=assemble_logits())
     else:
-        forward_pass_callable = partial(
+        _reinforce_base = partial(
             reinforce_forward_pass,
             model=model,
             tokenizer=tokenizer,
             loss_instance=loss_instance,
-            learnable_inputs=learnable_inputs,
             embedding_weights_subset=embedding_weights_subset,
             allowed_tokens=allowed_tokens,
             target_length=target_length,
@@ -846,6 +1079,8 @@ def optimize_inputs(
             filter_vocab=filter_vocab,
             reinforce_helper=reinforce_helper,
         )
+        def forward_pass_callable():
+            return _reinforce_base(learnable_inputs=assemble_logits())
 
     estimator_is_stgs = estimator_choice == "stgs"
 
@@ -858,6 +1093,8 @@ def optimize_inputs(
         "prompt_exact_match": [],
         "prompt_lcs_ratio": [],
         "prompt_cosine_similarity": [],
+        "prompt_gt_token_rank_mean": [],         # mean rank (scalar per epoch)
+        "prompt_gt_token_rank_per_position": [],  # list of per-pos ranks (list per epoch)
     }
     track_prompt_metrics = ground_truth_prompt_tokens is not None
 
@@ -908,11 +1145,11 @@ def optimize_inputs(
 
             need_baseline_grad = (
                 (measure_grad_variance or measure_grad_bias)
-                and learnable_inputs.grad is not None
+                and free_logits.grad is not None
             )
             baseline_grad = None
             if need_baseline_grad:
-                baseline_grad = learnable_inputs.grad.detach().clone()
+                baseline_grad = free_logits.grad.detach().clone()
 
             stgs_grad_samples = []
             if measure_grad_variance and baseline_grad is not None:
@@ -922,7 +1159,7 @@ def optimize_inputs(
                         stgs_grad_variance_samples,
                         baseline_grad,
                         forward_pass_callable,
-                        learnable_inputs,
+                        free_logits,
                     )
                 )
                 stgs_grad_samples = estimator_metrics.pop("stgs_grad_samples")
@@ -934,12 +1171,11 @@ def optimize_inputs(
                     use_baseline=stgs_grad_bias_reference_use_baseline,
                     baseline_beta=stgs_grad_bias_reference_baseline_beta,
                 )
-                bias_reinforce_forward = partial(
+                _bias_reinforce_base = partial(
                     reinforce_forward_pass,
                     model=model,
                     tokenizer=tokenizer,
                     loss_instance=loss_instance,
-                    learnable_inputs=learnable_inputs,
                     embedding_weights_subset=embedding_weights_subset,
                     allowed_tokens=allowed_tokens,
                     target_length=target_length,
@@ -950,6 +1186,8 @@ def optimize_inputs(
                     filter_vocab=filter_vocab,
                     reinforce_helper=bias_reinforce_helper,
                 )
+                def bias_reinforce_forward(**_kw):
+                    return _bias_reinforce_base(learnable_inputs=assemble_logits(), **_kw)
 
                 bias_metrics = estimate_stgs_gradient_bias(
                     stgs_num_samples=stgs_grad_bias_samples,
@@ -957,7 +1195,7 @@ def optimize_inputs(
                     baseline_grad=baseline_grad,
                     stgs_forward_pass_fn=forward_pass_callable,
                     reinforce_forward_pass_fn=bias_reinforce_forward,
-                    learnable_inputs=learnable_inputs,
+                    learnable_inputs=free_logits,
                     reinforce_update_baseline=stgs_grad_bias_reference_use_baseline,
                     stgs_grad_samples=stgs_grad_samples,
                 )
@@ -979,15 +1217,15 @@ def optimize_inputs(
                 and (epoch % reinforce_grad_variance_period == 0)
             )
             baseline_grad = None
-            if measure_grad_variance and learnable_inputs.grad is not None:
-                baseline_grad = learnable_inputs.grad.detach().clone()
+            if measure_grad_variance and free_logits.grad is not None:
+                baseline_grad = free_logits.grad.detach().clone()
             if measure_grad_variance and baseline_grad is not None:
                 estimator_metrics.update(
                     estimate_reinforce_gradient_variance(
                         reinforce_grad_variance_samples,
                         baseline_grad,
                         forward_pass_callable,
-                        learnable_inputs,
+                        free_logits,
                     )
                 )
             
@@ -1000,7 +1238,7 @@ def optimize_inputs(
 
         optimizer.step()
 
-        grad_tensor = learnable_inputs.grad
+        grad_tensor = free_logits.grad
         grad_norm = grad_tensor.norm().item() if grad_tensor is not None else 0.0
         non_zero_grads = int((grad_tensor != 0).sum().item()) if grad_tensor is not None else 0
         grad_mean = grad_tensor.mean().item() if grad_tensor is not None else 0.0
@@ -1072,7 +1310,7 @@ def optimize_inputs(
             wandb_log.update(estimator_metrics)
 
         # Update wandb_table with generated_output:
-        learnable_input_ids = torch.argmax(learnable_inputs, dim=-1)[0]
+        learnable_input_ids = torch.argmax(assemble_logits().detach(), dim=-1)[0]
         generated_output_ids = torch.argmax(generated_logits, dim=-1)
         table_generated_output_ids = torch.gather(allowed_tokens.unsqueeze(0), dim=1, index=generated_output_ids[0:1])
         learnable_input_str = tokenizer.decode(learnable_input_ids, skip_special_tokens=False)
@@ -1129,6 +1367,30 @@ def optimize_inputs(
 
             prompt_metrics_history["prompt_cosine_similarity"].append(cos_sim)
             wandb_log['prompt_cosine_similarity'] = cos_sim
+
+            # Compute GT token rank from learnable logits distribution (full assembled view)
+            with torch.no_grad():
+                logits_per_pos = assemble_logits()[0]  # (seq_len, allowed_vocab_size)
+                prompt_seq_len = min(logits_per_pos.shape[0], gt_prompt_len)
+                per_position_ranks = []
+                for pos in range(prompt_seq_len):
+                    gt_token_id = ground_truth_prompt_tokens[pos]
+                    pos_logits = logits_per_pos[pos]
+                    if gt_token_id in allowed_token_to_idx:
+                        allowed_idx = allowed_token_to_idx[gt_token_id]
+                        gt_logit = pos_logits[allowed_idx]
+                        rank = int((pos_logits > gt_logit).sum().item()) + 1  # 1-indexed
+                    else:
+                        rank = int(pos_logits.shape[0]) + 1  # Not in allowed vocab → worst rank
+                    per_position_ranks.append(rank)
+            gt_rank_mean = (
+                sum(per_position_ranks) / len(per_position_ranks) if per_position_ranks else float('nan')
+            )
+            prompt_metrics_history["prompt_gt_token_rank_mean"].append(gt_rank_mean)
+            prompt_metrics_history["prompt_gt_token_rank_per_position"].append(per_position_ranks)
+            wandb_log['prompt_gt_token_rank_mean'] = gt_rank_mean
+            for pos, rank in enumerate(per_position_ranks):
+                wandb_log[f'prompt_gt_token_rank_pos_{pos}'] = rank
 
         # Compute semantic metrics (BERT/SentenceBERT) at specified intervals
         if track_semantic_metrics and (epoch % semantic_metrics_every_n_epochs == 0 or epoch == epochs - 1):
@@ -1207,7 +1469,7 @@ def optimize_inputs(
 
         if epoch > 0 and epoch % (plot_every * 5) == 0:
             with torch.no_grad():
-                curr_input_embeddings = torch.matmul(learnable_inputs, embedding_weights_subset)
+                curr_input_embeddings = torch.matmul(assemble_logits(), embedding_weights_subset)
                 generated_tokens, _ = generate_completions(
                     model,
                     curr_input_embeddings,
@@ -1225,8 +1487,8 @@ def optimize_inputs(
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
 
-    # Return prompt_metrics_history and semantic_metrics_history
-    return generated_tokens, learnable_inputs, losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history
+    # Return the full assembled logits (detached) for downstream use
+    return generated_tokens, assemble_logits().detach(), losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history
 
 
 def str2bool(instr):
@@ -1306,7 +1568,21 @@ def main():
     parser.add_argument("--vocab_threshold", type=float, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=128)
-    
+
+    # Fixed logit distribution parameters
+    parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
+                        help="Fix first N prompt positions to GT token at rank 1 (requires prompt reconstruction)")
+    parser.add_argument("--fixed_gt_suffix_n", type=int, default=0,
+                        help="Fix last N prompt positions to GT token at rank 1 (requires prompt reconstruction)")
+    parser.add_argument("--fixed_gt_prefix_rank2_n", type=int, default=0,
+                        help="Fix next N prefix positions to GT token at rank 2 (after fixed_gt_prefix_n)")
+    parser.add_argument("--fixed_gt_suffix_rank2_n", type=int, default=0,
+                        help="Fix N positions before fixed_gt_suffix_n to GT token at rank 2")
+    parser.add_argument("--fixed_prefix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot prefix")
+    parser.add_argument("--fixed_suffix_text", type=str, default=None,
+                        help="Text string whose tokens form a fixed one-hot suffix")
+
     args = parser.parse_args()
     config = vars(args)
    
@@ -1328,7 +1604,7 @@ def main():
     torch.manual_seed(config["seed"])
     # Optimize inputs
     print(f"Starting optimization with target: {args.target_text}")
-    generated_tokens, optimized_inputs, losses, lcs_ratio_history = optimize_inputs(
+    generated_tokens, optimized_inputs, losses, lcs_ratio_history, _, _ = optimize_inputs(
         model,
         tokenizer,
         losses=config['losses'],
@@ -1368,6 +1644,12 @@ def main():
         filter_vocab=config['filter_vocab'],
         max_gradient_norm=config['max_gradient_norm'],
         batch_size=config['batch_size'],
+        fixed_gt_prefix_n=config.get('fixed_gt_prefix_n', 0),
+        fixed_gt_suffix_n=config.get('fixed_gt_suffix_n', 0),
+        fixed_gt_prefix_rank2_n=config.get('fixed_gt_prefix_rank2_n', 0),
+        fixed_gt_suffix_rank2_n=config.get('fixed_gt_suffix_rank2_n', 0),
+        fixed_prefix_text=config.get('fixed_prefix_text'),
+        fixed_suffix_text=config.get('fixed_suffix_text'),
         kwargs=config,
     )
 

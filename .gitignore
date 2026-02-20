@@ -200,4 +200,5 @@ cython_debug/
 # W&B :
 *wandb_cache*
 *wandb*
+*artifacts*
 
