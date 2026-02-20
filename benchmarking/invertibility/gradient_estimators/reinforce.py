@@ -72,6 +72,8 @@ def reinforce_forward_pass(
     filter_vocab: bool,
     reinforce_helper: ReinforceEstimator,
     update_baseline: bool = True,
+    target_tokens: Optional[torch.Tensor] = None,
+    compute_tf_completion_logits: bool = False,
 ) -> ForwardPassResult:
     message_logits = learnable_inputs.repeat(batch_size, 1, 1)
     if model_precision == "half":
@@ -94,6 +96,8 @@ def reinforce_forward_pass(
         current_embeds = torch.cat([pre_prompt_embeds, input_embeddings], dim=1)
     else:
         current_embeds = input_embeddings
+
+    seq_len = current_embeds.shape[1]
 
     outputs = model(
         inputs_embeds=current_embeds,
@@ -139,6 +143,23 @@ def reinforce_forward_pass(
     generated_logits = torch.cat(all_logits, dim=1)
     completion_ids = torch.cat(completion_ids, dim=1)
 
+    # Optionally run a single TF forward pass to get teacher-forced completion logits
+    if compute_tf_completion_logits and target_tokens is not None:
+        target_embeds = embedding_weights_subset[target_tokens[:, :-1]]
+        combined_embeds = torch.cat([current_embeds, target_embeds], dim=1)
+        tf_outputs = model(
+            inputs_embeds=combined_embeds,
+            output_hidden_states=False,
+            use_cache=False,
+            return_dict=True,
+        )
+        tf_logits = tf_outputs.logits
+        tf_prompt_logits = tf_logits[:, :seq_len, :][..., allowed_tokens]
+        tf_compl_logits = tf_logits[:, seq_len-1:seq_len-1+target_length, :][..., allowed_tokens]
+        tf_generated_logits = torch.cat([tf_prompt_logits, tf_compl_logits], dim=1)
+    else:
+        tf_generated_logits = None
+
     losses_dict = loss_instance.compute_loss(
         input_dict={
             "generated_logits": generated_logits,
@@ -147,6 +168,7 @@ def reinforce_forward_pass(
             "prompt_ids": message_ids,
             "prompt_argmax_ids": message_logits.argmax(dim=-1),
             "prompt_logits": prompt_logits,
+            "tf_generated_logits": tf_generated_logits,
         },
     )
     loss = losses_dict["sumloss"]

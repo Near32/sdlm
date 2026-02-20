@@ -892,6 +892,8 @@ def parse_args():
                         help="Weight for prompt perplexity loss")
     parser.add_argument("--complLambda", type=float, default=0.0,
                         help="Weight for completion perplexity loss")
+    parser.add_argument("--promptTfComplLambda", type=float, default=0.0,
+                        help="Weight for prompt + teacher-forced completion perplexity loss")
     
     # Metrics parameters
     parser.add_argument("--metric_groups", type=str, default=None,
@@ -948,6 +950,8 @@ def main():
         args.losses += '+promptPerplexity'
     if args.complLambda > 0.0:
         args.losses += '+completionPerplexity'
+    if args.promptTfComplLambda > 0.0:
+        args.losses += '+promptTfComplPerplexity'
     
     # Prepare configuration dictionary
     config = vars(args)

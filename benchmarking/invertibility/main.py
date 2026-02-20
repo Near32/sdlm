@@ -383,18 +383,43 @@ class LossClass(object):
             predictions=input_dict['completion_ids'],
         )
         losses_dict[f"PLX-completion"] = complPLX.mean()
-        
+
+        # Teacher-forced completion perplexity: PPL over prompt + actual target tokens
+        if 'tf_generated_logits' in input_dict and input_dict['tf_generated_logits'] is not None:
+            tf_compl_logits = input_dict['tf_generated_logits']
+            # tf_compl_logits: (batch_size, seq_len+target_length, vocab_size)
+            # prompt portion (positions 0..seq_len-1) matches prompt_argmax_ids
+            # completion portion (positions seq_len..seq_len+target_length-1) matches target_tokens_mapped
+            # Build combined predictions: prompt argmax ids + target tokens
+            combined_predictions = torch.cat([
+                input_dict['prompt_argmax_ids'],
+                self.target_tokens_mapped,
+            ], dim=1)
+            promptTfComplPLX = self.compute_perplexity(
+                all_logits=tf_compl_logits,
+                predictions=combined_predictions,
+            )
+            losses_dict['PLX-prompt-tf-completion'] = promptTfComplPLX.mean()
+        else:
+            promptTfComplPLX = None
+
         if 'perplexity' in self.losses.lower():
             if 'promptPerplexity' not in self.losses:
                 promptPLX = torch.zeros(self.batch_size).to(loss.device)
 
             if 'completionPerplexity' not in self.losses:
                 complPLX = torch.zeros(self.batch_size).to(loss.device)
-            
+
             promptLambda = self.kwargs['promptLambda']
             complLambda = self.kwargs['complLambda']
             loss = (complLambda*complPLX + promptLambda*promptPLX).mean()
             sumloss += loss
+
+        if 'promptTfComplPerplexity' in self.losses:
+            if promptTfComplPLX is not None:
+                promptTfComplLambda = self.kwargs['promptTfComplLambda']
+                loss = (promptTfComplLambda * promptTfComplPLX).mean()
+                sumloss += loss
 
         losses_dict['sumloss'] = sumloss
 
@@ -1060,6 +1085,7 @@ def optimize_inputs(
             filter_vocab=filter_vocab,
             teacher_forcing=teacher_forcing,
             target_tokens=target_tokens_mapped,
+            compute_tf_completion_logits=('promptTfComplPerplexity' in losses),
         )
         def forward_pass_callable():
             return _stgs_base(learnable_inputs=assemble_logits())
@@ -1078,6 +1104,8 @@ def optimize_inputs(
             pre_prompt=pre_prompt,
             filter_vocab=filter_vocab,
             reinforce_helper=reinforce_helper,
+            target_tokens=target_tokens_mapped,
+            compute_tf_completion_logits=('promptTfComplPerplexity' in losses),
         )
         def forward_pass_callable():
             return _reinforce_base(learnable_inputs=assemble_logits())
@@ -1185,6 +1213,8 @@ def optimize_inputs(
                     pre_prompt=pre_prompt,
                     filter_vocab=filter_vocab,
                     reinforce_helper=bias_reinforce_helper,
+                    target_tokens=target_tokens_mapped,
+                    compute_tf_completion_logits=('promptTfComplPerplexity' in losses),
                 )
                 def bias_reinforce_forward(**_kw):
                     return _bias_reinforce_base(learnable_inputs=assemble_logits(), **_kw)
@@ -1536,6 +1566,8 @@ def main():
     # +perplexityPenalty
     parser.add_argument("--promptLambda", type=float, default=0.0)
     parser.add_argument("--complLambda", type=float, default=0.0)
+    parser.add_argument("--promptTfComplLambda", type=float, default=0.0,
+                        help="Weight for prompt + teacher-forced completion perplexity loss")
     parser.add_argument("--learning_rate", type=float, default=1e-1)
     parser.add_argument("--max_gradient_norm", type=float, default=0.0)
     parser.add_argument("--eps", type=float, default=1e-10)
@@ -1588,6 +1620,7 @@ def main():
    
     if config['promptLambda'] > 0.0:    config['losses'] += '+promptPerplexity'
     if config['complLambda'] > 0.0:    config['losses'] += '+completionPerplexity'
+    if config['promptTfComplLambda'] > 0.0:    config['losses'] += '+promptTfComplPerplexity'
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
