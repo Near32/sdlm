@@ -128,6 +128,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+*venv*
 .env
 .venv
 env/
@@ -192,3 +193,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Claude Code
+*CLAUDE.md
+
+# W&B :
+*wandb_cache*
+*wandb*
+
