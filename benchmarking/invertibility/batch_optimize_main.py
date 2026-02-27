@@ -227,7 +227,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
     target_tokens = tokenizer(target_text, return_tensors="pt").input_ids[0].cpu().tolist()
     
     # Optimize inputs for this target
-    generated_tokens, optimized_inputs, losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history = optimize_inputs(
+    opt_result = optimize_inputs(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -244,7 +244,11 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         bptt_learnable_temperature=config.get("bptt_learnable_temperature", False),
         bptt_decouple_learnable_temperature=config.get("bptt_decouple_learnable_temperature", False),
         stgs_hard=config.get("stgs_hard", True),
+        stgs_hard_method=config.get("stgs_hard_method", "categorical"),
+        stgs_hard_embsim_probs=config.get("stgs_hard_embsim_probs", "gumbel_soft"),
         bptt_stgs_hard=config.get("bptt_stgs_hard", True),
+        bptt_stgs_hard_method=config.get("bptt_stgs_hard_method", "categorical"),
+        bptt_stgs_hard_embsim_probs=config.get("bptt_stgs_hard_embsim_probs", "gumbel_soft"),
         bptt_hidden_state_conditioning=config.get("bptt_hidden_state_conditioning", False),
         plot_every=config.get("plot_every", 100),
         stgs_grad_variance_samples=config.get("stgs_grad_variance_samples", 0),
@@ -266,6 +270,11 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         bptt_eps=config.get("bptt_eps", 1e-10),
         vocab_threshold=config.get("vocab_threshold", 0.5),
         filter_vocab=config.get("filter_vocab", True),
+        logits_top_k=config.get("logits_top_k", 0),
+        logits_top_p=config.get("logits_top_p", 1.0),
+        logits_filter_penalty=config.get("logits_filter_penalty", 1e4),
+        logits_normalize=config.get("logits_normalize", "none"),
+        bptt_logits_normalize=config.get("bptt_logits_normalize", "none"),
         max_gradient_norm=config.get("max_gradient_norm", 0.0),
         batch_size=config.get("batch_size", 1),
         # Method selection (NEW)
@@ -310,11 +319,56 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         init_std=config.get("init_std", 0.0),
         init_mlm_model=config.get("init_mlm_model", "distilbert-base-uncased"),
         init_mlm_top_k=config.get("init_mlm_top_k", 50),
-        early_stop_on_exact_match=config.get("early_stop_on_exact_match", True),
+        early_stop_on_exact_match=config.get("early_stop_on_exact_match", False),
         early_stop_loss_threshold=config.get("early_stop_loss_threshold", 0.01),
+        early_stop_embsim_lcs_ratio_threshold=config.get("early_stop_embsim_lcs_ratio_threshold", 1.0),
+        run_discrete_validation=config.get("run_discrete_validation", False),
+        run_discrete_embsim_validation=config.get("run_discrete_embsim_validation", False),
+        embsim_similarity=config.get("embsim_similarity", "cossim"),
+        embsim_use_input_logits=config.get("embsim_use_input_logits", True),
+        embsim_teacher_forcing=config.get("embsim_teacher_forcing", False),
+        embsim_temperature=config.get("embsim_temperature", 1.0),
+        temperature_anneal_schedule=config.get("temperature_anneal_schedule", "none"),
+        temperature_anneal_min=config.get("temperature_anneal_min", 0.1),
+        temperature_anneal_epochs=config.get("temperature_anneal_epochs", 0),
+        temperature_anneal_reg_lambda=config.get("temperatureAnnealRegLambda", 0.0),
+        temperature_anneal_reg_mode=config.get("temperatureAnnealRegMode", "mse"),
+        discrete_reinit_epoch=config.get("discrete_reinit_epoch", 0),
+        discrete_reinit_snap=config.get("discrete_reinit_snap", "argmax"),
+        gumbel_noise_scale=config.get("gumbel_noise_scale", 1.0),
+        adaptive_gumbel_noise=config.get("adaptive_gumbel_noise", False),
+        adaptive_gumbel_noise_beta=config.get("adaptive_gumbel_noise_beta", 0.9),
+        adaptive_gumbel_noise_min_scale=config.get("adaptive_gumbel_noise_min_scale", 0.0),
+        # Learnable prompt length
+        prompt_length_learnable=config.get("prompt_length_learnable", False),
+        prompt_length_alpha_init=config.get("prompt_length_alpha_init", 0.0),
+        prompt_length_beta=config.get("prompt_length_beta", 5.0),
+        prompt_length_reg_lambda=config.get("prompt_length_reg_lambda", 0.0),
+        prompt_length_eos_spike=config.get("prompt_length_eos_spike", 10.0),
+        prompt_length_mask_eos_attention=config.get("prompt_length_mask_eos_attention", False),
+        logit_decay=config.get("logit_decay", 0.0),
         kwargs=config,
     )
-    
+
+    # Extract fields from result dict
+    generated_tokens          = opt_result["generated_tokens"]
+    optimized_inputs          = opt_result["optimized_inputs"]
+    losses                    = opt_result["losses"]
+    lcs_ratio_history         = opt_result["lcs_ratio_history"]
+    prompt_metrics_history    = opt_result["prompt_metrics_history"]
+    semantic_metrics_history  = opt_result["semantic_metrics_history"]
+    discrete_generated_tokens         = opt_result.get("discrete_generated_tokens", [])
+    discrete_lcs_ratio_history        = opt_result.get("discrete_lcs_ratio_history", [])
+    discrete_prompt_metrics_history   = opt_result.get("discrete_prompt_metrics_history", {})
+    discrete_semantic_metrics_history = opt_result.get("discrete_semantic_metrics_history", {})
+    all_lcs_ratio_history             = opt_result.get("all_lcs_ratio_history", [])
+    all_prompt_metrics_history        = opt_result.get("all_prompt_metrics_history", {})
+    all_semantic_metrics_history      = opt_result.get("all_semantic_metrics_history", {})
+    embsim_generated_tokens         = opt_result.get("embsim_generated_tokens", [])
+    embsim_lcs_ratio_history        = opt_result.get("embsim_lcs_ratio_history", [])
+    embsim_prompt_metrics_history   = opt_result.get("embsim_prompt_metrics_history", {})
+    embsim_semantic_metrics_history = opt_result.get("embsim_semantic_metrics_history", {})
+
     # Extract the optimized prompt tokens
     optimized_tokens = torch.argmax(optimized_inputs[0], dim=-1).cpu().tolist()
     optimized_text = tokenizer.decode(optimized_tokens)
@@ -327,6 +381,36 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         metric_groups=metric_groups,
         device=device
     )
+
+    # Discrete + all_ final evaluation
+    if discrete_generated_tokens:
+        disc_eval = evaluate_generated_output(
+            generated_tokens=discrete_generated_tokens,
+            target_tokens=target_tokens,
+            tokenizer=tokenizer,
+            metric_groups=metric_groups,
+            device=device)
+        for k, v in disc_eval.items():
+            evaluation_metrics[f"discrete_{k}"] = v
+        for k in disc_eval:
+            s_val = evaluation_metrics.get(k)
+            d_val = disc_eval[k]
+            if s_val is not None and d_val is not None:
+                if "exact_match" in k:
+                    evaluation_metrics[f"all_{k}"] = int(bool(s_val) and bool(d_val))
+                elif isinstance(s_val, (int, float)):
+                    evaluation_metrics[f"all_{k}"] = min(s_val, d_val)
+
+    # Embsim final evaluation
+    if embsim_generated_tokens:
+        embsim_eval = evaluate_generated_output(
+            generated_tokens=embsim_generated_tokens,
+            target_tokens=target_tokens,
+            tokenizer=tokenizer,
+            metric_groups=metric_groups,
+            device=device)
+        for k, v in embsim_eval.items():
+            evaluation_metrics[f"embsim_{k}"] = v
 
     # For SODA-style prompt reconstruction, also compute prompt-level metrics
     prompt_metrics = {}
@@ -372,6 +456,26 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
             result["ground_truth_prompt"] = ground_truth_prompt
         result["prompt_metrics"] = prompt_metrics
         result["prompt_metrics_history"] = prompt_metrics_history
+
+    # Add discrete and all_ histories if populated
+    if discrete_lcs_ratio_history:
+        result["discrete_lcs_ratio_history"] = discrete_lcs_ratio_history
+    if discrete_prompt_metrics_history:
+        result["discrete_prompt_metrics_history"] = discrete_prompt_metrics_history
+    if discrete_semantic_metrics_history:
+        result["discrete_semantic_metrics_history"] = discrete_semantic_metrics_history
+    if all_lcs_ratio_history:
+        result["all_lcs_ratio_history"] = all_lcs_ratio_history
+    if all_prompt_metrics_history:
+        result["all_prompt_metrics_history"] = all_prompt_metrics_history
+    if all_semantic_metrics_history:
+        result["all_semantic_metrics_history"] = all_semantic_metrics_history
+    if embsim_lcs_ratio_history:
+        result["embsim_lcs_ratio_history"] = embsim_lcs_ratio_history
+    if embsim_prompt_metrics_history:
+        result["embsim_prompt_metrics_history"] = embsim_prompt_metrics_history
+    if embsim_semantic_metrics_history:
+        result["embsim_semantic_metrics_history"] = embsim_semantic_metrics_history
 
     # Add semantic metrics history if tracked
     if semantic_metrics_history and any(len(v) > 0 for v in semantic_metrics_history.values()):
@@ -443,7 +547,16 @@ def process_targets_sequential(targets: List[Dict[str, Any]], model, tokenizer, 
             lcs_ratio_history=result["lcs_ratio_history"],
             k_value=k_value,
             prompt_metrics_history=result.get("prompt_metrics_history"),
-            semantic_metrics_history=result.get("semantic_metrics_history")
+            semantic_metrics_history=result.get("semantic_metrics_history"),
+            discrete_lcs_ratio_history=result.get("discrete_lcs_ratio_history"),
+            discrete_prompt_metrics_history=result.get("discrete_prompt_metrics_history"),
+            discrete_semantic_metrics_history=result.get("discrete_semantic_metrics_history"),
+            all_lcs_ratio_history=result.get("all_lcs_ratio_history"),
+            all_prompt_metrics_history=result.get("all_prompt_metrics_history"),
+            all_semantic_metrics_history=result.get("all_semantic_metrics_history"),
+            embsim_lcs_ratio_history=result.get("embsim_lcs_ratio_history"),
+            embsim_prompt_metrics_history=result.get("embsim_prompt_metrics_history"),
+            embsim_semantic_metrics_history=result.get("embsim_semantic_metrics_history"),
         )
 
     return results
@@ -504,7 +617,16 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
                     lcs_ratio_history=result["lcs_ratio_history"],
                     k_value=k_value,
                     prompt_metrics_history=result.get("prompt_metrics_history"),
-                    semantic_metrics_history=result.get("semantic_metrics_history")
+                    semantic_metrics_history=result.get("semantic_metrics_history"),
+                    discrete_lcs_ratio_history=result.get("discrete_lcs_ratio_history"),
+                    discrete_prompt_metrics_history=result.get("discrete_prompt_metrics_history"),
+                    discrete_semantic_metrics_history=result.get("discrete_semantic_metrics_history"),
+                    all_lcs_ratio_history=result.get("all_lcs_ratio_history"),
+                    all_prompt_metrics_history=result.get("all_prompt_metrics_history"),
+                    all_semantic_metrics_history=result.get("all_semantic_metrics_history"),
+                    embsim_lcs_ratio_history=result.get("embsim_lcs_ratio_history"),
+                    embsim_prompt_metrics_history=result.get("embsim_prompt_metrics_history"),
+                    embsim_semantic_metrics_history=result.get("embsim_semantic_metrics_history"),
                 )
 
             except Exception as exc:
@@ -752,6 +874,17 @@ def parse_args():
                         help="Whether to learn multiple decouple temperature parameters, one for each learnable input.")
     parser.add_argument("--stgs_hard", type=str2bool, default=True,
                         help="Whether to use hard ST-GS")
+    parser.add_argument("--stgs_hard_method", type=str, default="categorical",
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        help="Hard token selection method for ST-GS: 'categorical' (Gumbel sample), "
+                             "'embsim-dot' (nearest token by dot-product), "
+                             "'embsim-cos' (nearest token by cosine similarity), "
+                             "'embsim-l2' (nearest token by L2 distance)")
+    parser.add_argument("--stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                        choices=["gumbel_soft", "input_logits"],
+                        help="Probability source for soft embedding in embsim hard-token methods: "
+                             "'gumbel_soft' (use y_soft from Gumbel-Softmax), "
+                             "'input_logits' (use softmax(x) of raw input logits)")
     parser.add_argument("--eps", type=float, default=1e-10,
                         help="Epsilon value for numerical stability")
     
@@ -839,6 +972,12 @@ def parse_args():
                         help="Whether to learn multiple decouple temperature parameters, one for each learnable input.")
     parser.add_argument("--bptt_stgs_hard", type=str2bool, default=False,
                         help="Whether to use hard ST-GS for BPTT")
+    parser.add_argument("--bptt_stgs_hard_method", type=str, default="categorical",
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        help="Hard token selection method for BPTT ST-GS")
+    parser.add_argument("--bptt_stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                        choices=["gumbel_soft", "input_logits"],
+                        help="Probability source for soft embedding in BPTT embsim hard-token methods")
     parser.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False,
                         help="Whether to condition BPTT on hidden states")
     parser.add_argument("--bptt_eps", type=float, default=1e-10,
@@ -849,7 +988,22 @@ def parse_args():
                         help="Whether to filter the vocabulary")
     parser.add_argument("--vocab_threshold", type=float, default=0.5,
                         help="Threshold for vocabulary filtering")
-    
+    parser.add_argument("--logits_top_k", type=int, default=0,
+                        help="Top-k soft filtering of learnable logits before STGS (0 = disabled)")
+    parser.add_argument("--logits_top_p", type=float, default=1.0,
+                        help="Top-p nucleus soft filtering of learnable logits before STGS (1.0 = disabled)")
+    parser.add_argument("--logits_filter_penalty", type=float, default=1e4,
+                        help="Penalty magnitude subtracted from suppressed logits (default: 1e4)")
+    parser.add_argument("--logits_normalize", type=str, default="none",
+                        choices=["none", "center", "zscore"],
+                        help="Per-position logit normalization before Gumbel noise: "
+                             "'none' (disabled), 'center' (subtract per-position mean), "
+                             "'zscore' (center + divide by std). "
+                             "Vocab dim only; no mixing across token positions.")
+    parser.add_argument("--bptt_logits_normalize", type=str, default="none",
+                        choices=["none", "center", "zscore"],
+                        help="Same as --logits_normalize but for the BPTT STGS module.")
+
     # Other parameters
     parser.add_argument("--max_gradient_norm", type=float, default=0.0,
                         help="Maximum gradient norm for clipping")
@@ -921,10 +1075,12 @@ def parse_args():
                         help="Compute BERT/SentenceBERT every N epochs (0=disabled)")
 
     # Early stopping parameters
-    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=True,
-                        help="Stop optimization when generated output exactly matches target (default: True)")
-    parser.add_argument("--early_stop_loss_threshold", type=float, default=0.01,
+    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=False,
+                        help="Stop optimization when generated output exactly matches target (default: False)")
+    parser.add_argument("--early_stop_loss_threshold", type=float, default=0.0,
                         help="Stop optimization when loss drops below this threshold (0 or negative to disable)")
+    parser.add_argument("--early_stop_embsim_lcs_ratio_threshold", type=float, default=1.0,
+                        help="Stop when embsim LCS ratio >= threshold; active when run_discrete_embsim_validation=True (>1.0 = disabled)")
 
     # Fixed logit distribution parameters
     parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
@@ -940,6 +1096,15 @@ def parse_args():
     parser.add_argument("--fixed_suffix_text", type=str, default=None,
                         help="Text string whose tokens form a fixed one-hot suffix")
 
+    # EoS position regularization parameters
+    parser.add_argument("--eos_reg_lambda", type=float, default=0.0,
+                        help="Weight for position-weighted EoS regularization (0 = disabled)")
+    parser.add_argument("--eos_reg_schedule", type=str, default="linear",
+                        choices=["linear", "exponential", "power"],
+                        help="Weight schedule: linear, exponential, or power")
+    parser.add_argument("--eos_reg_alpha", type=float, default=1.0,
+                        help="Schedule parameter: exponent p for power=(1-i/N)^p, or alpha for exp(-alpha*i/N)")
+
     # STGS initialization strategy
     parser.add_argument("--init_strategy", type=str, default="randn",
                         choices=["randn", "zeros", "normal", "one_hot_random",
@@ -951,6 +1116,123 @@ def parse_args():
                         help="MLM checkpoint for 'mlm_mask' initialization strategy")
     parser.add_argument("--init_mlm_top_k", type=int, default=1000,
                         help="Top k indices that are initialized for 'mlm_mask' initialization strategy")
+
+    # Discrete validation pass (opt-in)
+    parser.add_argument("--run_discrete_validation", type=str2bool, default=False,
+                        help="Run a greedy discrete decode at each epoch and log discrete_* and all_* metrics")
+    parser.add_argument("--run_discrete_embsim_validation", type=str2bool, default=False,
+                        help="At each epoch, find the nearest-embedding token at each position "
+                             "(cosine sim to soft embedding) and run greedy decode; logs embsim_* metrics.")
+    parser.add_argument("--embsim_similarity", type=str, default="cossim",
+                        choices=["cossim", "dotproduct", "l2"],
+                        help="Similarity metric used by embsim validation (cossim, dotproduct, or l2)")
+    parser.add_argument("--embsim_use_input_logits", type=str2bool, default=True,
+                        help="Embsim validation source: True=softmax(input logits) [default], "
+                             "False=STGS y_soft (Gumbel-Softmax outputs)")
+    parser.add_argument("--embsim_teacher_forcing", type=str2bool, default=False,
+                        help="Embsim validation decode: True=single teacher-forced forward pass "
+                             "(faster, no autoregressive generation), False=model.generate() [default]")
+    parser.add_argument("--embsim_temperature", type=float, default=1.0,
+                        help="Temperature applied to raw logits before softmax in embsim validation "
+                             "when embsim_use_input_logits=True. Match to training temperature "
+                             "(e.g. 0.05). Default: 1.0 (backward-compatible).")
+
+    # Temperature annealing (opt-in)
+    parser.add_argument("--temperature_anneal_schedule", type=str, default="none",
+                        choices=["none", "linear", "cosine"],
+                        help="Temperature annealing schedule (none=disabled)")
+    parser.add_argument("--temperature_anneal_min", type=float, default=0.1,
+                        help="Minimum temperature for annealing")
+    parser.add_argument("--temperature_anneal_epochs", type=int, default=0,
+                        help="Number of epochs over which to anneal temperature (0=use total epochs)")
+    parser.add_argument("--temperatureAnnealRegLambda", type=float, default=0.0,
+                        help="Regularization weight for temperature annealing loss when learnable_temperature=True (0=disabled)")
+    parser.add_argument("--temperatureAnnealRegMode", type=str, default="mse",
+                        choices=["mse", "one_sided"],
+                        help="Temperature reg penalty: 'mse' (symmetric) or 'one_sided' (only when tau > target)")
+
+    # Prompt distribution entropy regularization (opt-in)
+    parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
+                        help="Weight for prompt distribution entropy regularization (0=disabled)")
+
+    # Commitment loss (VQ-VAE style, opt-in)
+    parser.add_argument("--commitmentLambda", type=float, default=0.0,
+                        help="Weight for commitment loss (L2 between soft and nearest discrete embedding)")
+    parser.add_argument("--commitment_similarity", type=str, default="argmax",
+                        choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        help="Nearest-token selection for commitment loss: "
+                             "'argmax' (highest logit), 'embsim-dot' (dot-product), 'embsim-cos' (cosine), "
+                             "'embsim-l2' (L2 distance)")
+
+    # Commitment loss position weighting (opt-in)
+    parser.add_argument("--commitment_pos_weight_schedule", type=str, default="uniform",
+                        choices=["uniform", "linear_inc", "linear_dec", "exp_inc", "exp_dec"],
+                        help="Position-weight schedule for commitment loss. "
+                             "'uniform' = equal weighting (default); "
+                             "'linear_inc' = weight increases linearly (step * position_index); "
+                             "'linear_dec' = reverse of linear_inc; "
+                             "'exp_inc' = base^position_index; "
+                             "'exp_dec' = base^(seq_len-1-position_index). "
+                             "Weights are normalized to sum to 1 before applying.")
+    parser.add_argument("--commitment_pos_weight_step", type=float, default=10.0,
+                        help="Linear step size for 'linear_inc'/'linear_dec' schedules "
+                             "(weights: step, 2*step, ..., seq_len*step before normalization)")
+    parser.add_argument("--commitment_pos_weight_base", type=float, default=2.0,
+                        help="Base for 'exp_inc'/'exp_dec' schedules (base^i before normalization)")
+
+    # Main-loss token-position weighting (opt-in)
+    parser.add_argument("--loss_pos_weight_schedule", type=str, default="uniform",
+                        choices=["uniform", "linear_inc", "linear_dec", "exp_inc", "exp_dec"],
+                        help="Position-weight schedule for main loss terms "
+                             "(crossentropy, embxentropy, hinge, embedded). "
+                             "'uniform'=no weighting (default); 'linear_inc'=left-light right-heavy; "
+                             "'linear_dec'=left-heavy right-light; 'exp_inc'/'exp_dec'=exponential variants.")
+    parser.add_argument("--loss_pos_weight_step", type=float, default=1.0,
+                        help="Multiplier for linear schedules: weight[i] = step*(i+1) or step*(T-i). "
+                             "Only used when loss_pos_weight_schedule in {linear_inc, linear_dec}.")
+    parser.add_argument("--loss_pos_weight_base", type=float, default=2.0,
+                        help="Base for exponential schedules: weight[i] = base^i or base^(T-1-i). "
+                             "Only used when loss_pos_weight_schedule in {exp_inc, exp_dec}.")
+
+    # Gumbel noise scale parameters (opt-in)
+    parser.add_argument("--gumbel_noise_scale", type=float, default=1.0,
+                        help="Fixed multiplier for Gumbel noise (0=no noise, 1=standard Gumbel)")
+    parser.add_argument("--adaptive_gumbel_noise", type=str2bool, default=False,
+                        help="Adaptively reduce Gumbel noise scale as loss decreases")
+    parser.add_argument("--adaptive_gumbel_noise_beta", type=float, default=0.9,
+                        help="EMA coefficient for loss tracking in adaptive Gumbel noise (higher = slower adaptation)")
+    parser.add_argument("--adaptive_gumbel_noise_min_scale", type=float, default=0.0,
+                        help="Minimum noise scale floor for adaptive Gumbel noise")
+
+    # Periodic discrete reinitialization (opt-in)
+    parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
+                        help="Snap free_logits to discrete projection every N epochs (0 = disabled)")
+    parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
+                        choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        help="Projection method for periodic discrete reinitialization")
+
+    # Exponential logit weight decay (opt-in)
+    parser.add_argument("--logit_decay", type=float, default=0.0,
+                        help="Multiplicative decay applied to free_logits after each optimizer step "
+                             "(0 = disabled; e.g. 0.999 for mild decay). "
+                             "Shrinks logit magnitudes exponentially toward zero.")
+
+    # Learnable prompt length (differentiable soft masking toward EoS)
+    parser.add_argument("--prompt_length_learnable", type=str2bool, default=False,
+                        help="Learn prompt length jointly with token logits via soft EoS masking")
+    parser.add_argument("--prompt_length_alpha_init", type=float, default=0.0,
+                        help="Initial alpha: lambda=n_free*sigmoid(alpha) "
+                             "(0.0->n_free/2 active; -3.0->~5%% active)")
+    parser.add_argument("--prompt_length_beta", type=float, default=5.0,
+                        help="Gate sharpness (higher=sharper; inf->hard threshold)")
+    parser.add_argument("--prompt_length_reg_lambda", type=float, default=0.0,
+                        help="Weight gamma for R(lambda)=gamma*lambda length regularizer (0=disabled)")
+    parser.add_argument("--prompt_length_eos_spike", type=float, default=10.0,
+                        help="Logit spike for EoS at inactive positions (sets EoS sampling probability)")
+    parser.add_argument("--prompt_length_mask_eos_attention", type=str2bool, default=False,
+                        help="Mask LM attention to EoS-sampled positions. "
+                             "When ON: no LM-attention gradient flows back through EoS positions. "
+                             "Gradient still flows through the gate (length_alpha) and STGS.")
 
     return parser.parse_args()
 
@@ -977,7 +1259,13 @@ def main():
         args.losses += '+completionPerplexity'
     if args.promptTfComplLambda > 0.0:
         args.losses += '+promptTfComplPerplexity'
-    
+    if args.eos_reg_lambda > 0.0:
+        args.losses += '+eosPositionReg'
+    if args.promptDistEntropyLambda > 0.0:
+        args.losses += '+promptDistEntropy'
+    if args.commitmentLambda > 0.0:
+        args.losses += '+commitmentLoss'
+
     # Prepare configuration dictionary
     config = vars(args)
     

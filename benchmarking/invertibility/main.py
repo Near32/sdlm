@@ -1111,7 +1111,11 @@ def optimize_inputs(
     bptt_learnable_temperature=False,
     bptt_decouple_learnable_temperature=False,
     stgs_hard=True,
+    stgs_hard_method="categorical",
+    stgs_hard_embsim_probs="gumbel_soft",
     bptt_stgs_hard=True,
+    bptt_stgs_hard_method="categorical",
+    bptt_stgs_hard_embsim_probs="gumbel_soft",
     bptt_hidden_state_conditioning=False,
     plot_every=10,
     log_table_every=100,
@@ -1134,6 +1138,11 @@ def optimize_inputs(
     bptt_eps=1e-10,
     vocab_threshold=0.5,  # Hyperparameter for filtering
     filter_vocab=False,
+    logits_top_k: int = 0,
+    logits_top_p: float = 1.0,
+    logits_filter_penalty: float = 1e4,
+    logits_normalize: str = "none",
+    bptt_logits_normalize: str = "none",
     max_gradient_norm=0.0,
     batch_size=1,
     # STGS initialization strategy
@@ -1178,8 +1187,40 @@ def optimize_inputs(
     fixed_gt_suffix_rank2_n: int = 0, # fix last N positions (before rank-1 suffix), GT at rank 2
     fixed_prefix_text: str = None,    # text whose tokens become a fixed prefix
     fixed_suffix_text: str = None,    # text whose tokens become a fixed suffix
-    early_stop_on_exact_match: bool = True,
+    early_stop_on_exact_match: bool = False,
     early_stop_loss_threshold: float = 0.01,
+    early_stop_embsim_lcs_ratio_threshold: float = 1.0,
+    # Discrete validation pass (opt-in)
+    run_discrete_validation: bool = False,
+    # Embedding-similarity discrete validation pass (opt-in)
+    run_discrete_embsim_validation: bool = False,
+    embsim_similarity: str = "cossim",
+    embsim_use_input_logits: bool = True,  # True=softmax(input logits); False=STGS y_soft
+    embsim_teacher_forcing: bool = False,  # True=teacher-forced fwd pass instead of model.generate()
+    embsim_temperature: float = 1.0,       # Temperature for softmax(logits/T) in embsim_use_input_logits path
+    # Temperature annealing (opt-in)
+    temperature_anneal_schedule: str = "none",  # "none", "linear", "cosine"
+    temperature_anneal_min: float = 0.1,
+    temperature_anneal_epochs: int = 0,
+    temperature_anneal_reg_lambda: float = 0.0,   # 0 = disabled
+    temperature_anneal_reg_mode: str = "mse",      # "mse" or "one_sided"
+    # Periodic discrete reinitialization
+    discrete_reinit_epoch: int = 0,       # 0 = disabled; N = reinitialize every N epochs
+    discrete_reinit_snap: str = "argmax", # "argmax" | "embsim-dot" | "embsim-cos"
+    # Gumbel noise scale (fixed or adaptive)
+    gumbel_noise_scale: float = 1.0,
+    adaptive_gumbel_noise: bool = False,
+    adaptive_gumbel_noise_beta: float = 0.9,
+    adaptive_gumbel_noise_min_scale: float = 0.0,
+    # Learnable prompt length via soft EoS masking
+    prompt_length_learnable: bool = False,
+    prompt_length_alpha_init: float = 0.0,
+    prompt_length_beta: float = 5.0,
+    prompt_length_reg_lambda: float = 0.0,
+    prompt_length_eos_spike: float = 10.0,
+    prompt_length_mask_eos_attention: bool = False,
+    # Exponential logit weight decay (multiplicative, applied after each optimizer step)
+    logit_decay: float = 0.0,  # 0 = disabled; e.g. 0.999 for mild decay
     kwargs={},
 ):
     """
@@ -1196,31 +1237,52 @@ def optimize_inputs(
     # Dispatch to SODA/GCG if requested
     method_lower = method.lower() if method else "stgs"
 
-    # Helper to wrap baseline returns with empty prompt_metrics_history and semantic_metrics_history
+    # Helper to wrap baseline returns as dicts with empty discrete/all fields
     def _wrap_baseline_result(result):
-        """Wrap baseline result to include empty prompt_metrics_history and semantic_metrics_history for compatibility.
-
-        If the result is a 4-tuple (old-style baseline), add empty prompt_metrics_history and semantic_metrics_history.
-        If the result is a 5-tuple (old-style with prompt_metrics_history), add empty semantic_metrics_history.
-        If the result is a 6-tuple (new-style with both), return as-is.
-        """
+        """Wrap baseline result (tuple or dict) as a named dict with discrete/all fields."""
         empty_prompt_metrics = {"prompt_token_accuracy": [], "prompt_exact_match": [], "prompt_lcs_ratio": [], "prompt_cosine_similarity": []}
         empty_semantic_metrics = {
             "output_bertscore_f1": [], "output_bertscore_precision": [], "output_bertscore_recall": [],
             "output_sentencebert_similarity": [], "prompt_bertscore_f1": [], "prompt_bertscore_precision": [],
             "prompt_bertscore_recall": [], "prompt_sentencebert_similarity": [],
         }
-        if len(result) == 4:
-            # Baseline returned (generated_tokens, optimized_inputs, losses, lcs_ratio_history)
-            return (*result, empty_prompt_metrics, empty_semantic_metrics)
-        elif len(result) == 5:
-            # Baseline returned 5-tuple with prompt_metrics_history
-            return (*result, empty_semantic_metrics)
-        # 6-tuple already includes both
-        return result
+        if isinstance(result, dict):
+            base = dict(result)
+        else:
+            keys = ["generated_tokens", "optimized_inputs", "losses", "lcs_ratio_history",
+                    "prompt_metrics_history", "semantic_metrics_history"]
+            defaults = [None, None, [], [], empty_prompt_metrics, empty_semantic_metrics]
+            base = {}
+            for i, k in enumerate(keys):
+                base[k] = result[i] if i < len(result) else defaults[i]
+        # Pad discrete / all fields with empty defaults
+        for prefix in ("discrete_", "all_", "embsim_"):
+            base.setdefault(f"{prefix}generated_tokens", [])
+            base.setdefault(f"{prefix}lcs_ratio_history", [])
+            base.setdefault(f"{prefix}prompt_metrics_history", {})
+            base.setdefault(f"{prefix}semantic_metrics_history", {})
+        return base
+
+    if method_lower in ("soda", "gcg", "o2p"):
+        # Shared precomputation for optional embsim validation across all baselines
+        _emb_w   = model.get_input_embeddings().weight.detach()
+        _all_tok = torch.arange(_emb_w.shape[0], device=device)
+        _tgt_ids  = tokenizer(target_text, return_tensors="pt").input_ids.to(device)
+        _tgt_list = _tgt_ids[0].cpu().tolist()
+        _tgt_len  = _tgt_ids.shape[1]
+        _embsim_sim = kwargs.get("embsim_similarity", embsim_similarity)
 
     if method_lower == "soda":
         from baselines.soda import soda_optimize_inputs
+        _embsim_acc = {"embsim_lcs_ratio_history": [], "embsim_generated_tokens": []}
+        _cb = None
+        if run_discrete_embsim_validation:
+            _cb = build_embsim_epoch_callback(
+                _embsim_acc, model, tokenizer, device, pre_prompt,
+                _tgt_list, _tgt_len, _emb_w, _all_tok, batch_size, _embsim_sim,
+                teacher_forcing=embsim_teacher_forcing,
+                embsim_temperature=embsim_temperature,
+            )
         result = soda_optimize_inputs(
             model=model,
             model_name=baseline_model_name,
@@ -1243,12 +1305,28 @@ def optimize_inputs(
             init_std=soda_init_std,
             batch_size=batch_size,
             ground_truth_prompt_tokens=ground_truth_prompt_tokens,
+            early_stop_on_exact_match=early_stop_on_exact_match,
+            embsim_lcs_ratio_threshold=early_stop_embsim_lcs_ratio_threshold,
+            per_epoch_callback=_cb,
             kwargs=kwargs,
         )
-        return _wrap_baseline_result(result)
+        wrapped = _wrap_baseline_result(result)
+        if run_discrete_embsim_validation:
+            wrapped["embsim_lcs_ratio_history"] = _embsim_acc["embsim_lcs_ratio_history"]
+            wrapped["embsim_generated_tokens"]  = _embsim_acc.get("embsim_generated_tokens", [])
+        return wrapped
 
     elif method_lower == "gcg":
         from baselines.gcg import gcg_optimize_inputs
+        _embsim_acc = {"embsim_lcs_ratio_history": [], "embsim_generated_tokens": []}
+        _cb = None
+        if run_discrete_embsim_validation:
+            _cb = build_embsim_epoch_callback(
+                _embsim_acc, model, tokenizer, device, pre_prompt,
+                _tgt_list, _tgt_len, _emb_w, _all_tok, batch_size, _embsim_sim,
+                teacher_forcing=embsim_teacher_forcing,
+                embsim_temperature=embsim_temperature,
+            )
         result = gcg_optimize_inputs(
             model=model,
             model_name=baseline_model_name,
@@ -1266,12 +1344,26 @@ def optimize_inputs(
             token_choice=gcg_token_choice,
             init_strategy=gcg_init_strategy,
             batch_size=batch_size,
+            per_epoch_callback=_cb,
             kwargs=kwargs,
         )
-        return _wrap_baseline_result(result)
+        wrapped = _wrap_baseline_result(result)
+        if run_discrete_embsim_validation:
+            wrapped["embsim_lcs_ratio_history"] = _embsim_acc["embsim_lcs_ratio_history"]
+            wrapped["embsim_generated_tokens"]  = _embsim_acc.get("embsim_generated_tokens", [])
+        return wrapped
 
     elif method_lower == "o2p":
         from baselines.o2p import o2p_optimize_inputs
+        _embsim_acc = {"embsim_lcs_ratio_history": [], "embsim_generated_tokens": []}
+        _cb = None
+        if run_discrete_embsim_validation:
+            _cb = build_embsim_epoch_callback(
+                _embsim_acc, model, tokenizer, device, pre_prompt,
+                _tgt_list, _tgt_len, _emb_w, _all_tok, batch_size, _embsim_sim,
+                teacher_forcing=embsim_teacher_forcing,
+                embsim_temperature=embsim_temperature,
+            )
         result = o2p_optimize_inputs(
             model=model,
             tokenizer=tokenizer,
@@ -1282,9 +1374,14 @@ def optimize_inputs(
             num_beams=kwargs.get("o2p_num_beams", 4),
             max_length=kwargs.get("o2p_max_length", 32),
             batch_size=batch_size,
+            per_epoch_callback=_cb,
             kwargs=kwargs,
         )
-        return _wrap_baseline_result(result)
+        wrapped = _wrap_baseline_result(result)
+        if run_discrete_embsim_validation:
+            wrapped["embsim_lcs_ratio_history"] = _embsim_acc["embsim_lcs_ratio_history"]
+            wrapped["embsim_generated_tokens"]  = _embsim_acc.get("embsim_generated_tokens", [])
+        return wrapped
 
     # Continue with STGS/REINFORCE for other methods
 
@@ -1309,8 +1406,13 @@ def optimize_inputs(
       target_embeds = embedding_layer(target_tokens)  # (1, target_length, embed_dim)
       seed_vector = target_embeds.mean(dim=1).squeeze(0)  # (embed_dim,)
 
-      # Filter full vocabulary based on cosine similarity and ensure target tokens are included
-      allowed_tokens = filter_vocabulary(full_embedding_weights, seed_vector, target_tokens[0], threshold=vocab_threshold)
+      # Filter full vocabulary based on cosine similarity and ensure target tokens + EoS are included
+      eos_tok = tokenizer.eos_token_id
+      forced_union = torch.cat([
+          target_tokens[0],
+          torch.tensor([eos_tok], device=device),
+      ]).unique()
+      allowed_tokens = filter_vocabulary(full_embedding_weights, seed_vector, forced_union, threshold=vocab_threshold)
       allowed_vocab_size = allowed_tokens.shape[0]
     else:
       allowed_tokens = torch.arange(vocab_size, device=device)
@@ -1321,6 +1423,12 @@ def optimize_inputs(
         token_id: idx
         for idx, token_id in enumerate(allowed_tokens.tolist())
     }
+    # EoS index in the allowed vocabulary (used by EoS position regularizer)
+    if filter_vocab:
+        eos_idx_in_allowed = allowed_token_to_idx.get(tokenizer.eos_token_id)
+    else:
+        # When filter_vocab=False, allowed_tokens = arange(vocab_size), so index == token id
+        eos_idx_in_allowed = tokenizer.eos_token_id
 
     # --- Fixed logit distribution spec (Approach B: Split Tensor) ---
     has_fixed_spec = any([
@@ -1389,7 +1497,11 @@ def optimize_inputs(
         "bptt_learnable_temperature": bptt_learnable_temperature,
         "bptt_decouple_learnable_temperature": bptt_decouple_learnable_temperature,
         "stgs_hard": stgs_hard,
+        "stgs_hard_method": stgs_hard_method,
+        "stgs_hard_embsim_probs": stgs_hard_embsim_probs,
         "bptt_stgs_hard": bptt_stgs_hard,
+        "bptt_stgs_hard_method": bptt_stgs_hard_method,
+        "bptt_stgs_hard_embsim_probs": bptt_stgs_hard_embsim_probs,
         "bptt_hidden_state_conditioning":bptt_hidden_state_conditioning,
         "plot_every": plot_every,
         "eps": eps,
@@ -1412,6 +1524,9 @@ def optimize_inputs(
         "reinforce_use_baseline": reinforce_use_baseline,
         "reinforce_baseline_beta": reinforce_baseline_beta,
         "teacher_forcing": teacher_forcing,
+        "loss_pos_weight_schedule": kwargs.get("loss_pos_weight_schedule", "uniform"),
+        "loss_pos_weight_step": kwargs.get("loss_pos_weight_step", 1.0),
+        "loss_pos_weight_base": kwargs.get("loss_pos_weight_base", 2.0),
     })
     wandb_table = wandb.Table(columns=[
         "epoch",
@@ -1423,6 +1538,10 @@ def optimize_inputs(
         "generated_output_str",
         "token_overlap_ratio",
         "target_hit_ratio",
+        "discrete_input_str",
+        "discrete_generated_str",
+        "embsim_input_str",
+        "embsim_generated_str",
     ])
 
     exact_match_hits_table = wandb.Table(columns=[
@@ -1472,18 +1591,64 @@ def optimize_inputs(
     )
     parameters.append(free_logits)
 
+    # --- Learnable prompt length via soft EoS masking ---
+    length_alpha = None
+    eos_logit_template = None
+    eos_allowed_idx = -1  # index of EoS in allowed_tokens space (-1 if absent)
+
+    if prompt_length_learnable and n_free > 1:
+        length_alpha = torch.tensor(float(prompt_length_alpha_init), requires_grad=True, device=device)
+        parameters.append(length_alpha)
+
+        eos_token_id = tokenizer.eos_token_id or tokenizer.pad_token_id or 0
+        eos_matches = (allowed_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+        eos_logit_template = torch.zeros(1, 1, allowed_vocab_size, device=device)
+        if len(eos_matches) > 0:
+            eos_allowed_idx = eos_matches[0].item()
+            eos_logit_template[0, 0, eos_allowed_idx] = prompt_length_eos_spike
+        else:
+            logging.warning(
+                "EoS token not found in allowed vocabulary; inactive positions will produce "
+                "uniform distributions. Consider setting --filter_vocab false."
+            )
+
+        logging.info(
+            f"Learnable prompt length: alpha_init={prompt_length_alpha_init}, "
+            f"beta={prompt_length_beta}, reg_lambda={prompt_length_reg_lambda}, "
+            f"eos_token_id={eos_token_id} (allowed_idx={eos_allowed_idx}), "
+            f"mask_eos_attention={prompt_length_mask_eos_attention}"
+        )
+    elif prompt_length_learnable and n_free <= 1:
+        logging.warning(
+            "prompt_length_learnable=True requires n_free > 1; feature disabled for this run."
+        )
+
     # Assembly function: build the full (1, seq_len, allowed_vocab_size) logits each step.
-    # When no fixed parts exist, returns free_logits directly (zero overhead).
+    # When no fixed parts exist and learnable length is disabled, returns free_logits directly (zero overhead).
     if fixed_prefix is None and fixed_suffix is None:
         def assemble_logits():
-            return free_logits
+            if length_alpha is None:
+                return free_logits
+            lambda_t = n_free * torch.sigmoid(length_alpha)
+            i_vals = torch.arange(n_free, 0, -1, device=device, dtype=lambda_t.dtype)
+            gates = torch.sigmoid(prompt_length_beta * (lambda_t - i_vals))
+            gates_3d = gates.unsqueeze(0).unsqueeze(-1)
+            return gates_3d * free_logits + (1.0 - gates_3d) * eos_logit_template
     else:
         def assemble_logits():
+            if length_alpha is None:
+                active_free = free_logits
+            else:
+                lambda_t = n_free * torch.sigmoid(length_alpha)
+                i_vals = torch.arange(n_free, 0, -1, device=device, dtype=lambda_t.dtype)
+                gates = torch.sigmoid(prompt_length_beta * (lambda_t - i_vals))
+                gates_3d = gates.unsqueeze(0).unsqueeze(-1)
+                active_free = gates_3d * free_logits + (1.0 - gates_3d) * eos_logit_template
             parts = []
             if fixed_prefix is not None:
                 parts.append(fixed_prefix)
             if n_free > 0:
-                parts.append(free_logits)
+                parts.append(active_free)
             if fixed_suffix is not None:
                 parts.append(fixed_suffix)
             return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
@@ -1502,7 +1667,15 @@ def optimize_inputs(
         target_text=target_text,
         target_tokens_mapped=target_tokens_mapped,
         kwargs=kwargs,
+        eos_idx_in_allowed=eos_idx_in_allowed,
     )
+    wandb.log({
+        "loss_pos_weights": (
+            loss_instance._loss_pos_weights.tolist()
+            if loss_instance._loss_pos_weights is not None
+            else None
+        ),
+    })
 
     estimator_choice = gradient_estimator.lower()
     stgs_module = None
@@ -1513,9 +1686,12 @@ def optimize_inputs(
         stgs_module = STGS(
             vocab_size=allowed_vocab_size,
             stgs_hard=stgs_hard,
+            stgs_hard_method=stgs_hard_method,
+            stgs_hard_embsim_probs=stgs_hard_embsim_probs,
             init_temperature=temperature,
             learnable_temperature=learnable_temperature,
             nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
+            logits_normalize=logits_normalize,
             eps=eps,
             device=device,
         )
@@ -1525,9 +1701,12 @@ def optimize_inputs(
             bptt_stgs_module = STGS(
                 vocab_size=allowed_vocab_size,
                 stgs_hard=bptt_stgs_hard,
+                stgs_hard_method=bptt_stgs_hard_method,
+                stgs_hard_embsim_probs=bptt_stgs_hard_embsim_probs,
                 init_temperature=bptt_temperature,
                 learnable_temperature=bptt_learnable_temperature,
                 nbr_learnable_temperatures=target_length if bptt_decouple_learnable_temperature else None,
+                logits_normalize=bptt_logits_normalize,
                 eps=bptt_eps,
                 conditioning_dim=hidden_state_dim if bptt_hidden_state_conditioning else 0,
                 device=device,
@@ -1566,6 +1745,11 @@ def optimize_inputs(
             teacher_forcing=teacher_forcing,
             target_tokens=target_tokens_mapped,
             compute_tf_completion_logits=('promptTfComplPerplexity' in losses),
+            logits_top_k=logits_top_k,
+            logits_top_p=logits_top_p,
+            logits_filter_penalty=logits_filter_penalty,
+            eos_allowed_idx=eos_allowed_idx,
+            mask_eos_attention=prompt_length_mask_eos_attention,
         )
         def forward_pass_callable():
             return _stgs_base(learnable_inputs=assemble_logits())
@@ -1618,6 +1802,33 @@ def optimize_inputs(
         "prompt_sentencebert_similarity": [],
     }
     track_semantic_metrics = semantic_metrics_every_n_epochs > 0
+
+    # Discrete validation histories (populated when run_discrete_validation=True)
+    from collections import defaultdict as _defaultdict
+    discrete_lcs_ratio_history = []
+    discrete_prompt_metrics_history = _defaultdict(list)
+    discrete_semantic_metrics_history = _defaultdict(list)
+    discrete_generated_tokens = []
+    all_lcs_ratio_history = []
+    all_prompt_metrics_history = _defaultdict(list)
+    all_semantic_metrics_history = _defaultdict(list)
+    # Embedding-similarity validation histories (populated when run_discrete_embsim_validation=True)
+    embsim_lcs_ratio_history = []
+    embsim_prompt_metrics_history = _defaultdict(list)
+    embsim_semantic_metrics_history = _defaultdict(list)
+    embsim_generated_tokens = []
+
+    disc_input_str   = ""
+    disc_output_str  = ""
+    embsim_input_str = ""
+    embsim_output_str = ""
+
+    # Adaptive Gumbel noise state
+    _loss_ema = None
+    _initial_loss_ema = None
+    if stgs_module is not None:
+        stgs_module.gumbel_noise_scale = gumbel_noise_scale
+
     pbar = tqdm(range(epochs))
     for epoch in pbar:
         optimizer.zero_grad()
@@ -1626,8 +1837,48 @@ def optimize_inputs(
         loss = step_result.loss
         backward_loss = step_result.backward_loss
         losses_dict = step_result.losses_dict
+
+        # Length regularizer: R(lambda) = gamma * lambda  (pushes toward shorter prompts)
+        if length_alpha is not None and prompt_length_reg_lambda > 0.0:
+            lambda_t = n_free * torch.sigmoid(length_alpha)
+            length_reg = prompt_length_reg_lambda * lambda_t
+            backward_loss = backward_loss + length_reg
         generated_logits = step_result.generated_logits
         estimator_state = step_result.estimator_state
+
+        # Temperature annealing regularization (for learnable_temperature only)
+        if (learnable_temperature
+                and temperature_anneal_reg_lambda > 0.0
+                and temperature_anneal_schedule != "none"):
+            _eff_temp = estimator_state.get("eff_temperature")
+            if torch.is_tensor(_eff_temp):
+                _n = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
+                target_tau = compute_annealed_temperature(
+                    temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule
+                )
+                target_tau_t = _eff_temp.new_tensor(target_tau)
+                if temperature_anneal_reg_mode == "one_sided":
+                    temp_reg = F.relu(_eff_temp.mean() - target_tau_t).pow(2)
+                else:  # "mse"
+                    temp_reg = (_eff_temp.mean() - target_tau_t).pow(2)
+                backward_loss = backward_loss + temperature_anneal_reg_lambda * temp_reg
+                losses_dict["temperature_anneal_reg"] = temp_reg.detach()
+
+        # Adaptive Gumbel noise scaling (similar to temperature annealing)
+        if adaptive_gumbel_noise and stgs_module is not None:
+            current_loss_val = loss.detach().item()
+            if _loss_ema is None:
+                _loss_ema = current_loss_val
+                _initial_loss_ema = current_loss_val
+            else:
+                _loss_ema = adaptive_gumbel_noise_beta * _loss_ema + (1 - adaptive_gumbel_noise_beta) * current_loss_val
+
+            if _initial_loss_ema is not None and _initial_loss_ema > 0:
+                raw_ratio = _loss_ema / _initial_loss_ema
+                effective_scale = gumbel_noise_scale * max(adaptive_gumbel_noise_min_scale, min(1.0, raw_ratio))
+            else:
+                effective_scale = gumbel_noise_scale
+            stgs_module.gumbel_noise_scale = effective_scale
 
         backward_loss.backward()
 
@@ -1748,6 +1999,31 @@ def optimize_inputs(
 
         optimizer.step()
 
+        # Exponential logit weight decay
+        if logit_decay > 0.0:
+            with torch.no_grad():
+                free_logits.data.mul_(logit_decay)
+
+        # Periodic discrete reinitialization
+        if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
+            prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
+            with torch.no_grad():
+                snap_free_logits(
+                    free_logits=free_logits,
+                    current_logits=assemble_logits().detach(),
+                    embedding_weights=embedding_weights_subset,
+                    n_free=n_free,
+                    prefix_len=prefix_len,
+                    snap_method=discrete_reinit_snap,
+                )
+            optimizer.state[free_logits] = {}   # reset momentum for a clean restart
+
+        # Temperature annealing (only when not learnable_temperature)
+        if temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
+            _n = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
+            stgs_module.init_temperature = compute_annealed_temperature(
+                temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule)
+
         grad_tensor = free_logits.grad
         grad_norm = grad_tensor.norm().item() if grad_tensor is not None else 0.0
         non_zero_grads = int((grad_tensor != 0).sum().item()) if grad_tensor is not None else 0
@@ -1789,6 +2065,33 @@ def optimize_inputs(
 
         for k, v in losses_dict.items():
             wandb_log[k] = v.item()
+
+        if temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
+            wandb_log["annealed_temperature"] = stgs_module.init_temperature
+
+        if (learnable_temperature
+                and temperature_anneal_reg_lambda > 0.0
+                and temperature_anneal_schedule != "none"):
+            if "temperature_anneal_reg" in losses_dict:
+                wandb_log["temperature_anneal_reg"] = losses_dict["temperature_anneal_reg"].item()
+            _n = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
+            wandb_log["temperature_anneal_target"] = compute_annealed_temperature(
+                temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule
+            )
+
+        if stgs_module is not None:
+            wandb_log["gumbel_noise_scale"] = getattr(stgs_module, 'gumbel_noise_scale', gumbel_noise_scale)
+
+        if adaptive_gumbel_noise and _loss_ema is not None:
+            wandb_log["gumbel_loss_ema"] = _loss_ema
+
+        if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
+            wandb_log["discrete_reinit"] = 1
+
+        if length_alpha is not None:
+            with torch.no_grad():
+                wandb_log["effective_prompt_length"] = (n_free * torch.sigmoid(length_alpha)).item()
+                wandb_log["length_alpha"] = length_alpha.item()
 
         if estimator_is_stgs:
             if torch.is_tensor(eff_temperature):
@@ -1834,6 +2137,181 @@ def optimize_inputs(
         lcs_ratio = lcs / len(target_tokens_list) if len(target_tokens_list) > 0 else 0.0
         wandb_log['lcs_ratio'] = lcs_ratio
         lcs_ratio_history.append(lcs_ratio)
+
+        # --- Discrete validation pass (opt-in) ---
+        if run_discrete_validation:
+            _dvp_logits = assemble_logits().detach()
+            disc_prompt_ids, disc_gen_tokens, disc_gen_text = run_discrete_validation_pass(
+                _dvp_logits, allowed_tokens, model, tokenizer, target_length, device, pre_prompt)
+
+            disc_lcs = lcs_length(disc_gen_tokens, target_tokens_list) / max(len(target_tokens_list), 1)
+            discrete_lcs_ratio_history.append(disc_lcs)
+            discrete_generated_tokens = disc_gen_tokens   # overwrite with latest epoch's
+
+            all_lcs = min(lcs_ratio, disc_lcs)
+            all_lcs_ratio_history.append(all_lcs)
+            wandb_log['discrete_lcs_ratio'] = disc_lcs
+            wandb_log['all_lcs_ratio'] = all_lcs
+
+            # Discrete prompt metrics
+            if track_prompt_metrics:
+                gt_len = len(ground_truth_prompt_tokens)
+                min_len = min(len(disc_prompt_ids), gt_len)
+                d_tok_acc = sum(disc_prompt_ids[i] == ground_truth_prompt_tokens[i]
+                                for i in range(min_len)) / max(gt_len, 1)
+                d_exact = int(disc_prompt_ids[:gt_len] == ground_truth_prompt_tokens)
+                d_lcs_p = lcs_length(disc_prompt_ids, ground_truth_prompt_tokens) / max(gt_len, 1)
+                with torch.no_grad():
+                    emb_layer = model.get_input_embeddings()
+                    d_opt_emb = emb_layer(torch.tensor(disc_prompt_ids[:gt_len], device=device))
+                    gt_emb_d = emb_layer(torch.tensor(ground_truth_prompt_tokens, device=device))
+                    d_cos = (F.normalize(d_opt_emb, dim=-1) * F.normalize(gt_emb_d, dim=-1)).sum(-1).mean().item()
+                discrete_prompt_metrics_history["prompt_token_accuracy"].append(d_tok_acc)
+                discrete_prompt_metrics_history["prompt_exact_match"].append(d_exact)
+                discrete_prompt_metrics_history["prompt_lcs_ratio"].append(d_lcs_p)
+                discrete_prompt_metrics_history["prompt_cosine_similarity"].append(d_cos)
+
+                _s_tok = prompt_metrics_history["prompt_token_accuracy"][-1]
+                _s_em = prompt_metrics_history["prompt_exact_match"][-1]
+                _s_lcs = prompt_metrics_history["prompt_lcs_ratio"][-1]
+                _s_cos = prompt_metrics_history["prompt_cosine_similarity"][-1]
+                all_tok = min(_s_tok, d_tok_acc)
+                all_em = int(bool(_s_em) and bool(d_exact))
+                all_lcs_p = min(_s_lcs, d_lcs_p)
+                all_cos = min(_s_cos, d_cos)
+                all_prompt_metrics_history["prompt_token_accuracy"].append(all_tok)
+                all_prompt_metrics_history["prompt_exact_match"].append(all_em)
+                all_prompt_metrics_history["prompt_lcs_ratio"].append(all_lcs_p)
+                all_prompt_metrics_history["prompt_cosine_similarity"].append(all_cos)
+                wandb_log.update({
+                    "discrete_prompt_token_accuracy": d_tok_acc,
+                    "discrete_prompt_exact_match": d_exact,
+                    "discrete_prompt_lcs_ratio": d_lcs_p,
+                    "discrete_prompt_cosine_similarity": d_cos,
+                    "all_prompt_token_accuracy": all_tok,
+                    "all_prompt_exact_match": all_em,
+                    "all_prompt_lcs_ratio": all_lcs_p,
+                    "all_prompt_cosine_similarity": all_cos,
+                })
+
+            # Discrete semantic metrics (same cadence as soft path)
+            if track_semantic_metrics and (epoch % semantic_metrics_every_n_epochs == 0 or epoch == epochs - 1):
+                from evaluation_utils import compute_bertscore, compute_sentencebert_similarity
+                disc_out_bert = compute_bertscore(disc_gen_text, target_text,
+                                                   model_type=bertscore_model_type, device=str(device))
+                disc_out_sbert = compute_sentencebert_similarity(disc_gen_text, target_text,
+                                                                  model_name=sentencebert_model_name, device=str(device))
+                for key, val in disc_out_bert.items():
+                    dv = float(val)
+                    discrete_semantic_metrics_history[f"output_{key}"].append(dv)
+                    wandb_log[f"discrete_output_{key}"] = dv
+                    sv = semantic_metrics_history[f"output_{key}"][-1] if semantic_metrics_history[f"output_{key}"] else dv
+                    av = min(sv, dv)
+                    all_semantic_metrics_history[f"output_{key}"].append(av)
+                    wandb_log[f"all_output_{key}"] = av
+                disc_sbert_val = float(disc_out_sbert["sentencebert_similarity"])
+                discrete_semantic_metrics_history["output_sentencebert_similarity"].append(disc_sbert_val)
+                wandb_log["discrete_output_sentencebert_similarity"] = disc_sbert_val
+                sv = semantic_metrics_history["output_sentencebert_similarity"][-1] if semantic_metrics_history["output_sentencebert_similarity"] else disc_sbert_val
+                av = min(sv, disc_sbert_val)
+                all_semantic_metrics_history["output_sentencebert_similarity"].append(av)
+                wandb_log["all_output_sentencebert_similarity"] = av
+                if track_prompt_metrics and ground_truth_prompt is not None:
+                    disc_prompt_text = tokenizer.decode(disc_prompt_ids, skip_special_tokens=True)
+                    disc_p_bert = compute_bertscore(disc_prompt_text, ground_truth_prompt,
+                                                     model_type=bertscore_model_type, device=str(device))
+                    disc_p_sbert = compute_sentencebert_similarity(disc_prompt_text, ground_truth_prompt,
+                                                                    model_name=sentencebert_model_name, device=str(device))
+                    for key, val in disc_p_bert.items():
+                        dv = float(val)
+                        discrete_semantic_metrics_history[f"prompt_{key}"].append(dv)
+                        wandb_log[f"discrete_prompt_{key}"] = dv
+                        sv = semantic_metrics_history[f"prompt_{key}"][-1] if semantic_metrics_history[f"prompt_{key}"] else dv
+                        av = min(sv, dv)
+                        all_semantic_metrics_history[f"prompt_{key}"].append(av)
+                        wandb_log[f"all_prompt_{key}"] = av
+                    disc_psbert_val = float(disc_p_sbert["sentencebert_similarity"])
+                    discrete_semantic_metrics_history["prompt_sentencebert_similarity"].append(disc_psbert_val)
+                    wandb_log["discrete_prompt_sentencebert_similarity"] = disc_psbert_val
+                    sv = semantic_metrics_history["prompt_sentencebert_similarity"][-1] if semantic_metrics_history["prompt_sentencebert_similarity"] else disc_psbert_val
+                    av = min(sv, disc_psbert_val)
+                    all_semantic_metrics_history["prompt_sentencebert_similarity"].append(av)
+                    wandb_log["all_prompt_sentencebert_similarity"] = av
+
+            disc_input_str  = tokenizer.decode(disc_prompt_ids, skip_special_tokens=False)
+            disc_output_str = disc_gen_text
+
+        # --- Embedding-similarity validation pass (opt-in) ---
+        if run_discrete_embsim_validation:
+            # Reuse _dvp_logits if already computed by the argmax pass, else compute fresh
+            _embsim_logits = _dvp_logits if run_discrete_validation else assemble_logits().detach()
+            embsim_prompt_ids, embsim_gen_tokens, embsim_gen_text, emb_err_stats = run_embsim_validation_pass(
+                _embsim_logits, embedding_weights_subset, allowed_tokens,
+                model, tokenizer, target_length, device, pre_prompt,
+                stgs_module=None if embsim_use_input_logits else stgs_module,
+                batch_size=batch_size,
+                similarity=embsim_similarity,
+                teacher_forcing=embsim_teacher_forcing,
+                target_tokens=target_tokens_list,
+                embsim_temperature=embsim_temperature)
+
+            embsim_lcs = lcs_length(embsim_gen_tokens, target_tokens_list) / max(len(target_tokens_list), 1)
+            embsim_lcs_ratio_history.append(embsim_lcs)
+            embsim_generated_tokens = embsim_gen_tokens
+            wandb_log.update(build_embsim_wandb_metrics(emb_err_stats, embsim_lcs))
+
+            if track_prompt_metrics:
+                gt_len = len(ground_truth_prompt_tokens)
+                min_len = min(len(embsim_prompt_ids), gt_len)
+                e_tok_acc = sum(embsim_prompt_ids[i] == ground_truth_prompt_tokens[i]
+                                for i in range(min_len)) / max(gt_len, 1)
+                e_exact   = int(embsim_prompt_ids[:gt_len] == ground_truth_prompt_tokens)
+                e_lcs_p   = lcs_length(embsim_prompt_ids, ground_truth_prompt_tokens) / max(gt_len, 1)
+                with torch.no_grad():
+                    emb_layer = model.get_input_embeddings()
+                    e_opt_emb = emb_layer(torch.tensor(embsim_prompt_ids[:gt_len], device=device))
+                    gt_emb_e  = emb_layer(torch.tensor(ground_truth_prompt_tokens, device=device))
+                    e_cos = (F.normalize(e_opt_emb, dim=-1) * F.normalize(gt_emb_e, dim=-1)).sum(-1).mean().item()
+                embsim_prompt_metrics_history["prompt_token_accuracy"].append(e_tok_acc)
+                embsim_prompt_metrics_history["prompt_exact_match"].append(e_exact)
+                embsim_prompt_metrics_history["prompt_lcs_ratio"].append(e_lcs_p)
+                embsim_prompt_metrics_history["prompt_cosine_similarity"].append(e_cos)
+                wandb_log.update({
+                    "embsim_prompt_token_accuracy":    e_tok_acc,
+                    "embsim_prompt_exact_match":       e_exact,
+                    "embsim_prompt_lcs_ratio":         e_lcs_p,
+                    "embsim_prompt_cosine_similarity": e_cos,
+                })
+
+            if track_semantic_metrics and (epoch % semantic_metrics_every_n_epochs == 0 or epoch == epochs - 1):
+                from evaluation_utils import compute_bertscore, compute_sentencebert_similarity
+                embsim_out_bert  = compute_bertscore(embsim_gen_text, target_text,
+                                                     model_type=bertscore_model_type, device=str(device))
+                embsim_out_sbert = compute_sentencebert_similarity(embsim_gen_text, target_text,
+                                                                   model_name=sentencebert_model_name, device=str(device))
+                for key, val in embsim_out_bert.items():
+                    ev = float(val)
+                    embsim_semantic_metrics_history[f"output_{key}"].append(ev)
+                    wandb_log[f"embsim_output_{key}"] = ev
+                ev = float(embsim_out_sbert["sentencebert_similarity"])
+                embsim_semantic_metrics_history["output_sentencebert_similarity"].append(ev)
+                wandb_log["embsim_output_sentencebert_similarity"] = ev
+                if track_prompt_metrics and ground_truth_prompt is not None:
+                    embsim_prompt_text = tokenizer.decode(embsim_prompt_ids, skip_special_tokens=True)
+                    embsim_p_bert  = compute_bertscore(embsim_prompt_text, ground_truth_prompt,
+                                                       model_type=bertscore_model_type, device=str(device))
+                    embsim_p_sbert = compute_sentencebert_similarity(embsim_prompt_text, ground_truth_prompt,
+                                                                     model_name=sentencebert_model_name, device=str(device))
+                    for key, val in embsim_p_bert.items():
+                        ev = float(val)
+                        embsim_semantic_metrics_history[f"prompt_{key}"].append(ev)
+                        wandb_log[f"embsim_prompt_{key}"] = ev
+                    ev = float(embsim_p_sbert["sentencebert_similarity"])
+                    embsim_semantic_metrics_history["prompt_sentencebert_similarity"].append(ev)
+                    wandb_log["embsim_prompt_sentencebert_similarity"] = ev
+
+            embsim_input_str  = tokenizer.decode(embsim_prompt_ids, skip_special_tokens=False)
+            embsim_output_str = embsim_gen_text
 
         # Compute prompt reconstruction metrics (SODA-style) if ground truth is available
         if track_prompt_metrics:
@@ -1952,6 +2430,10 @@ def optimize_inputs(
             table_generated_output_ids[0].tolist(),
             generated_output_str,
             *metrics_dict.values(),
+            disc_input_str,
+            disc_output_str,
+            embsim_input_str,
+            embsim_output_str,
         )
 
         wandb.log(wandb_log)
@@ -2007,14 +2489,36 @@ def optimize_inputs(
             wandb.log({"exact_match_hits": copy.deepcopy(exact_match_hits_table)})
 
         # Optional: early stopping condition
+        _embsim_lcs_this_epoch = embsim_lcs_ratio_history[-1] if (run_discrete_embsim_validation and embsim_lcs_ratio_history) else 0.0
         if (early_stop_loss_threshold > 0.0 and loss.item() < early_stop_loss_threshold) \
-        or (early_stop_on_exact_match and generated_output_str == target_text):
+        or (early_stop_on_exact_match and generated_output_str == target_text) \
+        or (_embsim_lcs_this_epoch >= early_stop_embsim_lcs_ratio_threshold):
             print(f"Converged at epoch {epoch+1} with loss: {loss.item():.6f}")
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
 
     # Return the full assembled logits (detached) for downstream use
-    return generated_tokens, assemble_logits().detach(), losses, lcs_ratio_history, prompt_metrics_history, semantic_metrics_history
+    return {
+        "generated_tokens":                   generated_tokens,
+        "optimized_inputs":                   assemble_logits().detach(),
+        "losses":                             losses,
+        "lcs_ratio_history":                  lcs_ratio_history,
+        "prompt_metrics_history":             prompt_metrics_history,
+        "semantic_metrics_history":           semantic_metrics_history,
+        # Populated when run_discrete_validation=True (else empty)
+        "discrete_generated_tokens":          discrete_generated_tokens,
+        "discrete_lcs_ratio_history":         discrete_lcs_ratio_history,
+        "discrete_prompt_metrics_history":    dict(discrete_prompt_metrics_history),
+        "discrete_semantic_metrics_history":  dict(discrete_semantic_metrics_history),
+        "all_lcs_ratio_history":              all_lcs_ratio_history,
+        "all_prompt_metrics_history":         dict(all_prompt_metrics_history),
+        "all_semantic_metrics_history":       dict(all_semantic_metrics_history),
+        # Populated when run_discrete_embsim_validation=True (else empty)
+        "embsim_generated_tokens":            embsim_generated_tokens,
+        "embsim_lcs_ratio_history":           embsim_lcs_ratio_history,
+        "embsim_prompt_metrics_history":      dict(embsim_prompt_metrics_history),
+        "embsim_semantic_metrics_history":    dict(embsim_semantic_metrics_history),
+    }
 
 
 def str2bool(instr):
@@ -2071,10 +2575,18 @@ def main():
     parser.add_argument("--temperature", type=float, default=1e1)
     parser.add_argument("--learnable_temperature", type=str2bool, default=False)
     parser.add_argument("--stgs_hard", type=str2bool, default=False)
+    parser.add_argument("--stgs_hard_method", type=str, default="categorical",
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"])
+    parser.add_argument("--stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                        choices=["gumbel_soft", "input_logits"])
     parser.add_argument("--bptt", type=str2bool, default=False)
     parser.add_argument("--bptt_temperature", type=float, default=1e1)
     parser.add_argument("--bptt_learnable_temperature", type=str2bool, default=False)
     parser.add_argument("--bptt_stgs_hard", type=str2bool, default=False)
+    parser.add_argument("--bptt_stgs_hard_method", type=str, default="categorical",
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"])
+    parser.add_argument("--bptt_stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                        choices=["gumbel_soft", "input_logits"])
     parser.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
     parser.add_argument("--plot_every", type=int, default=100000)
     parser.add_argument("--stgs_grad_variance_samples", type=int, default=0)
@@ -2096,10 +2608,53 @@ def main():
     parser.add_argument("--vocab_threshold", type=float, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=True,
-                        help="Stop optimization when generated output exactly matches target (default: True)")
+    parser.add_argument("--early_stop_on_exact_match", type=str2bool, default=False,
+                        help="Stop optimization when generated output exactly matches target (default: False)")
     parser.add_argument("--early_stop_loss_threshold", type=float, default=0.01,
                         help="Stop optimization when loss drops below this threshold (0 or negative to disable)")
+    parser.add_argument("--early_stop_embsim_lcs_ratio_threshold", type=float, default=1.0,
+                        help="Stop when embsim LCS ratio >= threshold; active when run_discrete_embsim_validation=True (>1.0 = disabled)")
+
+    # Discrete validation pass
+    parser.add_argument("--run_discrete_validation", type=str2bool, default=False,
+                        help="Run a greedy discrete decode at each epoch and log discrete_* and all_* metrics")
+    parser.add_argument("--run_discrete_embsim_validation", type=str2bool, default=False,
+                        help="At each epoch, find the nearest-embedding token at each position "
+                             "(cosine sim to soft embedding) and run greedy decode; logs embsim_* metrics.")
+    parser.add_argument("--embsim_similarity", type=str, default="cossim",
+                        choices=["cossim", "dotproduct", "l2"],
+                        help="Similarity metric for embsim validation: 'cossim' (cosine, default) "
+                             "or 'dotproduct' (unnormalized dot product, better matches model logits).")
+    parser.add_argument("--embsim_use_input_logits", type=str2bool, default=True,
+                        help="Embsim validation source: True=softmax(input logits) [default], "
+                             "False=STGS y_soft (Gumbel-Softmax outputs)")
+    parser.add_argument("--embsim_teacher_forcing", type=str2bool, default=False,
+                        help="Embsim validation decode: True=single teacher-forced forward pass "
+                             "(faster, no autoregressive generation), False=model.generate() [default]")
+    parser.add_argument("--embsim_temperature", type=float, default=1.0,
+                        help="Temperature applied to raw logits before softmax in embsim validation "
+                             "when embsim_use_input_logits=True. Use the training temperature "
+                             "(e.g. 0.05) to match the sharpness seen during optimization. "
+                             "Default: 1.0 (untempered, backward-compatible). "
+                             "Has no effect when embsim_use_input_logits=False.")
+
+    # Temperature annealing
+    parser.add_argument("--temperature_anneal_schedule", type=str, default="none",
+                        choices=["none", "linear", "cosine"],
+                        help="Temperature annealing schedule (none=disabled)")
+    parser.add_argument("--temperature_anneal_min", type=float, default=0.1,
+                        help="Minimum temperature for annealing")
+    parser.add_argument("--temperature_anneal_epochs", type=int, default=0,
+                        help="Number of epochs over which to anneal temperature (0=use total epochs)")
+    parser.add_argument("--temperature_anneal_reg_lambda", type=float, default=0.0,
+                        help="Regularization weight for temperature annealing loss (0=disabled)")
+    parser.add_argument("--temperature_anneal_reg_mode", type=str, default="mse",
+                        choices=["mse", "one_sided"],
+                        help="'mse': symmetric L2 to target; 'one_sided': L2 only when tau > target")
+
+    # Prompt distribution entropy regularization
+    parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
+                        help="Weight for prompt distribution entropy regularization (0=disabled)")
 
     # Fixed logit distribution parameters
     parser.add_argument("--fixed_gt_prefix_n", type=int, default=0,
@@ -2121,6 +2676,8 @@ def main():
     if config['promptLambda'] > 0.0:    config['losses'] += '+promptPerplexity'
     if config['complLambda'] > 0.0:    config['losses'] += '+completionPerplexity'
     if config['promptTfComplLambda'] > 0.0:    config['losses'] += '+promptTfComplPerplexity'
+    if config.get('eos_reg_lambda', 0.0) > 0.0:    config['losses'] += '+eosPositionReg'
+    if config.get('promptDistEntropyLambda', 0.0) > 0.0:    config['losses'] += '+promptDistEntropy'
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2137,7 +2694,7 @@ def main():
     torch.manual_seed(config["seed"])
     # Optimize inputs
     print(f"Starting optimization with target: {args.target_text}")
-    generated_tokens, optimized_inputs, losses, lcs_ratio_history, _, _ = optimize_inputs(
+    opt_result = optimize_inputs(
         model,
         tokenizer,
         losses=config['losses'],
@@ -2153,7 +2710,11 @@ def main():
         bptt_learnable_temperature=config['bptt_learnable_temperature'],
         learnable_temperature=config['learnable_temperature'],
         stgs_hard=config['stgs_hard'],
+        stgs_hard_method=config.get('stgs_hard_method', 'categorical'),
+        stgs_hard_embsim_probs=config.get('stgs_hard_embsim_probs', 'gumbel_soft'),
         bptt_stgs_hard=config['bptt_stgs_hard'],
+        bptt_stgs_hard_method=config.get('bptt_stgs_hard_method', 'categorical'),
+        bptt_stgs_hard_embsim_probs=config.get('bptt_stgs_hard_embsim_probs', 'gumbel_soft'),
         bptt_hidden_state_conditioning=config['bptt_hidden_state_conditioning'],
         plot_every=config['plot_every'],
         stgs_grad_variance_samples=config['stgs_grad_variance_samples'],
@@ -2183,10 +2744,26 @@ def main():
         fixed_gt_suffix_rank2_n=config.get('fixed_gt_suffix_rank2_n', 0),
         fixed_prefix_text=config.get('fixed_prefix_text'),
         fixed_suffix_text=config.get('fixed_suffix_text'),
-        early_stop_on_exact_match=config.get('early_stop_on_exact_match', True),
+        early_stop_on_exact_match=config.get('early_stop_on_exact_match', False),
         early_stop_loss_threshold=config.get('early_stop_loss_threshold', 0.01),
+        early_stop_embsim_lcs_ratio_threshold=config.get('early_stop_embsim_lcs_ratio_threshold', 1.0),
+        run_discrete_validation=config.get('run_discrete_validation', False),
+        run_discrete_embsim_validation=config.get('run_discrete_embsim_validation', False),
+        embsim_similarity=config.get('embsim_similarity', 'cossim'),
+        embsim_use_input_logits=config.get('embsim_use_input_logits', True),
+        embsim_teacher_forcing=config.get('embsim_teacher_forcing', False),
+        embsim_temperature=config.get('embsim_temperature', 1.0),
+        temperature_anneal_schedule=config.get('temperature_anneal_schedule', 'none'),
+        temperature_anneal_min=config.get('temperature_anneal_min', 0.1),
+        temperature_anneal_epochs=config.get('temperature_anneal_epochs', 0),
+        temperature_anneal_reg_lambda=config.get('temperature_anneal_reg_lambda', 0.0),
+        temperature_anneal_reg_mode=config.get('temperature_anneal_reg_mode', 'mse'),
         kwargs=config,
     )
+    generated_tokens = opt_result["generated_tokens"]
+    optimized_inputs = opt_result["optimized_inputs"]
+    losses = opt_result["losses"]
+    lcs_ratio_history = opt_result["lcs_ratio_history"]
 
     wandb_run.finish()
 
