@@ -85,6 +85,64 @@ class STGS_standalone(nn.Module):
         return message_ids, message_one_hot, eff_temperature
 
 
+def _top_k_logit_filter(
+    logits: torch.Tensor, k: int, penalty: float = 1e4
+) -> torch.Tensor:
+    """Suppress logits below the k-th largest at each position with a large penalty.
+    Mask is computed without gradients so all positions still receive gradient updates."""
+    if k <= 0 or k >= logits.size(-1):
+        return logits
+    with torch.no_grad():
+        top_k_vals = torch.topk(logits, min(k, logits.size(-1)), dim=-1).values
+        threshold = top_k_vals[..., -1:]          # (batch, seq, 1)
+        mask = (logits < threshold).float()
+    return logits - mask * penalty
+
+
+def _top_p_logit_filter(
+    logits: torch.Tensor, p: float, penalty: float = 1e4
+) -> torch.Tensor:
+    """Suppress logits whose cumulative softmax probability exceeds p (nucleus).
+    Mask is computed without gradients so all positions still receive gradient updates."""
+    if p >= 1.0 or p <= 0.0:
+        return logits
+    with torch.no_grad():
+        sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
+        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        # Exclude the token that pushes cumprob over threshold (shift to keep boundary)
+        sorted_mask = (cumprobs - F.softmax(sorted_logits, dim=-1)) >= p
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(-1, sorted_indices, sorted_mask)
+    return logits - mask.float() * penalty
+
+
+def _build_prompt_attn_mask(
+    message_ids: torch.Tensor,
+    eos_allowed_idx: int,
+    batch_size: int,
+    pre_prompt_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a prompt attention mask that zeros out EoS-sampled positions.
+
+    Args:
+        message_ids: (batch, seq_len) discrete token indices in allowed_tokens space.
+        eos_allowed_idx: Index of EoS token in the allowed vocabulary.
+        batch_size: Number of sequences in the batch.
+        pre_prompt_len: Number of pre-prompt tokens prepended before the learnable prompt.
+        device: Torch device.
+
+    Returns:
+        prompt_attn_mask: (batch, pre_prompt_len + seq_len) long tensor; 0 at EoS positions, 1 elsewhere.
+    """
+    eos_in_prompt = (message_ids == eos_allowed_idx)  # (batch, seq_len)
+    prompt_attn = (~eos_in_prompt).long()              # (batch, seq_len)
+    if pre_prompt_len > 0:
+        pre_attn = torch.ones(batch_size, pre_prompt_len, device=device, dtype=torch.long)
+        return torch.cat([pre_attn, prompt_attn], dim=1)
+    return prompt_attn
+
+
 def stgs_forward_pass(
     *,
     model,
@@ -105,21 +163,50 @@ def stgs_forward_pass(
     teacher_forcing: bool = False,
     target_tokens: Optional[torch.Tensor] = None,
     compute_tf_completion_logits: bool = False,
+    logits_top_k: int = 0,
+    logits_top_p: float = 1.0,
+    logits_filter_penalty: float = 1e4,
+    eos_allowed_idx: int = -1,
+    mask_eos_attention: bool = False,
 ) -> ForwardPassResult:
     message_logits = learnable_inputs.repeat(batch_size, 1, 1)
     if model_precision == "half":
         message_logits = message_logits.half()
-    message_ids, message_one_hot, eff_temperature, y_soft = stgs_module.forward(message_logits)
+    # Soft top-k / top-p filtering (gradient flows to all positions via detached mask)
+    if logits_top_k > 0:
+        message_logits = _top_k_logit_filter(message_logits, logits_top_k, logits_filter_penalty)
+    if logits_top_p < 1.0:
+        message_logits = _top_p_logit_filter(message_logits, logits_top_p, logits_filter_penalty)
+    # Read gumbel_noise_scale set externally (e.g. by adaptive noise controller in main.py)
+    gumbel_noise_scale = getattr(stgs_module, 'gumbel_noise_scale', 1.0)
+    message_ids, message_one_hot, eff_temperature, y_soft = stgs_module.forward(
+        message_logits,
+        gumbel_noise_scale=gumbel_noise_scale,
+        embedding_weights=embedding_weights_subset,
+    )
 
     input_embeddings = torch.matmul(message_one_hot, embedding_weights_subset)
     embedding_layer = model.get_input_embeddings()
 
+    pre_prompt_len = 0
     if pre_prompt is not None:
         pre_prompt_tokens = tokenizer(pre_prompt, return_tensors="pt").input_ids.to(device)
         pre_prompt_embeds = embedding_layer(pre_prompt_tokens).repeat(batch_size, 1, 1)
+        pre_prompt_len = pre_prompt_tokens.shape[1]
         current_embeds = torch.cat([pre_prompt_embeds, input_embeddings], dim=1)
     else:
         current_embeds = input_embeddings
+
+    # Build optional attention mask that suppresses EoS-sampled prompt positions
+    prompt_attn_mask = None
+    if mask_eos_attention and eos_allowed_idx >= 0:
+        prompt_attn_mask = _build_prompt_attn_mask(
+            message_ids=message_ids,
+            eos_allowed_idx=eos_allowed_idx,
+            batch_size=batch_size,
+            pre_prompt_len=pre_prompt_len,
+            device=device,
+        )
 
     seq_len = current_embeds.shape[1]
     bptt_eff_temperature = torch.tensor(0.0, device=device)
@@ -138,8 +225,16 @@ def stgs_forward_pass(
             combined_embeds = torch.cat([current_embeds, target_embeds], dim=1)
 
             # Single forward pass for all positions
+            tf_attention_mask = None
+            if prompt_attn_mask is not None:
+                tf_attention_mask = torch.cat(
+                    [prompt_attn_mask,
+                     torch.ones(batch_size, target_length - 1, device=device, dtype=torch.long)],
+                    dim=1,
+                )
             outputs = model(
                 inputs_embeds=combined_embeds,
+                attention_mask=tf_attention_mask,
                 output_hidden_states=True,
                 use_cache=False,  # No need for KV cache in teacher forcing
                 return_dict=True,
@@ -178,6 +273,7 @@ def stgs_forward_pass(
                     "prompt_argmax_ids": message_logits.argmax(dim=-1),
                     "prompt_logits": prompt_logits,
                     "tf_generated_logits": tf_generated_logits,
+                    "prompt_input_logits": message_logits,
                 },
             )
             loss = losses_dict["sumloss"]
@@ -201,6 +297,7 @@ def stgs_forward_pass(
     # SLOW PATH: Existing autoregressive generation (unchanged)
     outputs = model(
         inputs_embeds=current_embeds,
+        attention_mask=prompt_attn_mask,
         output_hidden_states=True,
         use_cache=True,
         return_dict=True,
@@ -214,6 +311,9 @@ def stgs_forward_pass(
 
     all_logits = [logits_allowed[:, -1:, :]]
     all_hidden_states = [outputs.hidden_states]
+
+    # Track growing attention mask for autoregressive steps
+    ar_attn = prompt_attn_mask
 
     completion_ids = []
     current_length = 1
@@ -235,9 +335,16 @@ def stgs_forward_pass(
 
         completion_ids.append(next_token_id)
 
+        if ar_attn is not None:
+            ar_attn = torch.cat(
+                [ar_attn, torch.ones(batch_size, 1, device=device, dtype=torch.long)],
+                dim=1,
+            )
+
         outputs = model(
             inputs_embeds=next_token_embedding,
             past_key_values=past_key_values,
+            attention_mask=ar_attn,
             output_hidden_states=True,
             use_cache=True,
             return_dict=True,
@@ -257,8 +364,16 @@ def stgs_forward_pass(
     if compute_tf_completion_logits and target_tokens is not None:
         target_embeds = embedding_weights_subset[target_tokens[:, :-1]]
         combined_embeds = torch.cat([current_embeds, target_embeds], dim=1)
+        tf_compl_attention_mask = None
+        if prompt_attn_mask is not None:
+            tf_compl_attention_mask = torch.cat(
+                [prompt_attn_mask,
+                 torch.ones(batch_size, target_length - 1, device=device, dtype=torch.long)],
+                dim=1,
+            )
         tf_outputs = model(
             inputs_embeds=combined_embeds,
+            attention_mask=tf_compl_attention_mask,
             output_hidden_states=False,
             use_cache=False,
             return_dict=True,
@@ -279,6 +394,7 @@ def stgs_forward_pass(
             "prompt_argmax_ids": message_logits.argmax(dim=-1),
             "prompt_logits": prompt_logits,
             "tf_generated_logits": tf_generated_logits,
+            "prompt_input_logits": message_logits,
         },
     )
     loss = losses_dict["sumloss"]
