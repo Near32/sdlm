@@ -33,6 +33,9 @@ class STGS(nn.Module):
         nbr_learnable_temperatures: Optional[int] = None,
         conditioning_dim: int = 0,
         dropout: float = 0.0,
+        stgs_hard_method: str = "categorical",
+        stgs_hard_embsim_probs: str = "gumbel_soft",
+        logits_normalize: str = "none",   # "none" | "center" | "zscore"
         eps: float = 1e-12,
         device: str = "cpu",
         tokenizer = None,
@@ -40,6 +43,9 @@ class STGS(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.stgs_hard = stgs_hard
+        self.stgs_hard_method = stgs_hard_method
+        self.stgs_hard_embsim_probs = stgs_hard_embsim_probs
+        self.logits_normalize = logits_normalize
         self.init_temperature = init_temperature
         self.learnable_temperature = learnable_temperature
         self.nbr_learnable_temperatures = nbr_learnable_temperatures
@@ -63,12 +69,14 @@ class STGS(nn.Module):
                 ).to(device=device)
 
     def forward(
-        self, 
-        x: Tensor, 
+        self,
+        x: Tensor,
         temperature: Optional[float] = None,
         hidden_states: Optional[Tensor] = None,
         dropout: Optional[float] = None,
         temperature_param_indices: Optional[List[int]] = None,
+        gumbel_noise_scale: float = 1.0,
+        embedding_weights: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with STGS sampling.
@@ -120,6 +128,15 @@ class STGS(nn.Module):
             dtype=x.dtype,
         )
 
+        # Per-position logit normalization (vocab dim only; no mixing across positions)
+        # Mean/std are inside the computational graph — gradients flow through them.
+        if self.logits_normalize != "none":
+            mean = x.mean(dim=-1, keepdim=True)
+            x = x - mean
+            if self.logits_normalize == "zscore":
+                std = x.std(dim=-1, keepdim=True)
+                x = x / (std + self.eps)
+
         # Gumbel-Softmax sampling
         with torch.no_grad():
             u = torch.rand_like(x)*(0.999-self.eps)+self.eps
@@ -129,13 +146,35 @@ class STGS(nn.Module):
             )
         # batch_size x seq_len x vocab_size
 
-        gumbel_logits = (x + gumbels).float()
+        gumbel_logits = (x + gumbel_noise_scale * gumbels).float()
         y_soft = F.softmax(gumbel_logits / eff_temperature, dim=-1)
         # temperary float conversion to prevent from underflow and breaking Simplex assumption
         # batch_size x seq_len x vocab_size
 
         # Sampling from batched distribution y_soft:
-        output_ids = torch.distributions.Categorical(probs=y_soft).sample()
+        if self.stgs_hard_method in ("embsim-dot", "embsim-cos", "embsim-l2") and embedding_weights is not None:
+            with torch.no_grad():
+                if self.stgs_hard_embsim_probs == "input_logits":
+                    emb_probs = F.softmax(x.float(), dim=-1)
+                else:  # "gumbel_soft" (default)
+                    emb_probs = y_soft.float()
+                soft_emb = torch.matmul(emb_probs, embedding_weights.float())
+                if self.stgs_hard_method == "embsim-dot":
+                    sim = torch.matmul(soft_emb, embedding_weights.float().T)
+                    output_ids = sim.argmax(dim=-1)
+                elif self.stgs_hard_method == "embsim-l2":
+                    soft_sq = (soft_emb ** 2).sum(dim=-1, keepdim=True)           # (B, S, 1)
+                    emb_sq  = (embedding_weights.float() ** 2).sum(dim=-1)        # (V,)
+                    cross   = torch.matmul(soft_emb, embedding_weights.float().T) # (B, S, V)
+                    l2_sq   = soft_sq - 2 * cross + emb_sq                        # (B, S, V)
+                    output_ids = l2_sq.argmin(dim=-1)
+                else:  # embsim-cos
+                    soft_norm = F.normalize(soft_emb, dim=-1, eps=self.eps)
+                    emb_norm  = F.normalize(embedding_weights.float(), dim=-1, eps=self.eps)
+                    sim = torch.matmul(soft_norm, emb_norm.T)
+                    output_ids = sim.argmax(dim=-1)
+        else:  # "categorical" (default) or fallback
+            output_ids = torch.distributions.Categorical(probs=y_soft).sample()
         # batch_size x seq_len
         del gumbel_logits
         y_soft = y_soft.to(x.dtype)
