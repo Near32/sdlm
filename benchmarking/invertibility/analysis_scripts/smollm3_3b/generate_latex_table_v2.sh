@@ -40,6 +40,10 @@ MAX_ROWS=""      # Limit number of rows (e.g., 10)
 RESULTS_DIR=""   # Local results directory (overrides W&B config)
 DEVICE=""        # Device for model (auto-detected if empty)
 
+# Re-sampling settings
+RESAMPLE=true                 # Set to true to re-generate outputs from learned prompts
+RESAMPLE_MAX_NEW_TOKENS=20    # Max new tokens for greedy re-sampling
+
 # === RUN SCRIPT ===
 
 CMD="python ${ANALYSIS_DIR}/generate_functional_lmi_latex_table_v2.py"
@@ -59,6 +63,8 @@ CMD="$CMD --dpi $DPI"
 [[ -n "$MAX_ROWS" ]] && CMD="$CMD --max-rows $MAX_ROWS"
 [[ -n "$RESULTS_DIR" ]] && CMD="$CMD --results-dir \"$RESULTS_DIR\""
 [[ -n "$DEVICE" ]] && CMD="$CMD --device \"$DEVICE\""
+[[ "$RESAMPLE" == "true" ]] && CMD="$CMD --resample"
+[[ -n "$RESAMPLE_MAX_NEW_TOKENS" ]] && CMD="$CMD --resample-max-new-tokens $RESAMPLE_MAX_NEW_TOKENS"
 
 echo "Running: $CMD"
 eval $CMD

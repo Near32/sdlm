@@ -19,6 +19,9 @@ python -m ipdb -c c batch_optimize_main.py  \
 --gcg_num_mutations=1 \
 --gcg_pos_choice="uniform" \
 --gcg_token_choice="uniform" \
---gcg_init_strategy="zeros"
+--gcg_init_strategy="zeros" \
+--run_discrete_embsim_validation=True \
+--embsim_similarity="l2" \
+--embsim_use_input_logits=True
 
 #--target_indices="0,1"

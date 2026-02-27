@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from generate_functional_lmi_latex_table import (
     compute_prompt_perplexity,
@@ -27,6 +29,55 @@ from generate_functional_lmi_latex_table import (
     truncate_text,
 )
 from text_to_png import render_text_to_png
+
+
+def resample_from_prompt(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt_tokens: list,
+    max_new_tokens: int = 50,
+) -> str:
+    """Greedy-decode `max_new_tokens` tokens conditioned on `prompt_tokens`."""
+    if not prompt_tokens:
+        return ""
+    input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=model.device)
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    new_ids = output_ids[0, len(prompt_tokens):]
+    return tokenizer.decode(new_ids, skip_special_tokens=True)
+
+
+def _lcs_length(a: list, b: list) -> int:
+    """Length of the longest common subsequence of two token lists."""
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    return dp[m][n]
+
+
+def compute_lcs_ratio(
+    tokenizer: AutoTokenizer,
+    generated_text: str,
+    target_text: str,
+) -> float:
+    """Token-level LCS ratio: lcs_length / len(target_tokens)."""
+    gen_tokens = tokenizer.encode(generated_text, add_special_tokens=False)
+    tgt_tokens = tokenizer.encode(target_text, add_special_tokens=False)
+    if not tgt_tokens:
+        return 0.0
+    return _lcs_length(gen_tokens, tgt_tokens) / len(tgt_tokens)
 
 
 def compute_diff_colors(
@@ -124,6 +175,7 @@ def generate_latex_table_v2(
     label: str,
     has_ground_truth: bool = False,
     image_width: str = "2cm",
+    resample: bool = False,
 ) -> str:
     """Generate LaTeX longtable with \\includegraphics for text columns.
 
@@ -143,6 +195,7 @@ def generate_latex_table_v2(
         lambda fname: rf"\includegraphics[width={image_width}]{{{images_dir_name}/{fname}}}"
     )
 
+    sample_col_header = r"\textbf{Re-sampled Output}" if resample else r"\textbf{Sampled Output}"
     if has_ground_truth:
         col_spec = "c|c|c|c|c|c|c|c"
         num_cols = 8
@@ -153,7 +206,7 @@ def generate_latex_table_v2(
             r"\textbf{GT Prompt}",
             r"\textbf{Learned Prompt}",
             r"\textbf{Prompt PPL}",
-            r"\textbf{Sampled Output}",
+            sample_col_header,
             r"\textbf{LCS}",
         ]
     else:
@@ -165,7 +218,7 @@ def generate_latex_table_v2(
             r"\textbf{Target Output}",
             r"\textbf{Learned Prompt}",
             r"\textbf{Prompt PPL}",
-            r"\textbf{Sampled Output}",
+            sample_col_header,
             r"\textbf{LCS}",
         ]
 
@@ -331,6 +384,17 @@ def main():
         default=300,
         help="Resolution in DPI for PNG rendering (default: 300)",
     )
+    parser.add_argument(
+        "--resample",
+        action="store_true",
+        help="Re-generate sampled output from learned prompt via greedy decoding",
+    )
+    parser.add_argument(
+        "--resample-max-new-tokens",
+        type=int,
+        default=50,
+        help="Max new tokens for re-sampling (default: 50)",
+    )
 
     args = parser.parse_args()
 
@@ -387,14 +451,24 @@ def main():
             prompt_info = learned_prompts[sample_id]
             row["learned_prompt"] = prompt_info.get("text", "")
 
-            if prompt_info.get("generated_text"):
-                row["sampled_output"] = prompt_info["generated_text"]
-            if prompt_info.get("lcs_ratio") is not None:
-                row["lcs_ratio"] = prompt_info["lcs_ratio"]
+            tokens = prompt_info.get("tokens", [])
+            if args.resample and tokens:
+                resampled = resample_from_prompt(
+                    model, tokenizer, tokens,
+                    max_new_tokens=args.resample_max_new_tokens,
+                )
+                row["sampled_output"] = resampled
+                row["lcs_ratio"] = compute_lcs_ratio(
+                    tokenizer, resampled, row["target_text"],
+                )
+            else:
+                if prompt_info.get("generated_text"):
+                    row["sampled_output"] = prompt_info["generated_text"]
+                if prompt_info.get("lcs_ratio") is not None:
+                    row["lcs_ratio"] = prompt_info["lcs_ratio"]
             if prompt_info.get("target_k") is not None and row.get("k_value") is None:
                 row["k_value"] = prompt_info["target_k"]
 
-            tokens = prompt_info.get("tokens", [])
             if tokens:
                 row["prompt_perplexity"] = compute_prompt_perplexity(model, tokenizer, tokens)
             else:
@@ -469,6 +543,7 @@ def main():
         label=args.label,
         has_ground_truth=dataset_info["has_ground_truth_prompt"],
         image_width=image_width_latex,
+        resample=args.resample,
     )
 
     # Output

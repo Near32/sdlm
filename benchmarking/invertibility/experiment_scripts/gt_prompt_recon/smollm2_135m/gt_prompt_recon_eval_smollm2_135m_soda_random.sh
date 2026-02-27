@@ -72,6 +72,9 @@ for PROMPT_LENGTH in 10 ; do
         --soda_init_strategy=zeros \
         --baseline_backend=hf \
         --num_workers=1 \
+        --run_discrete_embsim_validation=True \
+        --embsim_similarity="l2" \
+        --embsim_use_input_logits=True \
         --wandb_project="gt-prompt-reconstruction"
 
     echo "Completed: ${OUTPUT_DIR}"

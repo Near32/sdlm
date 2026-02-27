@@ -32,7 +32,10 @@ python -m ipdb -c c batch_optimize_main.py  \
 --bptt_learnable_temperature=True \
 --bptt_decouple_learnable_temperature=True \
 --bptt_hidden_state_conditioning=False \
---bptt_temperature=100.0 
+--bptt_temperature=100.0 \
+--run_discrete_embsim_validation=True \
+--embsim_similarity="l2" \
+--embsim_use_input_logits=True
 
 #--target_indices="0,1" 
 #--losses=embxentropy \

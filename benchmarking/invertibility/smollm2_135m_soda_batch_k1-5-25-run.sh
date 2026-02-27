@@ -22,7 +22,10 @@ python -m ipdb -c c batch_optimize_main.py  \
 --soda_reset_epoch=50 \
 --soda_reinit_epoch=1500 \
 --soda_bias_correction=False \
---soda_init_strategy="zeros"
+--soda_init_strategy="zeros" \
+--run_discrete_embsim_validation=True \
+--embsim_similarity="l2" \
+--embsim_use_input_logits=True
 
 #--soda_reg_weight=0.009 \
 #--target_indices="0,1"

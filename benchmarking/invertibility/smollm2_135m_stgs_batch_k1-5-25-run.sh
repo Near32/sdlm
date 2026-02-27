@@ -31,8 +31,11 @@ python -m ipdb -c c batch_optimize_main.py  \
 --bptt_stgs_hard=False \
 --bptt_learnable_temperature=False \
 --bptt_hidden_state_conditioning=False \
---bptt_temperature=100.0 
+--bptt_temperature=100.0 \
+--run_discrete_embsim_validation=True \
+--embsim_similarity="l2" \
+--embsim_use_input_logits=True
 
-#--target_indices="0,1" 
+#--target_indices="0,1"
 #--losses=embxentropy \
 # DEPR to same as batch_size : --stgs_grad_bias_reference_batch_size=64 \

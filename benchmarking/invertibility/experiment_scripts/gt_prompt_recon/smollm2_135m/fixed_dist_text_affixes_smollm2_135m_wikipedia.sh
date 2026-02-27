@@ -109,6 +109,9 @@ for (( i=0; i<N_EXPERIMENTS; i++ )); do
         --bptt=False \
         --num_workers=1 \
         ${EXTRA_ARGS} \
+        --run_discrete_embsim_validation=True \
+        --embsim_similarity="l2" \
+        --embsim_use_input_logits=True \
         --wandb_project="fixed-dist-text-affixes-Wikipedia-SmolLM2-135M"
 
     echo "Completed: ${OUTPUT_DIR}"

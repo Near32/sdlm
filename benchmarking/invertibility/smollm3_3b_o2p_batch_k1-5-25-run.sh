@@ -35,7 +35,10 @@ python batch_optimize_main.py \
     --batch_size=1 \
     --seed=42 \
     --num_workers=1 \
-    --wandb_project="LMI-O2P"
+    --wandb_project="LMI-O2P" \
+    --run_discrete_embsim_validation=True \
+    --embsim_similarity="l2" \
+    --embsim_use_input_logits=True
 
 # Notes:
 # - epochs=1 since O2P is one-shot (not iterative)

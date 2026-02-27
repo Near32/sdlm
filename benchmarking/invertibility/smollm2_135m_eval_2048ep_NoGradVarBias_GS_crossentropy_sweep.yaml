@@ -73,5 +73,16 @@ parameters:
     values: [1.0e-1]
   num_workers:
     values: [1]
+  run_discrete_embsim_validation:
+    values: [True]
+  embsim_similarity:
+    values: ["l2"]
+  embsim_use_input_logits:
+    values: [True]
 
-                   
+  early_stop_on_exact_match:
+    values: [False]
+  early_stop_loss_threshold:
+    values: [0]
+  early_stop_embsim_lcs_ratio_threshold:
+    values: [1.0]

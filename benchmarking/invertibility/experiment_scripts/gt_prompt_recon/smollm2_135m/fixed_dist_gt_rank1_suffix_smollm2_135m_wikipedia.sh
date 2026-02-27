@@ -79,6 +79,9 @@ for CFG in "${CONFIGS[@]}"; do
             --bptt=False \
             --num_workers=1 \
             --fixed_gt_suffix_n=${FIXED_N} \
+            --run_discrete_embsim_validation=True \
+            --embsim_similarity="l2" \
+            --embsim_use_input_logits=True \
             --wandb_project="fixed-dist-gt-rank1-suffix-Wikipedia-SmolLM2-135M"
 
         echo "Completed: ${OUTPUT_DIR}"
