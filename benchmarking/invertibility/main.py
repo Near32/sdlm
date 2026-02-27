@@ -10,7 +10,7 @@ import copy
 import wandb
 import matplotlib.pyplot as plt
 from functools import partial
-from typing import Dict
+from typing import Dict, Optional
 
 from gradient_estimators import (
     STGS,
@@ -22,6 +22,12 @@ from gradient_estimators import (
     estimate_reinforce_gradient_variance,
 )
 from metrics_registry import lcs_length
+from evaluation import (
+    run_discrete_validation_pass,
+    run_embsim_validation_pass,
+    build_embsim_wandb_metrics,
+    build_embsim_epoch_callback,
+)
 
 
 def setup_model_and_tokenizer(model_name="HuggingFaceM4/tiny-random-LlamaForCausalLM",device='cpu',model_precision='full'):
@@ -195,6 +201,169 @@ def filter_vocabulary(embedding_weights, seed_vector, target_token_ids, threshol
     union_allowed = torch.tensor(sorted(list(union_allowed)), device=embedding_weights.device)
     return union_allowed
 
+def compute_commitment_loss(
+    prompt_input_logits: torch.Tensor,
+    embedding_weights: torch.Tensor,
+    similarity: str = "argmax",
+    eps: float = 1e-8,
+    position_weights: Optional[torch.Tensor] = None,
+    extras_dict: Optional[Dict] = None,
+) -> torch.Tensor:
+    """
+    VQ-VAE-style commitment loss.
+
+    Computes the mean squared L2 distance between the soft embedding at each
+    prompt position and the embedding of its nearest discrete token (stop-gradient).
+
+    Args:
+        prompt_input_logits: (batch, seq_len, vocab) — logits over allowed vocab.
+        embedding_weights:   (vocab, embed_dim)      — subset of model embedding matrix.
+        similarity: How to find the nearest token per position:
+            "argmax"     — token with highest logit (no embedding look-up needed for selection).
+            "embsim-dot" — token whose embedding has highest dot product with the soft embedding.
+            "embsim-cos" — token whose embedding has highest cosine similarity.
+        eps: Small constant for numerical stability in cosine normalization.
+        position_weights: Optional (seq_len,) tensor of per-position weights. If None,
+            falls back to uniform averaging (original behaviour). Weights are normalized
+            to sum=1 inside this function.
+        extras_dict: Optional dict to populate with diagnostic tensors (detached):
+            "per_pos"  — (seq_len,) batch-mean per-position MSE before weighting.
+            "weights"  — (seq_len,) normalized weights, or None for uniform.
+
+    Returns:
+        Scalar commitment loss tensor (weighted/mean over positions, mean over batch).
+    """
+    probs = torch.softmax(prompt_input_logits, dim=-1)               # (batch, seq, vocab)
+    soft_embed = torch.matmul(probs, embedding_weights)              # (batch, seq, embed)
+
+    if similarity == "argmax":
+        nearest_idx = prompt_input_logits.argmax(dim=-1)             # (batch, seq)
+    elif similarity == "embsim-dot":
+        sim = torch.matmul(soft_embed, embedding_weights.T)          # (batch, seq, vocab)
+        nearest_idx = sim.argmax(dim=-1)
+    elif similarity == "embsim-l2":
+        soft_sq = (soft_embed ** 2).sum(dim=-1, keepdim=True)
+        emb_sq  = (embedding_weights ** 2).sum(dim=-1)
+        cross   = torch.matmul(soft_embed, embedding_weights.T)
+        l2_sq   = soft_sq - 2 * cross + emb_sq
+        nearest_idx = l2_sq.argmin(dim=-1)
+    else:  # "embsim-cos"
+        soft_norm = F.normalize(soft_embed, dim=-1, eps=eps)
+        e_norm    = F.normalize(embedding_weights, dim=-1, eps=eps)
+        sim = torch.matmul(soft_norm, e_norm.T)                      # (batch, seq, vocab)
+        nearest_idx = sim.argmax(dim=-1)
+
+    nearest_embed = embedding_weights[nearest_idx]                   # (batch, seq, embed)
+    per_pos = (soft_embed - nearest_embed.detach()).pow(2).mean(dim=-1)  # (batch, seq)
+
+    if extras_dict is not None:
+        extras_dict["per_pos"] = per_pos.mean(dim=0).detach()        # (seq_len,) batch-mean, unweighted
+
+    if position_weights is not None:
+        w = position_weights.to(per_pos.device)
+        w = w / w.sum()                                              # normalize to sum=1
+        if extras_dict is not None:
+            extras_dict["weights"] = w.detach()
+        return (per_pos * w.unsqueeze(0)).sum(dim=-1).mean()         # weighted sum over pos, mean over batch
+    else:
+        if extras_dict is not None:
+            extras_dict["weights"] = None
+        return per_pos.mean()                                        # original behaviour
+
+
+def make_commitment_position_weights(
+    seq_len: int,
+    schedule: str = "uniform",
+    step: float = 10.0,
+    base: float = 2.0,
+) -> Optional[torch.Tensor]:
+    """
+    Build a (seq_len,) position-weight tensor for commitment loss.
+    Returns None for "uniform" (preserves existing .mean() behaviour).
+    Weights are NOT normalized here; normalization happens inside compute_commitment_loss.
+
+    Args:
+        seq_len:  Number of prompt token positions.
+        schedule: One of "uniform", "linear_inc", "linear_dec", "exp_inc", "exp_dec".
+        step:     Multiplier for linear schedules (weight at position i = step * (i+1)).
+        base:     Base for exponential schedules (weight at position i = base^i).
+
+    Returns:
+        (seq_len,) float32 tensor, or None for "uniform".
+    """
+    if schedule == "uniform":
+        return None
+    elif schedule == "linear_inc":
+        return torch.arange(1, seq_len + 1, dtype=torch.float32) * step
+    elif schedule == "linear_dec":
+        return torch.arange(seq_len, 0, -1, dtype=torch.float32) * step
+    elif schedule == "exp_inc":
+        return base ** torch.arange(seq_len, dtype=torch.float32)
+    elif schedule == "exp_dec":
+        return base ** torch.arange(seq_len - 1, -1, -1, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown commitment_pos_weight_schedule: {schedule!r}")
+
+
+def snap_free_logits(
+    free_logits: torch.Tensor,
+    current_logits: torch.Tensor,
+    embedding_weights: torch.Tensor,
+    n_free: int,
+    prefix_len: int,
+    snap_method: str = "argmax",
+    spike_value: float = 10.0,
+    eps: float = 1e-8,
+) -> None:
+    """
+    In-place reinitialization of free_logits to a spiked one-hot distribution
+    pointing at the current discrete projection of the soft prompt.
+
+    Args:
+        free_logits:       (batch, n_free, vocab) — learnable parameter to overwrite in-place.
+        current_logits:    (1, seq_len, vocab)    — assembled logits (detached, no-grad).
+        embedding_weights: (vocab, embed_dim)     — allowed-vocab embedding subset.
+        n_free:            Number of free (learnable) positions.
+        prefix_len:        Number of positions occupied by fixed prefix (may be 0).
+        snap_method:       "argmax" | "embsim-dot" | "embsim-cos" — projection method.
+        spike_value:       Logit value placed at the selected token (default 10.0).
+        eps:               Numerical stability epsilon for cosine normalization.
+    """
+    batch_size, _, vocab_size = free_logits.shape
+
+    if snap_method == "argmax":
+        snapped = current_logits.argmax(dim=-1)                      # (1, seq_len)
+    elif snap_method == "embsim-dot":
+        probs    = torch.softmax(current_logits, dim=-1)
+        soft_emb = torch.matmul(probs, embedding_weights)
+        sim      = torch.matmul(soft_emb, embedding_weights.T)
+        snapped  = sim.argmax(dim=-1)
+    elif snap_method == "embsim-l2":
+        probs    = torch.softmax(current_logits, dim=-1)
+        soft_emb = torch.matmul(probs, embedding_weights)
+        soft_sq  = (soft_emb ** 2).sum(dim=-1, keepdim=True)
+        emb_sq   = (embedding_weights ** 2).sum(dim=-1)
+        cross    = torch.matmul(soft_emb, embedding_weights.T)
+        l2_sq    = soft_sq - 2 * cross + emb_sq
+        snapped  = l2_sq.argmin(dim=-1)
+    else:  # "embsim-cos"
+        probs    = torch.softmax(current_logits, dim=-1)
+        soft_emb = torch.matmul(probs, embedding_weights)
+        soft_norm = F.normalize(soft_emb, dim=-1, eps=eps)
+        e_norm    = F.normalize(embedding_weights, dim=-1, eps=eps)
+        sim       = torch.matmul(soft_norm, e_norm.T)
+        snapped   = sim.argmax(dim=-1)
+
+    # Extract the free portion from the assembled sequence
+    free_snapped = snapped[:1, prefix_len:prefix_len + n_free]       # (1, n_free)
+
+    # Spike the chosen token at each free position
+    new_logits = torch.zeros(batch_size, n_free, vocab_size,
+                             device=free_logits.device, dtype=free_logits.dtype)
+    new_logits.scatter_(-1, free_snapped.expand(batch_size, -1).unsqueeze(-1), spike_value)
+    free_logits.data.copy_(new_logits)
+
+
 def generate_completions(model, input_embeddings, target_length, temperature=1.0, pre_prompt=None):
     """
     Generate completions from the model using the input embeddings
@@ -274,6 +443,7 @@ class LossClass(object):
         model,
         tokenizer,
         kwargs,
+        eos_idx_in_allowed=None,
     ):
         self.eps = 1e-8
         self.losses = losses
@@ -290,6 +460,49 @@ class LossClass(object):
         self.hidden_state_dim = self.model.config.hidden_size
 
         self.kwargs = kwargs
+
+        # EoS position regularization
+        self.eos_idx_in_allowed = eos_idx_in_allowed
+        self.eos_reg_lambda = kwargs.get("eos_reg_lambda", 0.0)
+        self.eos_reg_schedule = kwargs.get("eos_reg_schedule", "linear")
+        self.eos_reg_alpha = kwargs.get("eos_reg_alpha", 1.0)
+
+        # Prompt distribution entropy regularization
+        self.prompt_dist_entropy_lambda = kwargs.get("promptDistEntropyLambda", 0.0)
+
+        # Commitment loss (VQ-VAE style)
+        self.commitment_lambda = kwargs.get("commitmentLambda", 0.0)
+        self.commitment_similarity = kwargs.get("commitment_similarity", "argmax")
+        # Position-weighted commitment loss (opt-in)
+        self.commitment_pos_weight_schedule = kwargs.get("commitment_pos_weight_schedule", "uniform")
+        self.commitment_pos_weight_step = kwargs.get("commitment_pos_weight_step", 10.0)
+        self.commitment_pos_weight_base = kwargs.get("commitment_pos_weight_base", 2.0)
+        _seq_len = kwargs.get("seq_len", 40)
+        self._commitment_pos_weights = make_commitment_position_weights(
+            seq_len=_seq_len,
+            schedule=self.commitment_pos_weight_schedule,
+            step=self.commitment_pos_weight_step,
+            base=self.commitment_pos_weight_base,
+        )
+
+        # Main-loss position weighting
+        self.loss_pos_weight_schedule = kwargs.get("loss_pos_weight_schedule", "uniform")
+        self.loss_pos_weight_step = kwargs.get("loss_pos_weight_step", 1.0)
+        self.loss_pos_weight_base = kwargs.get("loss_pos_weight_base", 2.0)
+        self._loss_pos_weights = make_commitment_position_weights(
+            seq_len=self.target_seq_len,
+            schedule=self.loss_pos_weight_schedule,
+            step=self.loss_pos_weight_step,
+            base=self.loss_pos_weight_base,
+        )
+
+        # Hinge loss margin
+        self.hinge_delta = 0.0
+        for _p in self.losses.split("+"):
+            if _p.lower().startswith("hinge"):
+                if "-margin=" in _p.lower():
+                    self.hinge_delta = float(_p.lower().split("-margin=")[1])
+                break
 
         # EmbXEntropy:
         if 'embxentropy' in self.losses.lower():
@@ -410,14 +623,42 @@ class LossClass(object):
         losses_dict = {}
 
         if "crossentropy" in self.losses.lower():
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(
-                #generated_logits.reshape(-1, vocab_size),
-                input_dict['generated_logits'].reshape(-1, self.embedding_weights_subset.shape[0]),
-                self.target_tokens_mapped.reshape(-1), #.reshape(1, -1).repeat(batch_size, 1),
-                #target_tokens.reshape(-1)
-            )
+            if self._loss_pos_weights is not None:
+                _ce = nn.CrossEntropyLoss(reduction='none')(
+                    input_dict['generated_logits'].reshape(-1, self.embedding_weights_subset.shape[0]),
+                    self.target_tokens_mapped.reshape(-1),
+                ).reshape(self.batch_size, self.target_seq_len)          # (B, T)
+                _w = self._loss_pos_weights.to(_ce.device)
+                _w = _w / _w.sum()
+                loss = (_ce * _w.unsqueeze(0)).sum(dim=-1).mean()
+            else:
+                loss = nn.CrossEntropyLoss()(
+                    input_dict['generated_logits'].reshape(-1, self.embedding_weights_subset.shape[0]),
+                    self.target_tokens_mapped.reshape(-1),
+                )
             losses_dict['crossentropy'] = loss
+            sumloss += loss
+
+        if any(p.lower().startswith("hinge") for p in self.losses.split("+")):
+            logits  = input_dict['generated_logits']           # (B, T, V)
+            targets = self.target_tokens_mapped                # (B, T)
+
+            # logit of the correct token at each position
+            logit_correct = torch.gather(logits, 2, targets.unsqueeze(-1)).squeeze(-1)  # (B, T)
+
+            # max logit over all *other* classes (mask correct class with -inf)
+            logits_masked = logits.clone()
+            logits_masked.scatter_(2, targets.unsqueeze(-1), float('-inf'))
+            max_other = logits_masked.max(dim=-1).values       # (B, T)
+
+            _hinge = torch.clamp(self.hinge_delta + max_other - logit_correct, min=0.0)  # (B, T)
+            if self._loss_pos_weights is not None:
+                _w = self._loss_pos_weights.to(_hinge.device)
+                _w = _w / _w.sum()
+                loss = (_hinge * _w.unsqueeze(0)).sum(dim=-1).mean()
+            else:
+                loss = _hinge.mean()
+            losses_dict['hinge'] = loss
             sumloss += loss
 
         if "embedded" in self.losses.lower():
@@ -438,19 +679,30 @@ class LossClass(object):
                 target=target_embeddings.detach(),
             )
             # (batch_size x target_seq_len x embedding_size)
-            #loss = loss.mean() #dim=-1).mean(dim=-1)
-            #loss = loss.sum(dim=-1).sqrt().mean()
-            loss = loss.sum(dim=-1).mean()
-            # (batch_size
+            loss = loss.sum(dim=-1)  # (B, T)
+            if self._loss_pos_weights is not None:
+                _w = self._loss_pos_weights.to(loss.device)
+                _w = _w / _w.sum()
+                loss = (loss * _w.unsqueeze(0)).sum(dim=-1).mean()
+            else:
+                loss = loss.mean()
             losses_dict['embedded'] = loss
             sumloss += loss
 
         if "embxentropy" in self.losses.lower():
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(
-                input_dict['generated_logits'].reshape(-1, self.vocab_size),
-                target=self.target_distr.reshape(-1, self.vocab_size).detach(),
-            )
+            if self._loss_pos_weights is not None:
+                _ex = nn.CrossEntropyLoss(reduction='none')(
+                    input_dict['generated_logits'].reshape(-1, self.vocab_size),
+                    target=self.target_distr.reshape(-1, self.vocab_size).detach(),
+                ).reshape(self.batch_size, self.target_seq_len)          # (B, T)
+                _w = self._loss_pos_weights.to(_ex.device)
+                _w = _w / _w.sum()
+                loss = (_ex * _w.unsqueeze(0)).sum(dim=-1).mean()
+            else:
+                loss = nn.CrossEntropyLoss()(
+                    input_dict['generated_logits'].reshape(-1, self.vocab_size),
+                    target=self.target_distr.reshape(-1, self.vocab_size).detach(),
+                )
             losses_dict['embxentropy'] = loss
             sumloss += loss
 
@@ -542,6 +794,65 @@ class LossClass(object):
                 promptTfComplLambda = self.kwargs['promptTfComplLambda']
                 loss = (promptTfComplLambda * promptTfComplPLX).mean()
                 sumloss += loss
+
+        if "eosPositionReg" in self.losses and self.eos_idx_in_allowed is not None:
+            prompt_input_logits = input_dict["prompt_input_logits"]  # (batch, seq_len, vocab)
+            seq_len = prompt_input_logits.shape[1]
+            i = torch.arange(seq_len, device=prompt_input_logits.device,
+                             dtype=prompt_input_logits.dtype)
+            if self.eos_reg_schedule == "linear":
+                weights = (seq_len - i) / seq_len
+            elif self.eos_reg_schedule == "exponential":
+                weights = torch.exp(-self.eos_reg_alpha * i / seq_len)
+            else:  # power
+                weights = ((seq_len - i) / seq_len) ** self.eos_reg_alpha
+
+            eos_targets = torch.full(
+                (prompt_input_logits.shape[0] * seq_len,),
+                self.eos_idx_in_allowed,
+                dtype=torch.long,
+                device=prompt_input_logits.device,
+            )
+            per_pos_ce = F.cross_entropy(
+                prompt_input_logits.reshape(-1, prompt_input_logits.shape[-1]),
+                eos_targets,
+                reduction="none",
+            ).reshape(prompt_input_logits.shape[0], seq_len)  # (batch, seq_len)
+            eos_reg = (weights.unsqueeze(0) * per_pos_ce).mean()
+            losses_dict["eos_position_reg"] = eos_reg
+            sumloss = sumloss + self.eos_reg_lambda * eos_reg
+
+        if "promptDistEntropy" in self.losses:
+            prompt_input_logits = input_dict["prompt_input_logits"]  # (batch, seq_len, vocab)
+            probs = torch.softmax(prompt_input_logits, dim=-1)
+            entropy_per_pos = -(probs * torch.log(probs + self.eps)).sum(dim=-1)  # (batch, seq_len)
+            prompt_dist_entropy = entropy_per_pos.mean()
+            losses_dict["prompt_dist_entropy"] = prompt_dist_entropy
+            sumloss = sumloss + self.prompt_dist_entropy_lambda * prompt_dist_entropy
+
+        if "commitmentLoss" in self.losses:
+            prompt_input_logits = input_dict["prompt_input_logits"]
+            _commit_extras = {}
+            commit_loss = compute_commitment_loss(
+                prompt_input_logits,
+                self.embedding_weights_subset,
+                similarity=self.commitment_similarity,
+                eps=self.eps,
+                position_weights=self._commitment_pos_weights,
+                extras_dict=_commit_extras,
+            )
+            losses_dict["commitment_loss"] = commit_loss
+            losses_dict["commitment_loss_pos_mean"] = torch.tensor(_commit_extras["per_pos"].tolist()).mean()
+            losses_dict["commitment_loss_pos_min"] = torch.tensor(_commit_extras["per_pos"].tolist()).min()
+            losses_dict["commitment_loss_pos_max"] = torch.tensor(_commit_extras["per_pos"].tolist()).max()
+            # Per-position unweighted losses (batch-mean MSE at each prompt position)
+            for pos, val in enumerate(_commit_extras["per_pos"].tolist()):
+                losses_dict[f"commitment_loss_pos_{pos}"] = torch.tensor(val)
+            # Position weights (static after init, but logged each step for convenience)
+            if _commit_extras["weights"] is not None:
+                for pos, w in enumerate(_commit_extras["weights"].tolist()):
+                    losses_dict[f"commitment_weight_pos_{pos}"] = torch.tensor(w)
+            sumloss = sumloss + self.commitment_lambda * commit_loss
 
         losses_dict['sumloss'] = sumloss
 
@@ -765,6 +1076,21 @@ def build_fixed_logits_spec(
         )
 
     return fixed_prefix, fixed_suffix, n_free
+
+
+def compute_annealed_temperature(initial, min_temp, epoch, total, schedule):
+    """Decay temperature from `initial` to `min_temp` over `total` steps."""
+    import math
+    if schedule == "none" or total <= 0:
+        return initial
+    t = min(epoch / total, 1.0)
+    if schedule == "linear":
+        return initial + (min_temp - initial) * t
+    # cosine
+    return min_temp + 0.5 * (initial - min_temp) * (1 + math.cos(math.pi * t))
+
+
+# run_discrete_validation_pass and run_embsim_validation_pass are imported from evaluation.py
 
 
 def optimize_inputs(
