@@ -42,6 +42,60 @@ class MetricsAggregator:
             "prompt_bertscore_recall": defaultdict(lambda: defaultdict(list)),
             "prompt_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
         }
+        # Discrete path histories (populated when run_discrete_validation=True)
+        self.discrete_lcs_ratio_by_epoch_by_k = defaultdict(lambda: defaultdict(list))
+        self.discrete_prompt_metrics_by_epoch_by_k = {
+            "prompt_token_accuracy": defaultdict(lambda: defaultdict(list)),
+            "prompt_exact_match": defaultdict(lambda: defaultdict(list)),
+            "prompt_lcs_ratio": defaultdict(lambda: defaultdict(list)),
+            "prompt_cosine_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        self.discrete_semantic_metrics_by_epoch_by_k = {
+            "output_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "output_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "prompt_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        # Embsim path histories (populated when run_discrete_embsim_validation=True)
+        self.embsim_lcs_ratio_by_epoch_by_k = defaultdict(lambda: defaultdict(list))
+        self.embsim_prompt_metrics_by_epoch_by_k = {
+            "prompt_token_accuracy":    defaultdict(lambda: defaultdict(list)),
+            "prompt_exact_match":       defaultdict(lambda: defaultdict(list)),
+            "prompt_lcs_ratio":         defaultdict(lambda: defaultdict(list)),
+            "prompt_cosine_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        self.embsim_semantic_metrics_by_epoch_by_k = {
+            "output_bertscore_f1":            defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_precision":     defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_recall":        defaultdict(lambda: defaultdict(list)),
+            "output_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_f1":            defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_precision":     defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_recall":        defaultdict(lambda: defaultdict(list)),
+            "prompt_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        # all_ path histories (min of soft and discrete)
+        self.all_lcs_ratio_by_epoch_by_k = defaultdict(lambda: defaultdict(list))
+        self.all_prompt_metrics_by_epoch_by_k = {
+            "prompt_token_accuracy": defaultdict(lambda: defaultdict(list)),
+            "prompt_exact_match": defaultdict(lambda: defaultdict(list)),
+            "prompt_lcs_ratio": defaultdict(lambda: defaultdict(list)),
+            "prompt_cosine_similarity": defaultdict(lambda: defaultdict(list)),
+        }
+        self.all_semantic_metrics_by_epoch_by_k = {
+            "output_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "output_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "output_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_f1": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_precision": defaultdict(lambda: defaultdict(list)),
+            "prompt_bertscore_recall": defaultdict(lambda: defaultdict(list)),
+            "prompt_sentencebert_similarity": defaultdict(lambda: defaultdict(list)),
+        }
         
     def add_sample(self, metrics: Dict[str, Any], k_value: Optional[int] = None):
         """
@@ -87,7 +141,16 @@ class MetricsAggregator:
 
     def add_epoch_metrics(self, lcs_ratio_history: List[float], k_value: int,
                           prompt_metrics_history: Optional[Dict[str, List[float]]] = None,
-                          semantic_metrics_history: Optional[Dict[str, List[float]]] = None):
+                          semantic_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          discrete_lcs_ratio_history: Optional[List[float]] = None,
+                          discrete_prompt_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          discrete_semantic_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          all_lcs_ratio_history: Optional[List[float]] = None,
+                          all_prompt_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          all_semantic_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          embsim_lcs_ratio_history: Optional[List[float]] = None,
+                          embsim_prompt_metrics_history: Optional[Dict[str, List[float]]] = None,
+                          embsim_semantic_metrics_history: Optional[Dict[str, List[float]]] = None):
         """
         Add per-epoch lcs_ratio values, prompt metrics, and semantic metrics for a sample.
 
@@ -96,6 +159,12 @@ class MetricsAggregator:
             k_value: The k value for this sample
             prompt_metrics_history: Dict mapping metric_name -> list of values per epoch
             semantic_metrics_history: Dict mapping metric_name -> list of values per epoch (BERT/SentenceBERT)
+            discrete_lcs_ratio_history: Discrete-path lcs_ratio history (run_discrete_validation=True)
+            discrete_prompt_metrics_history: Discrete-path prompt metrics history
+            discrete_semantic_metrics_history: Discrete-path semantic metrics history
+            all_lcs_ratio_history: min(soft, discrete) lcs_ratio history
+            all_prompt_metrics_history: min(soft, discrete) prompt metrics history
+            all_semantic_metrics_history: min(soft, discrete) semantic metrics history
         """
         for epoch, lcs_ratio in enumerate(lcs_ratio_history):
             self.lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
@@ -113,6 +182,51 @@ class MetricsAggregator:
                 if metric_name in self.semantic_metrics_by_epoch_by_k:
                     for epoch, value in enumerate(history):
                         self.semantic_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+
+        # Discrete path
+        if discrete_lcs_ratio_history:
+            for epoch, lcs_ratio in enumerate(discrete_lcs_ratio_history):
+                self.discrete_lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
+        if discrete_prompt_metrics_history:
+            for metric_name, history in discrete_prompt_metrics_history.items():
+                if metric_name in self.discrete_prompt_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.discrete_prompt_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+        if discrete_semantic_metrics_history:
+            for metric_name, history in discrete_semantic_metrics_history.items():
+                if metric_name in self.discrete_semantic_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.discrete_semantic_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+
+        # all_ path
+        if all_lcs_ratio_history:
+            for epoch, lcs_ratio in enumerate(all_lcs_ratio_history):
+                self.all_lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
+        if all_prompt_metrics_history:
+            for metric_name, history in all_prompt_metrics_history.items():
+                if metric_name in self.all_prompt_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.all_prompt_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+        if all_semantic_metrics_history:
+            for metric_name, history in all_semantic_metrics_history.items():
+                if metric_name in self.all_semantic_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.all_semantic_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+
+        # Embsim path
+        if embsim_lcs_ratio_history:
+            for epoch, lcs_ratio in enumerate(embsim_lcs_ratio_history):
+                self.embsim_lcs_ratio_by_epoch_by_k[epoch][k_value].append(lcs_ratio)
+        if embsim_prompt_metrics_history:
+            for metric_name, history in embsim_prompt_metrics_history.items():
+                if metric_name in self.embsim_prompt_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.embsim_prompt_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
+        if embsim_semantic_metrics_history:
+            for metric_name, history in embsim_semantic_metrics_history.items():
+                if metric_name in self.embsim_semantic_metrics_by_epoch_by_k:
+                    for epoch, value in enumerate(history):
+                        self.embsim_semantic_metrics_by_epoch_by_k[metric_name][epoch][k_value].append(value)
 
     def compute_avg_lcs_ratio_by_epoch_by_k(self) -> Dict[int, Dict[int, float]]:
         """
