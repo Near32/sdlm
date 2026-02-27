@@ -6,7 +6,7 @@ Provides a unified interface for SODA optimization with different backends
 (single-target or internal batching).
 """
 
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import Callable, List, Tuple, Dict, Any, Optional, Union
 import torch
 
 
@@ -32,12 +32,13 @@ def soda_optimize_inputs(
     init_strategy: str = "zeros",
     init_std: float = 0.05,
     max_batch_size: int = 285,
-    early_stop_on_exact_match: bool = True,
-    lcs_ratio_threshold: float = 1.0,
+    early_stop_on_exact_match: bool = False,
+    embsim_lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
     ground_truth_prompt_tokens: Optional[List[int]] = None,
+    per_epoch_callback: Optional[Callable] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Union[Tuple[List[int], torch.Tensor, List[float], List[float], Dict[str, List[float]]], Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Unified SODA interface with backend and batching dispatch.
 
@@ -70,7 +71,7 @@ def soda_optimize_inputs(
         init_std: Standard deviation for normal init
         max_batch_size: Max batch size for internal batching
         early_stop_on_exact_match: Stop early on exact match
-        lcs_ratio_threshold: LCS ratio threshold for early stopping
+        embsim_lcs_ratio_threshold: Stop when embsim_lcs_ratio >= threshold (>1.0 = disabled)
         batch_size: Batch size (for compatibility)
         kwargs: Additional keyword arguments
 
@@ -132,9 +133,10 @@ def soda_optimize_inputs(
             init_strategy=init_strategy,
             init_std=init_std,
             early_stop_on_exact_match=early_stop_on_exact_match,
-            lcs_ratio_threshold=lcs_ratio_threshold,
+            embsim_lcs_ratio_threshold=embsim_lcs_ratio_threshold,
             batch_size=batch_size,
             ground_truth_prompt_tokens=ground_truth_prompt_tokens,
+            per_epoch_callback=per_epoch_callback,
             kwargs=kwargs,
         )
 
@@ -181,7 +183,7 @@ def soda_optimize_inputs(
             init_strategy=init_strategy,
             init_std=init_std,
             early_stop_on_exact_match=early_stop_on_exact_match,
-            lcs_ratio_threshold=lcs_ratio_threshold,
+            embsim_lcs_ratio_threshold=embsim_lcs_ratio_threshold,
             batch_size=batch_size,
             model=model,
             ground_truth_prompt_tokens=ground_truth_prompt_tokens,

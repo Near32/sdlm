@@ -44,8 +44,8 @@ def soda_optimize_inputs_tl(
     bias_correction: bool = False,
     init_strategy: str = "zeros",
     init_std: float = 0.05,
-    early_stop_on_exact_match: bool = True,
-    lcs_ratio_threshold: float = 1.0,
+    early_stop_on_exact_match: bool = False,
+    embsim_lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
     model: Optional[Any] = None,  # Pre-loaded model
     ground_truth_prompt_tokens: Optional[List[int]] = None,
@@ -74,7 +74,7 @@ def soda_optimize_inputs_tl(
         init_strategy: Initialization strategy ("zeros" or "normal")
         init_std: Standard deviation for normal initialization
         early_stop_on_exact_match: Stop early if exact match found
-        lcs_ratio_threshold: Stop early if LCS ratio >= threshold
+        embsim_lcs_ratio_threshold: API-consistency placeholder; no-op (no callback in TL path)
         batch_size: Batch size (for compatibility, not used in single-target)
         model: Pre-loaded transformer_lens model (optional)
         kwargs: Additional keyword arguments
@@ -332,10 +332,6 @@ def soda_optimize_inputs_tl(
         is_exact_match = check_exact_match(generated_tokens[0], target_tokens[0])
         if early_stop_on_exact_match and is_exact_match:
             logger.info(f"SODA TL: Exact match found at epoch {epoch + 1}")
-            wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
-            break
-        if lcs_ratio >= lcs_ratio_threshold:
-            logger.info(f"SODA TL: LCS ratio threshold reached at epoch {epoch + 1}")
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
     else:

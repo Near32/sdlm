@@ -6,7 +6,8 @@ using a pre-trained T5-based inverse model with HuggingFace models.
 """
 
 import torch
-from typing import List, Tuple, Dict, Any, Optional
+import torch.nn.functional as F
+from typing import Callable, List, Tuple, Dict, Any, Optional
 import logging
 import copy
 import wandb
@@ -29,8 +30,9 @@ def o2p_optimize_inputs_hf(
     seq_len: int,
     num_beams: int = 4,
     max_length: int = 32,
+    per_epoch_callback: Optional[Callable] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
+) -> Dict[str, Any]:
     """
     O2P prompt reconstruction using HuggingFace models.
 
@@ -52,11 +54,8 @@ def o2p_optimize_inputs_hf(
         kwargs: Additional keyword arguments (for compatibility)
 
     Returns:
-        Tuple of:
-            - generated_tokens: List of generated token IDs (the inverted prompt)
-            - optimized_inputs: Tensor placeholder (zeros, for API compatibility)
-            - losses: Single-element list [0.0] (no iterative loss for O2P)
-            - lcs_ratio_history: Single-element list [final_lcs_ratio]
+        Dict with keys: generated_tokens, optimized_inputs (one-hot of predicted prompt
+        tokens [1, seq_len, vocab_size]), losses ([0.0]), lcs_ratio_history ([final_lcs]).
     """
     kwargs = kwargs or {}
 
@@ -174,6 +173,13 @@ def o2p_optimize_inputs_hf(
         learned_input_str = tokenizer.decode(learned_input_ids, skip_special_tokens=False)
         generated_output_str = tokenizer.decode(generated_tokens_list, skip_special_tokens=False)
 
+    # One-hot encoding of the predicted prompt tokens.
+    # Computed here (before wandb_log) so the per_epoch_callback can use it for embsim.
+    optimized_inputs = F.one_hot(
+        prompt_tokens[0],                   # [seq_len] — already padded to seq_len
+        num_classes=model.config.vocab_size,
+    ).float().unsqueeze(0)                  # [1, seq_len, vocab_size]
+
     # Log to wandb
     wandb_log = {
         "epoch": 1,  # O2P is one-shot
@@ -184,6 +190,13 @@ def o2p_optimize_inputs_hf(
         "o2p_num_beams": num_beams,
         "o2p_max_length": max_length,
     }
+
+    # Per-epoch callback (called once for one-shot O2P, epoch=0) — same interface as SODA/GCG
+    if per_epoch_callback is not None:
+        cb_metrics = per_epoch_callback(0, optimized_inputs)
+        if cb_metrics:
+            wandb_log.update(cb_metrics)
+
     wandb.log(wandb_log)
 
     # Add to wandb table
@@ -204,15 +217,12 @@ def o2p_optimize_inputs_hf(
 
     logger.info(f"O2P: Final LCS ratio: {lcs_ratio:.4f}")
 
-    # Create placeholder tensor for optimized_inputs (for API compatibility)
-    # Use zeros with shape matching expected format
-    optimized_inputs = torch.zeros(
-        1, seq_len, model.config.vocab_size,
-        device=device, dtype=torch.float32
-    )
-
-    # Return single-element history lists for API compatibility
-    return generated_tokens_list, optimized_inputs, [0.0], [lcs_ratio]
+    return {
+        "generated_tokens":  generated_tokens_list,
+        "optimized_inputs":  optimized_inputs,
+        "losses":            [0.0],
+        "lcs_ratio_history": [lcs_ratio],
+    }
 
 
 def clear_o2p_cache():

@@ -6,7 +6,7 @@ Provides a unified interface for GCG optimization with different backends
 (single-target or internal batching).
 """
 
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import Callable, List, Tuple, Dict, Any, Optional, Union
 import torch
 
 
@@ -28,11 +28,12 @@ def gcg_optimize_inputs(
     token_choice: str = "uniform",
     init_strategy: str = "zeros",
     max_batch_size: int = 285,
-    early_stop_on_exact_match: bool = True,
+    early_stop_on_exact_match: bool = False,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
+    per_epoch_callback: Optional[Callable] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Union[Tuple[List[int], torch.Tensor, List[float], List[float]], Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Unified GCG interface with backend and batching dispatch.
 
@@ -121,6 +122,7 @@ def gcg_optimize_inputs(
             early_stop_on_exact_match=early_stop_on_exact_match,
             lcs_ratio_threshold=lcs_ratio_threshold,
             batch_size=batch_size,
+            per_epoch_callback=per_epoch_callback,
             kwargs=kwargs,
         )
 

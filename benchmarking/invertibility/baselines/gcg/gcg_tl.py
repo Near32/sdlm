@@ -37,7 +37,7 @@ def gcg_optimize_inputs_tl(
     pos_choice: str = "uniform",
     token_choice: str = "uniform",
     init_strategy: str = "zeros",
-    early_stop_on_exact_match: bool = True,
+    early_stop_on_exact_match: bool = False,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
     model: Optional[Any] = None,

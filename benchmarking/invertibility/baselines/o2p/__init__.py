@@ -8,7 +8,7 @@ Unlike SODA/GCG which optimize iteratively, O2P uses a pre-trained inverse
 model for one-shot prompt reconstruction.
 """
 
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import Callable, List, Tuple, Dict, Any, Optional, Union
 import torch
 
 
@@ -22,8 +22,9 @@ def o2p_optimize_inputs(
     num_beams: int = 4,
     max_length: int = 32,
     batch_size: int = 1,
+    per_epoch_callback: Optional[Callable] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
+) -> Dict[str, Any]:
     """
     O2P prompt reconstruction using a pre-trained inverse model.
 
@@ -79,6 +80,7 @@ def o2p_optimize_inputs(
         seq_len=seq_len,
         num_beams=num_beams,
         max_length=max_length,
+        per_epoch_callback=per_epoch_callback,
         kwargs=kwargs,
     )
 

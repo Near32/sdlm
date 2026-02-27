@@ -40,7 +40,7 @@ def gcg_optimize_inputs_tl_batch(
     token_choice: str = "uniform",
     init_strategy: str = "zeros",
     max_batch_size: int = 285,
-    early_stop_on_exact_match: bool = True,
+    early_stop_on_exact_match: bool = False,
     model: Optional[Any] = None,
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:

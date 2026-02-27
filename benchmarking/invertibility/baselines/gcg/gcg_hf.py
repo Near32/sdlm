@@ -7,7 +7,7 @@ inversion using the HuggingFace model API.
 
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Callable, List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
 import logging
 import copy
@@ -38,11 +38,12 @@ def gcg_optimize_inputs_hf(
     pos_choice: str = "uniform",
     token_choice: str = "uniform",
     init_strategy: str = "zeros",
-    early_stop_on_exact_match: bool = True,
+    early_stop_on_exact_match: bool = False,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
+    per_epoch_callback: Optional[Callable[[int, torch.Tensor], Dict[str, float]]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], torch.Tensor, List[float], List[float]]:
+) -> Dict[str, Any]:
     """
     Single-target GCG optimization using HuggingFace models.
 
@@ -67,14 +68,14 @@ def gcg_optimize_inputs_hf(
         early_stop_on_exact_match: Stop early if exact match found
         lcs_ratio_threshold: Stop early if LCS ratio >= threshold
         batch_size: Batch size (for compatibility, not used in single-target)
+        per_epoch_callback: Optional callable ``(epoch, logits) -> dict`` invoked at the
+            end of each epoch (before ``wandb.log``). The returned dict is merged into
+            ``wandb_log`` so that extra metrics (e.g. embsim) are logged together.
         kwargs: Additional keyword arguments (for compatibility)
 
     Returns:
-        Tuple of:
-            - generated_tokens: List of generated token IDs
-            - optimized_inputs: One-hot encoding of final tokens
-            - losses: List of loss values per epoch
-            - lcs_ratio_history: List of LCS ratios per epoch
+        Dict with keys: generated_tokens, optimized_inputs (one-hot of final tokens),
+        losses, lcs_ratio_history.
     """
     kwargs = kwargs or {}
 
@@ -192,6 +193,16 @@ def gcg_optimize_inputs_hf(
             "token_overlap_ratio": token_overlap_ratio,
             "target_hit_ratio": target_hit_ratio,
         }
+
+        # Per-epoch callback (e.g. embsim validation) — merges extra metrics into wandb_log
+        # GCG has no soft logits; pass one-hot of current discrete tokens
+        if per_epoch_callback is not None:
+            with torch.no_grad():
+                _cb_one_hot = F.one_hot(pred_tokens, num_classes=vocab_size).float()
+            cb_metrics = per_epoch_callback(epoch, _cb_one_hot)
+            if cb_metrics:
+                wandb_log.update(cb_metrics)
+
         wandb.log(wandb_log)
 
         # Add to wandb table
@@ -295,4 +306,9 @@ def gcg_optimize_inputs_hf(
         # Return one-hot encoding of final tokens
         final_one_hot = F.one_hot(pred_tokens, num_classes=vocab_size).float()
 
-    return generated_tokens_list, final_one_hot, losses, lcs_ratio_history
+    return {
+        "generated_tokens":  generated_tokens_list,
+        "optimized_inputs":  final_one_hot,
+        "losses":            losses,
+        "lcs_ratio_history": lcs_ratio_history,
+    }

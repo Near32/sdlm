@@ -7,7 +7,7 @@ for prompt reconstruction using the HuggingFace model API.
 
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Callable, List, Tuple, Dict, Any, Optional
 from tqdm import tqdm
 import logging
 import copy
@@ -45,12 +45,13 @@ def soda_optimize_inputs_hf(
     bias_correction: bool = False,
     init_strategy: str = "zeros",
     init_std: float = 0.05,
-    early_stop_on_exact_match: bool = True,
-    lcs_ratio_threshold: float = 1.0,
+    early_stop_on_exact_match: bool = False,
+    embsim_lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
     ground_truth_prompt_tokens: Optional[List[int]] = None,
+    per_epoch_callback: Optional[Callable[[int, torch.Tensor], Dict[str, float]]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], torch.Tensor, List[float], List[float], Dict[str, List[float]]]:
+) -> Dict[str, Any]:
     """
     Single-target SODA optimization using HuggingFace models.
 
@@ -76,17 +77,16 @@ def soda_optimize_inputs_hf(
         init_strategy: Initialization strategy ("zeros" or "normal")
         init_std: Standard deviation for normal initialization
         early_stop_on_exact_match: Stop early if exact match found
-        lcs_ratio_threshold: Stop early if LCS ratio >= threshold
+        embsim_lcs_ratio_threshold: Stop early when per-epoch callback embsim_lcs_ratio >= threshold (>1.0 = disabled)
         batch_size: Batch size (for compatibility, not used in single-target)
+        per_epoch_callback: Optional callable ``(epoch, logits) -> dict`` invoked at the
+            end of each epoch (before ``wandb.log``). The returned dict is merged into
+            ``wandb_log`` so that extra metrics (e.g. embsim) are logged together.
         kwargs: Additional keyword arguments (for compatibility)
 
     Returns:
-        Tuple of:
-            - generated_tokens: List of generated token IDs
-            - optimized_inputs: Optimized learnable parameter tensor
-            - losses: List of loss values per epoch
-            - lcs_ratio_history: List of LCS ratios per epoch
-            - prompt_metrics_history: Dict of prompt reconstruction metrics per epoch
+        Dict with keys: generated_tokens, optimized_inputs (raw logits pred_embed_pre),
+        losses, lcs_ratio_history, prompt_metrics_history.
     """
     kwargs = kwargs or {}
 
@@ -298,6 +298,13 @@ def soda_optimize_inputs_hf(
             wandb_log['prompt_lcs_ratio'] = prompt_lcs
             wandb_log['prompt_cosine_similarity'] = cos_sim
 
+        # Per-epoch callback (e.g. embsim validation) — merges extra metrics into wandb_log
+        cb_metrics = None
+        if per_epoch_callback is not None:
+            cb_metrics = per_epoch_callback(epoch, pred_embed_pre)
+            if cb_metrics:
+                wandb_log.update(cb_metrics)
+
         wandb.log(wandb_log)
 
         # Add to wandb table
@@ -328,8 +335,8 @@ def soda_optimize_inputs_hf(
             logger.info(f"SODA: Exact match found at epoch {epoch + 1}")
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
-        if lcs_ratio >= lcs_ratio_threshold:
-            logger.info(f"SODA: LCS ratio threshold reached at epoch {epoch + 1}")
+        if cb_metrics and cb_metrics.get("embsim_lcs_ratio", 0.0) >= embsim_lcs_ratio_threshold:
+            logger.info(f"SODA: embsim LCS ratio threshold reached at epoch {epoch + 1}")
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
             break
     else:
@@ -338,7 +345,7 @@ def soda_optimize_inputs_hf(
 
     # Return final results
     with torch.no_grad():
-        # Get final predictions
+        # Get final predictions (using raw logits; caller uses pred_embed_pre for embsim)
         final_one_hot = torch.softmax(pred_embed_pre / temperature, dim=-1)
         final_pred_tokens = final_one_hot.argmax(dim=-1)
         final_embed = embedding_layer(final_pred_tokens)
@@ -351,4 +358,10 @@ def soda_optimize_inputs_hf(
         final_generated = final_logits[:, seq_len - 1 : seq_len - 1 + target_length, :].argmax(dim=-1)
         generated_tokens_list = final_generated[0].cpu().tolist()
 
-    return generated_tokens_list, final_one_hot, losses, lcs_ratio_history, prompt_metrics_history
+    return {
+        "generated_tokens":       generated_tokens_list,
+        "optimized_inputs":       pred_embed_pre.detach(),  # raw logits (not softmax'd) — avoids double-softmax in embsim
+        "losses":                 losses,
+        "lcs_ratio_history":      lcs_ratio_history,
+        "prompt_metrics_history": prompt_metrics_history,
+    }
