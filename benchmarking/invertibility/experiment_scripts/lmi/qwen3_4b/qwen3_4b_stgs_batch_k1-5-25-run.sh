@@ -1,8 +1,8 @@
 #!/bin/bash
 
-python -m ipdb -c c batch_optimize_main.py  \
+python -m ipdb -c c ../../../batch_optimize_main.py  \
 --model_name="Qwen/Qwen3-4B" \
---dataset_path="data/qwen3-4b_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
+--dataset_path="../../../data/qwen3-4b_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
 --output_dir="results/qwen3-4b_STGS+Soft+LearnTau+SoftBPTT+LearnBTau+BS=16+LR=1e-1+SEED=2_test_k1-5-25-run" \
 --teacher_forcing=True \
 --learning_rate=1.0e-1  \
@@ -32,7 +32,10 @@ python -m ipdb -c c batch_optimize_main.py  \
 --bptt_stgs_hard=False \
 --bptt_learnable_temperature=False \
 --bptt_hidden_state_conditioning=False \
---bptt_temperature=100.0 
+--bptt_temperature=100.0 \
+--run_discrete_embsim_validation=True \
+--embsim_similarity="l2" \
+--embsim_use_input_logits=True
 
 #--target_indices="0,1" 
 #--losses=embxentropy \
