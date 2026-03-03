@@ -653,6 +653,12 @@ def parse_args():
     parser.add_argument("--adaptive_gumbel_noise_min_scale", type=float, default=0.0,
                         help="Minimum noise scale floor for adaptive Gumbel noise")
 
+    # Input-distribution dropout for STGS (opt-in)
+    parser.add_argument("--stgs_dropout", type=float, default=0.0,
+                        help="Dropout rate applied to input logits before Gumbel-softmax sampling "
+                             "(0 = disabled; e.g. 0.2 zeros ~20%% of vocab dims per forward pass). "
+                             "Uses F.dropout, so remaining logits are rescaled by 1/(1-p).")
+
     # Periodic discrete reinitialization (opt-in)
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
                         help="Snap free_logits to discrete projection every N epochs (0 = disabled)")
@@ -665,6 +671,18 @@ def parse_args():
                         help="Multiplicative decay applied to free_logits after each optimizer step "
                              "(0 = disabled; e.g. 0.999 for mild decay). "
                              "Shrinks logit magnitudes exponentially toward zero.")
+
+    # PPO-KL distributional trust-region parameters
+    parser.add_argument("--ppo_kl_lambda", type=float, default=0.0,
+                        help="Weight for PPO-KL trust-region regularizer (0 = disabled)")
+    parser.add_argument("--ppo_kl_mode", type=str, default="soft",
+                        choices=["soft", "hinge"],
+                        help="'soft': penalize all KL divergence from reference; "
+                             "'hinge': penalize only when per-position KL > ppo_kl_epsilon (PPO-clip analogue)")
+    parser.add_argument("--ppo_kl_epsilon", type=float, default=0.0,
+                        help="KL divergence threshold for hinge mode (ignored in soft mode)")
+    parser.add_argument("--ppo_ref_update_period", type=int, default=10,
+                        help="Update the PPO reference snapshot every N epochs (0 = never update after init)")
 
     # Learnable prompt length (differentiable soft masking toward EoS)
     parser.add_argument("--prompt_length_learnable", type=str2bool, default=False,
