@@ -339,7 +339,9 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         adaptive_gumbel_noise=config.get("adaptive_gumbel_noise", False),
         adaptive_gumbel_noise_beta=config.get("adaptive_gumbel_noise_beta", 0.9),
         adaptive_gumbel_noise_min_scale=config.get("adaptive_gumbel_noise_min_scale", 0.0),
-        stgs_dropout=config.get("stgs_dropout", 0.0),
+        stgs_input_dropout=config.get("stgs_input_dropout", 0.0),
+        stgs_output_dropout=config.get("stgs_output_dropout", 0.0),
+        logits_lora_rank=config.get("logits_lora_rank", 0),
         # Learnable prompt length
         prompt_length_learnable=config.get("prompt_length_learnable", False),
         prompt_length_alpha_init=config.get("prompt_length_alpha_init", 0.0),
@@ -1209,11 +1211,18 @@ def parse_args():
     parser.add_argument("--adaptive_gumbel_noise_min_scale", type=float, default=0.0,
                         help="Minimum noise scale floor for adaptive Gumbel noise")
 
-    # Input-distribution dropout for STGS (opt-in)
-    parser.add_argument("--stgs_dropout", type=float, default=0.0,
-                        help="Dropout rate applied to input logits before Gumbel-softmax sampling "
-                             "(0 = disabled; e.g. 0.2 zeros ~20%% of vocab dims per forward pass). "
-                             "Uses F.dropout, so remaining logits are rescaled by 1/(1-p).")
+    # Pre/post-STGS dropout (opt-in)
+    parser.add_argument("--stgs_input_dropout", type=float, default=0.0,
+                        help="Dropout applied to input logits before Gumbel-softmax sampling "
+                             "(0 = disabled). F.dropout zeros ~p of vocab dims and rescales by 1/(1-p).")
+    parser.add_argument("--stgs_output_dropout", type=float, default=0.0,
+                        help="Dropout applied to y_soft (after softmax, before hard sampling) "
+                             "(0 = disabled). F.dropout zeros ~p of prob entries and rescales by 1/(1-p).")
+
+    # LoRA-factored prompt logits (opt-in)
+    parser.add_argument("--logits_lora_rank", type=int, default=0,
+                        help="LoRA rank for prompt logit factorisation (0 = disabled, "
+                             "uses standard free_logits; >0 uses A@B decomposition).")
 
     # Periodic discrete reinitialization (opt-in)
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
