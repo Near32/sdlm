@@ -271,6 +271,36 @@ def compute_commitment_loss(
         return per_pos.mean()                                        # original behaviour
 
 
+def compute_ppo_kl_loss(
+    free_logits: torch.Tensor,          # (1, n_free, vocab)
+    ref_logits: torch.Tensor,           # (1, n_free, vocab) — detached snapshot
+    temperature: float,
+    mode: str = "soft",                 # "soft" | "hinge"
+    epsilon: float = 0.0,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """
+    Distributional trust-region penalty (PPO-KL analog) for the STGS path.
+
+    Computes KL(p_old || p_new) per free-logit position, then aggregates:
+      soft:  mean_j KL_j
+      hinge: mean_j ReLU(KL_j - epsilon)   [PPO-clip semantic: no penalty inside trust region]
+
+    Returns scalar loss (0.0 tensor if ref_logits is None).
+    """
+    p_old = torch.softmax(ref_logits / temperature, dim=-1)   # (1, n_free, vocab) — no grad
+    p_new = torch.softmax(free_logits / temperature, dim=-1)  # (1, n_free, vocab) — has grad
+
+    # KL(p_old || p_new) = sum_k p_old * log(p_old / p_new)
+    kl_per_pos = (p_old * (torch.log(p_old + eps) - torch.log(p_new + eps))).sum(dim=-1)  # (1, n_free)
+    kl_mean = kl_per_pos.mean()  # scalar
+
+    if mode == "hinge":
+        return torch.relu(kl_mean - epsilon)
+    else:  # "soft"
+        return kl_mean
+
+
 def make_commitment_position_weights(
     seq_len: int,
     schedule: str = "uniform",
@@ -1212,6 +1242,8 @@ def optimize_inputs(
     adaptive_gumbel_noise: bool = False,
     adaptive_gumbel_noise_beta: float = 0.9,
     adaptive_gumbel_noise_min_scale: float = 0.0,
+    # Input-distribution dropout for STGS (applied to logits before Gumbel noise)
+    stgs_dropout: float = 0.0,
     # Learnable prompt length via soft EoS masking
     prompt_length_learnable: bool = False,
     prompt_length_alpha_init: float = 0.0,
@@ -1221,6 +1253,11 @@ def optimize_inputs(
     prompt_length_mask_eos_attention: bool = False,
     # Exponential logit weight decay (multiplicative, applied after each optimizer step)
     logit_decay: float = 0.0,  # 0 = disabled; e.g. 0.999 for mild decay
+    # PPO-KL distributional trust-region regularizer
+    ppo_kl_lambda: float = 0.0,          # 0 = disabled
+    ppo_kl_mode: str = "soft",           # "soft" | "hinge"
+    ppo_kl_epsilon: float = 0.0,         # KL threshold for hinge mode
+    ppo_ref_update_period: int = 10,     # refresh reference every N epochs (0 = never)
     kwargs={},
 ):
     """
@@ -1692,6 +1729,7 @@ def optimize_inputs(
             learnable_temperature=learnable_temperature,
             nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
             logits_normalize=logits_normalize,
+            input_dropout=stgs_dropout,
             eps=eps,
             device=device,
         )
@@ -1829,6 +1867,9 @@ def optimize_inputs(
     if stgs_module is not None:
         stgs_module.gumbel_noise_scale = gumbel_noise_scale
 
+    # PPO-KL trust region state
+    _ppo_ref_logits: Optional[torch.Tensor] = None
+
     pbar = tqdm(range(epochs))
     for epoch in pbar:
         optimizer.zero_grad()
@@ -1879,6 +1920,24 @@ def optimize_inputs(
             else:
                 effective_scale = gumbel_noise_scale
             stgs_module.gumbel_noise_scale = effective_scale
+
+        # PPO-KL distributional trust-region term
+        if ppo_kl_lambda > 0.0:
+            # Lazily initialize reference on first epoch
+            if _ppo_ref_logits is None:
+                _ppo_ref_logits = free_logits.detach().clone()
+
+            # Effective temperature: use STGS module's current temperature
+            _eff_tau = float(stgs_module.init_temperature) if stgs_module is not None else temperature
+
+            ppo_kl = compute_ppo_kl_loss(
+                free_logits=free_logits,
+                ref_logits=_ppo_ref_logits,
+                temperature=_eff_tau,
+                mode=ppo_kl_mode,
+                epsilon=ppo_kl_epsilon,
+            )
+            backward_loss = backward_loss + ppo_kl_lambda * ppo_kl
 
         backward_loss.backward()
 
@@ -2004,6 +2063,11 @@ def optimize_inputs(
             with torch.no_grad():
                 free_logits.data.mul_(logit_decay)
 
+        # Roll reference snapshot every ppo_ref_update_period epochs
+        if ppo_kl_lambda > 0.0 and ppo_ref_update_period > 0:
+            if (epoch + 1) % ppo_ref_update_period == 0:
+                _ppo_ref_logits = free_logits.detach().clone()
+
         # Periodic discrete reinitialization
         if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
             prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
@@ -2061,6 +2125,7 @@ def optimize_inputs(
             "grad_norm": grad_norm,
             "grad_std": grad_std,
             "vocab_size": model.config.vocab_size,
+            "ppo_kl_loss": ppo_kl.item() if ppo_kl_lambda > 0.0 else 0.0,
         }
 
         for k, v in losses_dict.items():
