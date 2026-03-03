@@ -5,7 +5,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --model_name="Qwen/Qwen3-0.6B" \
 --dataset_path="../../../data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
 --output_dir="results/qwen3-600m-base_STGS+Soft+LearnTau+SoftBPTT+LearnBTau+BS=16+LR=1e-1+SEED=2_test_k1-5-25-run" \
---learning_rate=1.0e-2  \
+--learning_rate=1.0e-1  \
 --epochs 8192 \
 --model_precision full \
 --gradient_checkpointing=False \
@@ -29,7 +29,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --stgs_grad_bias_reference_reward_scale=1.0 \
 --stgs_grad_bias_reference_baseline_beta=0.9 \
 \
---batch_size=8 \
+--batch_size=128 \
 --seed=10 \
 --num_workers=1 \
 \
@@ -38,18 +38,24 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --stgs_hard=True \
 --stgs_hard_method="embsim-l2" \
 --stgs_hard_embsim_probs="gumbel_soft" \
---logits_normalize="zscore" \
+--logits_normalize="none" \
 --logits_top_k=0 \
 --logits_top_p=1.0 \
 --logit_decay=1.0 \
---learnable_temperature=True \
---decouple_learnable_temperature=True \
---temperature=100.0 \
+--learnable_temperature=False \
+--decouple_learnable_temperature=False \
+--temperature=0.1 \
 \
 --gumbel_noise_scale=1.0 \
 --adaptive_gumbel_noise=False \
 --adaptive_gumbel_noise_beta=0.9 \
 --adaptive_gumbel_noise_min_scale=0.0 \
+--stgs_dropout=0.0 \
+\
+--ppo_kl_lambda=0.0 \
+--ppo_kl_mode="soft" \
+--ppo_kl_epsilon=0.1 \
+--ppo_ref_update_period=16 \
 \
 --commitmentLambda=0.0 \
 --commitment_pos_weight_schedule="uniform" \
@@ -80,7 +86,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --embsim_use_input_logits=True \
 --embsim_temperature=0.01 \
 \
---temperature_anneal_schedule="cosine" \
+--temperature_anneal_schedule="none" \
 --temperature_anneal_min=0.05 \
 --temperature_anneal_epochs=2000 \
 --temperatureAnnealRegLambda=0.01 \
