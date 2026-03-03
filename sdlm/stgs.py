@@ -33,6 +33,7 @@ class STGS(nn.Module):
         nbr_learnable_temperatures: Optional[int] = None,
         conditioning_dim: int = 0,
         dropout: float = 0.0,
+        input_dropout: float = 0.0,
         stgs_hard_method: str = "categorical",
         stgs_hard_embsim_probs: str = "gumbel_soft",
         logits_normalize: str = "none",   # "none" | "center" | "zscore"
@@ -55,6 +56,8 @@ class STGS(nn.Module):
         self.conditioning_dim = conditioning_dim
         self.dropout = dropout
         assert 0 <= self.dropout <= 1, "Dropout rate must be between 0 and 1"
+        self.input_dropout = input_dropout
+        assert 0.0 <= self.input_dropout < 1.0, "input_dropout must be in [0, 1)"
         self.eps = eps
         self.device = device
         self.tokenizer = tokenizer
@@ -76,6 +79,7 @@ class STGS(nn.Module):
         dropout: Optional[float] = None,
         temperature_param_indices: Optional[List[int]] = None,
         gumbel_noise_scale: float = 1.0,
+        input_dropout: Optional[float] = None,
         embedding_weights: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -136,6 +140,11 @@ class STGS(nn.Module):
             if self.logits_normalize == "zscore":
                 std = x.std(dim=-1, keepdim=True)
                 x = x / (std + self.eps)
+
+        # Input-distribution dropout: randomly zero vocab-dimension logits before Gumbel noise
+        eff_input_dropout = self.input_dropout if input_dropout is None else input_dropout
+        if eff_input_dropout > 0.0:
+            x = F.dropout(x, p=eff_input_dropout, training=self.training)
 
         # Gumbel-Softmax sampling
         with torch.no_grad():

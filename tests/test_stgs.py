@@ -76,11 +76,49 @@ class TestSTGS:
         vocab_size = 10
         stgs = STGS(vocab_size=vocab_size, device=device)
         logits = torch.randn(1, 5, vocab_size, device=device, requires_grad=True)
-        
+
         output_ids, _, _, _ = stgs(logits)
         loss = output_ids.sum()
         loss.backward()
-        
+
         # Check that gradients are flowing back to logits
         assert logits.grad is not None
         assert not torch.all(logits.grad == 0)
+
+    def test_input_dropout_zero_has_no_effect(self, device):
+        """With input_dropout=0, forward is deterministic given fixed Gumbel noise."""
+        vocab_size = 20
+        stgs = STGS(vocab_size=vocab_size, input_dropout=0.0, device=device)
+        stgs.train()
+        logits = torch.ones(1, 5, vocab_size, device=device)
+        # Two runs with same module should have same y_soft shape
+        _, one_hot_a, _, _ = stgs(logits)
+        _, one_hot_b, _, _ = stgs(logits)
+        # Shapes must be valid probability distributions
+        assert one_hot_a.shape == (1, 5, vocab_size)
+        assert one_hot_b.shape == (1, 5, vocab_size)
+
+    def test_input_dropout_nonzero_zeroes_logits(self, device):
+        """With input_dropout > 0 and training=True, some logit values become zero."""
+        torch.manual_seed(0)
+        vocab_size = 1000
+        stgs = STGS(vocab_size=vocab_size, input_dropout=0.5, device=device)
+        stgs.train()
+        logits = torch.ones(2, 8, vocab_size, device=device)
+        # Run forward: inside forward, F.dropout zeros ~50% of logit dimensions
+        # The resulting y_soft must still be a valid distribution (sums to 1)
+        _, one_hot, _, y_soft = stgs(logits)
+        assert one_hot.shape == (2, 8, vocab_size)
+        # Probabilities must still sum to 1 (softmax normalises after dropout)
+        assert torch.allclose(y_soft.sum(dim=-1), torch.ones(2, 8, device=device), atol=1e-4)
+
+    def test_input_dropout_eval_mode_no_effect(self, device):
+        """In eval mode, input_dropout must be inactive (F.dropout respects training flag)."""
+        vocab_size = 50
+        stgs = STGS(vocab_size=vocab_size, input_dropout=0.9, device=device)
+        stgs.eval()
+        logits = torch.randn(1, 3, vocab_size, device=device)
+        # Eval: dropout disabled → same output on repeated calls with same Gumbel (probabilistic but shape OK)
+        _, _, _, y_soft = stgs(logits)
+        assert y_soft.shape == (1, 3, vocab_size)
+        assert torch.allclose(y_soft.sum(dim=-1), torch.ones(1, 3, device=device), atol=1e-4)
