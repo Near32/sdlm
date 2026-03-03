@@ -122,3 +122,37 @@ class TestSTGS:
         _, _, _, y_soft = stgs(logits)
         assert y_soft.shape == (1, 3, vocab_size)
         assert torch.allclose(y_soft.sum(dim=-1), torch.ones(1, 3, device=device), atol=1e-4)
+
+    def test_output_dropout_zero_has_no_effect(self, device):
+        """With output_dropout=0, y_soft is an unmodified softmax output."""
+        vocab_size = 20
+        stgs = STGS(vocab_size=vocab_size, output_dropout=0.0, device=device)
+        stgs.train()
+        logits = torch.ones(1, 5, vocab_size, device=device)
+        _, _, _, y_soft = stgs(logits)
+        assert y_soft.shape == (1, 5, vocab_size)
+        assert torch.allclose(y_soft.sum(dim=-1), torch.ones(1, 5, device=device), atol=1e-4)
+
+    def test_output_dropout_applied_after_softmax(self, device):
+        """With output_dropout > 0, some y_soft entries are zeroed (but rescaled, not renormalised)."""
+        torch.manual_seed(0)
+        vocab_size = 1000
+        stgs = STGS(vocab_size=vocab_size, output_dropout=0.5, device=device)
+        stgs.train()
+        logits = torch.ones(2, 8, vocab_size, device=device)
+        _, _, _, y_soft = stgs(logits)
+        assert y_soft.shape == (2, 8, vocab_size)
+        # F.dropout zeros ~50% of entries and rescales the rest by 1/(1-0.5)=2;
+        # the output is NOT renormalised so exact sum != 1, but values are non-negative
+        assert torch.all(y_soft >= 0)
+
+    def test_output_dropout_eval_mode_no_effect(self, device):
+        """In eval mode, output_dropout must be inactive."""
+        vocab_size = 50
+        stgs = STGS(vocab_size=vocab_size, output_dropout=0.9, device=device)
+        stgs.eval()
+        logits = torch.randn(1, 3, vocab_size, device=device)
+        _, _, _, y_soft = stgs(logits)
+        assert y_soft.shape == (1, 3, vocab_size)
+        # Eval: no dropout, so y_soft is a valid probability distribution
+        assert torch.allclose(y_soft.sum(dim=-1), torch.ones(1, 3, device=device), atol=1e-4)

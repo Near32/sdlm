@@ -34,6 +34,7 @@ class STGS(nn.Module):
         conditioning_dim: int = 0,
         dropout: float = 0.0,
         input_dropout: float = 0.0,
+        output_dropout: float = 0.0,
         stgs_hard_method: str = "categorical",
         stgs_hard_embsim_probs: str = "gumbel_soft",
         logits_normalize: str = "none",   # "none" | "center" | "zscore"
@@ -58,6 +59,8 @@ class STGS(nn.Module):
         assert 0 <= self.dropout <= 1, "Dropout rate must be between 0 and 1"
         self.input_dropout = input_dropout
         assert 0.0 <= self.input_dropout < 1.0, "input_dropout must be in [0, 1)"
+        self.output_dropout = output_dropout
+        assert 0.0 <= self.output_dropout < 1.0, "output_dropout must be in [0, 1)"
         self.eps = eps
         self.device = device
         self.tokenizer = tokenizer
@@ -80,6 +83,7 @@ class STGS(nn.Module):
         temperature_param_indices: Optional[List[int]] = None,
         gumbel_noise_scale: float = 1.0,
         input_dropout: Optional[float] = None,
+        output_dropout: Optional[float] = None,
         embedding_weights: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -159,6 +163,11 @@ class STGS(nn.Module):
         y_soft = F.softmax(gumbel_logits / eff_temperature, dim=-1)
         # temperary float conversion to prevent from underflow and breaking Simplex assumption
         # batch_size x seq_len x vocab_size
+
+        # Post-softmax dropout: randomly zero vocab-dimension probabilities before hard sampling
+        eff_output_dropout = self.output_dropout if output_dropout is None else output_dropout
+        if eff_output_dropout > 0.0:
+            y_soft = F.dropout(y_soft, p=eff_output_dropout, training=self.training)
 
         # Sampling from batched distribution y_soft:
         if self.stgs_hard_method in ("embsim-dot", "embsim-cos", "embsim-l2") and embedding_weights is not None:
