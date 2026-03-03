@@ -183,6 +183,42 @@ def initialize_learnable_inputs(
 
     return logits.detach().requires_grad_(True)
 
+
+def initialize_lora_logits(seq_len, vocab_size, rank, device,
+                            init_strategy="randn", **init_kwargs):
+    """
+    Return (lora_A, lora_B) where effective_logits = lora_A @ lora_B.
+    Shapes: lora_A (1, seq_len, rank), lora_B (1, rank, vocab_size).
+
+    For 'zeros'/'randn'/'normal' init_strategy: standard LoRA init (A ~ N(0,1/sqrt(r)), B=0)
+    so the effective logits start at 0 (uniform distribution).
+
+    For all other strategies: call initialize_learnable_inputs to get a full
+    (1, seq_len, vocab_size) tensor, then compute the best rank-r SVD
+    approximation to seed A and B.
+    """
+    if init_strategy in ("zeros", "randn", "normal"):
+        std = 1.0 / (rank ** 0.5)
+        lora_A = (torch.randn(1, seq_len, rank, device=device) * std
+                  ).detach().requires_grad_(True)
+        lora_B = torch.zeros(1, rank, vocab_size, device=device
+                             ).detach().requires_grad_(True)
+    else:
+        # Compute full logits from the requested strategy, then SVD-factorize.
+        full_logits = initialize_learnable_inputs(
+            vocab_size, seq_len, device, init_strategy=init_strategy, **init_kwargs
+        )  # (1, seq_len, vocab_size), detached
+        mat = full_logits.squeeze(0).float()  # (seq_len, vocab_size)
+        U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+        r = min(rank, S.shape[0])
+        sq = S[:r].sqrt()
+        A = (U[:, :r] * sq.unsqueeze(0)).to(device)   # (seq_len, r)
+        B = (sq.unsqueeze(1) * Vh[:r, :]).to(device)  # (r, vocab_size)
+        lora_A = A.unsqueeze(0).detach().to(full_logits.dtype).requires_grad_(True)
+        lora_B = B.unsqueeze(0).detach().to(full_logits.dtype).requires_grad_(True)
+    return lora_A, lora_B
+
+
 def filter_vocabulary(embedding_weights, seed_vector, target_token_ids, threshold=0.5):
     """
     Compute cosine similarities between each vocabulary token embedding and seed_vector.
@@ -392,6 +428,38 @@ def snap_free_logits(
                              device=free_logits.device, dtype=free_logits.dtype)
     new_logits.scatter_(-1, free_snapped.expand(batch_size, -1).unsqueeze(-1), spike_value)
     free_logits.data.copy_(new_logits)
+
+
+def snap_lora_logits(lora_A, lora_B, current_logits, embedding_weights,
+                     n_free, prefix_len, snap_method, optimizer,
+                     spike_value=10.0, eps=1e-8):
+    """
+    Re-express a snapped one-hot logit matrix as a rank-r LoRA factorisation.
+    Reuses the token-selection logic of snap_free_logits, then SVD-factorizes the
+    spiked target matrix into lora_A and lora_B in-place.
+    """
+    rank = lora_A.shape[-1]
+    vocab_size = lora_B.shape[-1]
+    tmp = torch.zeros(1, n_free, vocab_size, device=lora_A.device, dtype=lora_A.dtype,
+                      requires_grad=False)
+    snap_free_logits(tmp, current_logits, embedding_weights,
+                     n_free, prefix_len, snap_method, spike_value, eps)
+    # tmp now holds the spiked target (1, n_free, vocab_size)
+
+    # SVD-factorize the spiked matrix
+    mat = tmp.squeeze(0).float()       # (n_free, vocab_size)
+    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    r = min(rank, S.shape[0])
+    sq = S[:r].sqrt()
+    A = (U[:, :r] * sq.unsqueeze(0)).to(lora_A.dtype)  # (n_free, r)
+    B = (sq.unsqueeze(1) * Vh[:r, :]).to(lora_B.dtype) # (r, vocab_size)
+
+    # Write in-place and reset Adam state
+    lora_A.data.copy_(A.unsqueeze(0))
+    lora_B.data.copy_(B.unsqueeze(0))
+    if optimizer is not None:
+        optimizer.state[lora_A] = {}
+        optimizer.state[lora_B] = {}
 
 
 def generate_completions(model, input_embeddings, target_length, temperature=1.0, pre_prompt=None):
@@ -1242,8 +1310,9 @@ def optimize_inputs(
     adaptive_gumbel_noise: bool = False,
     adaptive_gumbel_noise_beta: float = 0.9,
     adaptive_gumbel_noise_min_scale: float = 0.0,
-    # Input-distribution dropout for STGS (applied to logits before Gumbel noise)
-    stgs_dropout: float = 0.0,
+    # Input- and output-distribution dropout for STGS
+    stgs_input_dropout: float = 0.0,
+    stgs_output_dropout: float = 0.0,
     # Learnable prompt length via soft EoS masking
     prompt_length_learnable: bool = False,
     prompt_length_alpha_init: float = 0.0,
@@ -1258,6 +1327,8 @@ def optimize_inputs(
     ppo_kl_mode: str = "soft",           # "soft" | "hinge"
     ppo_kl_epsilon: float = 0.0,         # KL threshold for hinge mode
     ppo_ref_update_period: int = 10,     # refresh reference every N epochs (0 = never)
+    # LoRA-factored prompt logits (opt-in)
+    logits_lora_rank: int = 0,           # 0 = disabled; >0 uses A@B decomposition
     kwargs={},
 ):
     """
@@ -1612,21 +1683,40 @@ def optimize_inputs(
 
     # Initialize learnable inputs (free positions only; fixed parts are separate)
     parameters = []
-    free_logits = initialize_learnable_inputs(
-        allowed_vocab_size, n_free, device,
-        init_strategy=init_strategy,
-        init_std=init_std,
-        embedding_weights=embedding_weights_subset,
-        target_token_ids=target_tokens_mapped[0],
-        model=model,
-        target_input_ids=target_tokens,
-        allowed_tokens=allowed_tokens,
-        mlm_model_name=init_mlm_model,
-        mlm_top_k=init_mlm_top_k,
-        target_text=target_text,
-        tokenizer=tokenizer,
-    )
-    parameters.append(free_logits)
+    lora_A = lora_B = None
+    if logits_lora_rank > 0:
+        lora_A, lora_B = initialize_lora_logits(
+            n_free, allowed_vocab_size, logits_lora_rank, device,
+            init_strategy=init_strategy,
+            init_std=init_std,
+            embedding_weights=embedding_weights_subset,
+            target_token_ids=target_tokens_mapped[0],
+            model=model,
+            target_input_ids=target_tokens,
+            allowed_tokens=allowed_tokens,
+            mlm_model_name=init_mlm_model,
+            mlm_top_k=init_mlm_top_k,
+            target_text=target_text,
+            tokenizer=tokenizer,
+        )
+        parameters.extend([lora_A, lora_B])
+        free_logits = None   # sentinel: LoRA path
+    else:
+        free_logits = initialize_learnable_inputs(
+            allowed_vocab_size, n_free, device,
+            init_strategy=init_strategy,
+            init_std=init_std,
+            embedding_weights=embedding_weights_subset,
+            target_token_ids=target_tokens_mapped[0],
+            model=model,
+            target_input_ids=target_tokens,
+            allowed_tokens=allowed_tokens,
+            mlm_model_name=init_mlm_model,
+            mlm_top_k=init_mlm_top_k,
+            target_text=target_text,
+            tokenizer=tokenizer,
+        )
+        parameters.append(free_logits)
 
     # --- Learnable prompt length via soft EoS masking ---
     length_alpha = None
@@ -1662,25 +1752,29 @@ def optimize_inputs(
 
     # Assembly function: build the full (1, seq_len, allowed_vocab_size) logits each step.
     # When no fixed parts exist and learnable length is disabled, returns free_logits directly (zero overhead).
+    def _free():
+        """Return the raw free logits tensor (LoRA product or bare free_logits)."""
+        return lora_A @ lora_B if lora_A is not None else free_logits
+
     if fixed_prefix is None and fixed_suffix is None:
         def assemble_logits():
             if length_alpha is None:
-                return free_logits
+                return _free()
             lambda_t = n_free * torch.sigmoid(length_alpha)
             i_vals = torch.arange(n_free, 0, -1, device=device, dtype=lambda_t.dtype)
             gates = torch.sigmoid(prompt_length_beta * (lambda_t - i_vals))
             gates_3d = gates.unsqueeze(0).unsqueeze(-1)
-            return gates_3d * free_logits + (1.0 - gates_3d) * eos_logit_template
+            return gates_3d * _free() + (1.0 - gates_3d) * eos_logit_template
     else:
         def assemble_logits():
             if length_alpha is None:
-                active_free = free_logits
+                active_free = _free()
             else:
                 lambda_t = n_free * torch.sigmoid(length_alpha)
                 i_vals = torch.arange(n_free, 0, -1, device=device, dtype=lambda_t.dtype)
                 gates = torch.sigmoid(prompt_length_beta * (lambda_t - i_vals))
                 gates_3d = gates.unsqueeze(0).unsqueeze(-1)
-                active_free = gates_3d * free_logits + (1.0 - gates_3d) * eos_logit_template
+                active_free = gates_3d * _free() + (1.0 - gates_3d) * eos_logit_template
             parts = []
             if fixed_prefix is not None:
                 parts.append(fixed_prefix)
@@ -1729,7 +1823,8 @@ def optimize_inputs(
             learnable_temperature=learnable_temperature,
             nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
             logits_normalize=logits_normalize,
-            input_dropout=stgs_dropout,
+            input_dropout=stgs_input_dropout,
+            output_dropout=stgs_output_dropout,
             eps=eps,
             device=device,
         )
@@ -1925,13 +2020,13 @@ def optimize_inputs(
         if ppo_kl_lambda > 0.0:
             # Lazily initialize reference on first epoch
             if _ppo_ref_logits is None:
-                _ppo_ref_logits = free_logits.detach().clone()
+                _ppo_ref_logits = assemble_logits().detach().clone()
 
             # Effective temperature: use STGS module's current temperature
             _eff_tau = float(stgs_module.init_temperature) if stgs_module is not None else temperature
 
             ppo_kl = compute_ppo_kl_loss(
-                free_logits=free_logits,
+                free_logits=assemble_logits(),
                 ref_logits=_ppo_ref_logits,
                 temperature=_eff_tau,
                 mode=ppo_kl_mode,
@@ -1961,8 +2056,19 @@ def optimize_inputs(
                 and (epoch % stgs_grad_bias_period == 0)
             )
 
+            # Grad variance/bias estimation requires a single leaf tensor with .grad;
+            # skip both when using LoRA factorisation (Jacobian recovery is deferred).
+            if lora_A is not None and (measure_grad_variance or measure_grad_bias):
+                logging.warning(
+                    "Gradient variance/bias estimation is not supported for LoRA logits "
+                    "(requires a single flat leaf tensor). Skipping this epoch."
+                )
+                measure_grad_variance = False
+                measure_grad_bias = False
+
             need_baseline_grad = (
                 (measure_grad_variance or measure_grad_bias)
+                and free_logits is not None
                 and free_logits.grad is not None
             )
             baseline_grad = None
@@ -2037,7 +2143,7 @@ def optimize_inputs(
                 and (epoch % reinforce_grad_variance_period == 0)
             )
             baseline_grad = None
-            if measure_grad_variance and free_logits.grad is not None:
+            if measure_grad_variance and free_logits is not None and free_logits.grad is not None:
                 baseline_grad = free_logits.grad.detach().clone()
             if measure_grad_variance and baseline_grad is not None:
                 estimator_metrics.update(
@@ -2061,26 +2167,42 @@ def optimize_inputs(
         # Exponential logit weight decay
         if logit_decay > 0.0:
             with torch.no_grad():
-                free_logits.data.mul_(logit_decay)
+                if lora_A is not None:
+                    lora_A.data.mul_(logit_decay)
+                    lora_B.data.mul_(logit_decay)
+                else:
+                    free_logits.data.mul_(logit_decay)
 
         # Roll reference snapshot every ppo_ref_update_period epochs
         if ppo_kl_lambda > 0.0 and ppo_ref_update_period > 0:
             if (epoch + 1) % ppo_ref_update_period == 0:
-                _ppo_ref_logits = free_logits.detach().clone()
+                _ppo_ref_logits = assemble_logits().detach().clone()
 
         # Periodic discrete reinitialization
         if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
             prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
             with torch.no_grad():
-                snap_free_logits(
-                    free_logits=free_logits,
-                    current_logits=assemble_logits().detach(),
-                    embedding_weights=embedding_weights_subset,
-                    n_free=n_free,
-                    prefix_len=prefix_len,
-                    snap_method=discrete_reinit_snap,
-                )
-            optimizer.state[free_logits] = {}   # reset momentum for a clean restart
+                if lora_A is not None:
+                    snap_lora_logits(
+                        lora_A=lora_A,
+                        lora_B=lora_B,
+                        current_logits=assemble_logits().detach(),
+                        embedding_weights=embedding_weights_subset,
+                        n_free=n_free,
+                        prefix_len=prefix_len,
+                        snap_method=discrete_reinit_snap,
+                        optimizer=optimizer,
+                    )
+                else:
+                    snap_free_logits(
+                        free_logits=free_logits,
+                        current_logits=assemble_logits().detach(),
+                        embedding_weights=embedding_weights_subset,
+                        n_free=n_free,
+                        prefix_len=prefix_len,
+                        snap_method=discrete_reinit_snap,
+                    )
+                    optimizer.state[free_logits] = {}   # reset momentum for a clean restart
 
         # Temperature annealing (only when not learnable_temperature)
         if temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
@@ -2088,7 +2210,9 @@ def optimize_inputs(
             stgs_module.init_temperature = compute_annealed_temperature(
                 temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule)
 
-        grad_tensor = free_logits.grad
+        # For gradient logging: use lora_A grad for LoRA path, free_logits grad otherwise.
+        _grad_leaf = lora_A if lora_A is not None else free_logits
+        grad_tensor = _grad_leaf.grad if _grad_leaf is not None else None
         grad_norm = grad_tensor.norm().item() if grad_tensor is not None else 0.0
         non_zero_grads = int((grad_tensor != 0).sum().item()) if grad_tensor is not None else 0
         grad_mean = grad_tensor.mean().item() if grad_tensor is not None else 0.0
