@@ -29,28 +29,30 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --stgs_grad_bias_reference_reward_scale=1.0 \
 --stgs_grad_bias_reference_baseline_beta=0.9 \
 \
---batch_size=128 \
+--batch_size=32 \
 --seed=10 \
 --num_workers=1 \
 \
 --seq_len=10 \
 \
---stgs_hard=True \
+--stgs_hard=False \
 --stgs_hard_method="embsim-l2" \
 --stgs_hard_embsim_probs="gumbel_soft" \
 --logits_normalize="none" \
 --logits_top_k=0 \
 --logits_top_p=1.0 \
---logit_decay=1.0 \
---learnable_temperature=False \
---decouple_learnable_temperature=False \
---temperature=0.1 \
+--logit_decay=0.0 \
+--learnable_temperature=True \
+--decouple_learnable_temperature=True \
+--temperature=100.0 \
 \
+--logits_lora_rank=4 \
+--stgs_input_dropout=0.0 \
+--stgs_output_dropout=0.0 \
 --gumbel_noise_scale=1.0 \
 --adaptive_gumbel_noise=False \
 --adaptive_gumbel_noise_beta=0.9 \
 --adaptive_gumbel_noise_min_scale=0.0 \
---stgs_dropout=0.0 \
 \
 --ppo_kl_lambda=0.0 \
 --ppo_kl_mode="soft" \
@@ -70,7 +72,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --bptt_hidden_state_conditioning=False \
 --bptt_temperature=100.0 \
 \
---init_strategy='normal' \
+--init_strategy='zeros' \
 --init_std=0.0 \
 --init_mlm_model=distilbert-base-uncased \
 --init_mlm_top_k=100 \
@@ -84,7 +86,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --embsim_similarity="l2" \
 --embsim_teacher_forcing=False \
 --embsim_use_input_logits=True \
---embsim_temperature=0.01 \
+--embsim_temperature=1.0 \
 \
 --temperature_anneal_schedule="none" \
 --temperature_anneal_min=0.05 \
