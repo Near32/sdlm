@@ -1,4 +1,4 @@
-from typing import Callable, Dict, Optional, List
+from typing import Any, Callable, Dict, Optional, List
 import logging
 from tqdm import tqdm
 
@@ -160,6 +160,8 @@ def stgs_forward_pass(
     bptt: bool,
     bptt_stgs: Optional[STGS],
     filter_vocab: bool,
+    bptt_teacher_forcing_via_diff_model: bool = False,
+    bptt_diff_model: Optional[Any] = None,
     teacher_forcing: bool = False,
     target_tokens: Optional[torch.Tensor] = None,
     compute_tf_completion_logits: bool = False,
@@ -210,8 +212,15 @@ def stgs_forward_pass(
 
     seq_len = current_embeds.shape[1]
     bptt_eff_temperature = torch.tensor(0.0, device=device)
+    use_bptt_tf_with_diff_model = (
+        bptt
+        and teacher_forcing
+        and target_tokens is not None
+        and bptt_teacher_forcing_via_diff_model
+        and bptt_diff_model is not None
+    )
 
-    if teacher_forcing and target_tokens is not None:
+    if teacher_forcing and target_tokens is not None and not use_bptt_tf_with_diff_model:
         # FAST PATH: Single forward pass with teacher forcing (like SODA)
         # This processes all positions in one call instead of autoregressive loop
         if bptt:
@@ -281,6 +290,8 @@ def stgs_forward_pass(
             estimator_state: Dict[str, Optional[torch.Tensor]] = {
                 "eff_temperature": eff_temperature,
                 "bptt_eff_temperature": bptt_eff_temperature,
+                "stgs_snr": getattr(stgs_module, "last_snr", None),
+                "bptt_stgs_snr": None,  # TF path has no BPTT call
             }
 
             return ForwardPassResult(
@@ -319,13 +330,38 @@ def stgs_forward_pass(
     current_length = 1
     while current_length < target_length:
         if bptt:
-            assert bptt_stgs is not None, "BPTT requested but no STGS module provided for it."
-            next_token_id, next_token_one_hot, bptt_eff_temperature, bptt_y_soft = bptt_stgs(
-                all_logits[-1],
-                hidden_states=outputs.hidden_states,
-                temperature_param_indices=[current_length-1],
-            )
-            next_token_embedding = torch.matmul(next_token_one_hot, embedding_weights_subset)
+            if use_bptt_tf_with_diff_model:
+                target_pos = current_length - 1
+                teacher_forced_next_ids = target_tokens[:, target_pos:target_pos + 1]
+
+                temp_param_indices = None
+                if (
+                    getattr(bptt_diff_model.stgs, "learnable_temperature", False)
+                    and getattr(bptt_diff_model.stgs, "nbr_learnable_temperatures", 1) > 1
+                ):
+                    temp_param_indices = [target_pos]
+
+                next_token_id, next_token_one_hot, bptt_eff_temperature, _ = bptt_diff_model.stgs(
+                    all_logits[-1],
+                    hidden_states=outputs.hidden_states,
+                    temperature_param_indices=temp_param_indices,
+                    embedding_weights=embedding_weights_subset,
+                )
+                if getattr(bptt_diff_model.stgs, "stgs_hard", False):
+                    next_token_id, next_token_one_hot = bptt_diff_model._override_st_output_with_teacher_forcing(
+                        diff_output_ids=next_token_id,
+                        diff_one_hot=next_token_one_hot,
+                        teacher_forced_token_ids=teacher_forced_next_ids,
+                    )
+                next_token_embedding = torch.matmul(next_token_one_hot, embedding_weights_subset)
+            else:
+                assert bptt_stgs is not None, "BPTT requested but no STGS module provided for it."
+                next_token_id, next_token_one_hot, bptt_eff_temperature, _ = bptt_stgs(
+                    all_logits[-1],
+                    hidden_states=outputs.hidden_states,
+                    temperature_param_indices=[current_length-1],
+                )
+                next_token_embedding = torch.matmul(next_token_one_hot, embedding_weights_subset)
         else:
             next_token_id = torch.argmax(all_logits[-1], dim=-1)
             if filter_vocab:
@@ -402,6 +438,12 @@ def stgs_forward_pass(
     estimator_state: Dict[str, Optional[torch.Tensor]] = {
         "eff_temperature": eff_temperature,
         "bptt_eff_temperature": bptt_eff_temperature,
+        "stgs_snr": getattr(stgs_module, "last_snr", None),
+        "bptt_stgs_snr": (
+            getattr(bptt_diff_model.stgs, "last_snr", None)
+            if use_bptt_tf_with_diff_model
+            else (getattr(bptt_stgs, "last_snr", None) if bptt_stgs is not None else None)
+        ),
     }
 
     return ForwardPassResult(
