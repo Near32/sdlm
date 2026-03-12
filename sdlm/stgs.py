@@ -37,6 +37,12 @@ class STGS(nn.Module):
         output_dropout: float = 0.0,
         stgs_hard_method: str = "categorical",
         stgs_hard_embsim_probs: str = "gumbel_soft",
+        stgs_hard_embsim_strategy: str = "nearest",  # nearest | topk_rerank | topk_sample | margin_fallback | lm_topk_restrict
+        stgs_hard_embsim_top_k: int = 8,
+        stgs_hard_embsim_rerank_alpha: float = 0.5,
+        stgs_hard_embsim_sample_tau: float = 1.0,
+        stgs_hard_embsim_margin: float = 0.0,
+        stgs_hard_embsim_fallback: str = "argmax",  # argmax | categorical
         logits_normalize: str = "none",   # "none" | "center" | "zscore"
         eps: float = 1e-12,
         device: str = "cpu",
@@ -47,6 +53,12 @@ class STGS(nn.Module):
         self.stgs_hard = stgs_hard
         self.stgs_hard_method = stgs_hard_method
         self.stgs_hard_embsim_probs = stgs_hard_embsim_probs
+        self.stgs_hard_embsim_strategy = stgs_hard_embsim_strategy
+        self.stgs_hard_embsim_top_k = stgs_hard_embsim_top_k
+        self.stgs_hard_embsim_rerank_alpha = stgs_hard_embsim_rerank_alpha
+        self.stgs_hard_embsim_sample_tau = stgs_hard_embsim_sample_tau
+        self.stgs_hard_embsim_margin = stgs_hard_embsim_margin
+        self.stgs_hard_embsim_fallback = stgs_hard_embsim_fallback
         self.logits_normalize = logits_normalize
         self.init_temperature = init_temperature
         self.learnable_temperature = learnable_temperature
@@ -64,6 +76,7 @@ class STGS(nn.Module):
         self.eps = eps
         self.device = device
         self.tokenizer = tokenizer
+        self.last_snr: Optional[Tensor] = None
 
         if self.learnable_temperature:
             if self.conditioning_dim < 1:
@@ -109,6 +122,9 @@ class STGS(nn.Module):
                 eff_temperature = self.eps+self.init_temperature*(1+F.tanh(self.temperature_param))
                 # SIGMOID:
                 #eff_temperature = self.eps+self.init_temperature*F.sigmoid(self.temperature_param)
+                #EXP:
+                #eff_temperature = self.eps+torch.exp(self.temperature_param)
+                ##
                 eff_temperature = eff_temperature.reshape(1, -1, 1)
                 batch_size = x.shape[0]
                 eff_temperature = eff_temperature.repeat(batch_size, 1, 1)
@@ -145,6 +161,15 @@ class STGS(nn.Module):
                 std = x.std(dim=-1, keepdim=True)
                 x = x / (std + self.eps)
 
+        # Signal-to-noise ratio: Var(x/T) / Var(ε·gumbels/T) = Var(x) / (T² · ε² · π²/6)
+        # Captures effective discriminability: high T → low SNR even with large logit variance.
+        # eff_temperature shapes: (1,) | (batch, 1, 1) | (batch, seq_len, 1)
+        _T = eff_temperature.float()
+        _T_pos = _T.mean(dim=0).view(-1) if _T.dim() >= 2 else _T.view(-1)  # (seq_len,) or (1,)
+        _noise_var = (_T_pos ** 2) * (gumbel_noise_scale ** 2) * (torch.pi ** 2 / 6.0)
+        self.last_snr = (x.float().var(dim=-1).mean(dim=0) / _noise_var).detach()
+        # shape: (seq_len,)
+
         # Input-distribution dropout: randomly zero vocab-dimension logits before Gumbel noise
         eff_input_dropout = self.input_dropout if input_dropout is None else input_dropout
         if eff_input_dropout > 0.0:
@@ -170,29 +195,79 @@ class STGS(nn.Module):
             y_soft = F.dropout(y_soft, p=eff_output_dropout, training=self.training)
 
         # Sampling from batched distribution y_soft:
+        with torch.no_grad():
+            if self.stgs_hard_embsim_probs == "input_logits":
+                emb_probs = F.softmax(x.float(), dim=-1)
+            else:  # "gumbel_soft" (default)
+                emb_probs = y_soft.float()
         if self.stgs_hard_method in ("embsim-dot", "embsim-cos", "embsim-l2") and embedding_weights is not None:
             with torch.no_grad():
-                if self.stgs_hard_embsim_probs == "input_logits":
-                    emb_probs = F.softmax(x.float(), dim=-1)
-                else:  # "gumbel_soft" (default)
-                    emb_probs = y_soft.float()
-                soft_emb = torch.matmul(emb_probs, embedding_weights.float())
+                emb_w = embedding_weights.float()
+                soft_emb = torch.matmul(emb_probs, emb_w)
                 if self.stgs_hard_method == "embsim-dot":
-                    sim = torch.matmul(soft_emb, embedding_weights.float().T)
-                    output_ids = sim.argmax(dim=-1)
+                    emb_scores = torch.matmul(soft_emb, emb_w.T)
                 elif self.stgs_hard_method == "embsim-l2":
                     soft_sq = (soft_emb ** 2).sum(dim=-1, keepdim=True)           # (B, S, 1)
-                    emb_sq  = (embedding_weights.float() ** 2).sum(dim=-1)        # (V,)
-                    cross   = torch.matmul(soft_emb, embedding_weights.float().T) # (B, S, V)
+                    emb_sq  = (emb_w ** 2).sum(dim=-1)                             # (V,)
+                    cross   = torch.matmul(soft_emb, emb_w.T)                      # (B, S, V)
                     l2_sq   = soft_sq - 2 * cross + emb_sq                        # (B, S, V)
-                    output_ids = l2_sq.argmin(dim=-1)
+                    emb_scores = -l2_sq
                 else:  # embsim-cos
                     soft_norm = F.normalize(soft_emb, dim=-1, eps=self.eps)
-                    emb_norm  = F.normalize(embedding_weights.float(), dim=-1, eps=self.eps)
-                    sim = torch.matmul(soft_norm, emb_norm.T)
-                    output_ids = sim.argmax(dim=-1)
+                    emb_norm  = F.normalize(emb_w, dim=-1, eps=self.eps)
+                    emb_scores = torch.matmul(soft_norm, emb_norm.T)
+
+                strategy = self.stgs_hard_embsim_strategy
+                if strategy == "nearest":
+                    output_ids = emb_scores.argmax(dim=-1)
+                elif strategy == "topk_rerank":
+                    k = max(1, min(int(self.stgs_hard_embsim_top_k), emb_scores.shape[-1]))
+                    cand_ids = emb_scores.topk(k, dim=-1).indices
+                    cand_emb_scores = emb_scores.gather(dim=-1, index=cand_ids)
+                    cand_lm_scores = emb_probs.gather(dim=-1, index=cand_ids)
+                    alpha = max(0.0, min(float(self.stgs_hard_embsim_rerank_alpha), 1.0))
+                    emb_std = cand_emb_scores.std(dim=-1, keepdim=True, unbiased=False)
+                    lm_std = cand_lm_scores.std(dim=-1, keepdim=True, unbiased=False)
+                    cand_emb_z = (cand_emb_scores - cand_emb_scores.mean(dim=-1, keepdim=True)) / (emb_std + self.eps)
+                    cand_lm_z = (cand_lm_scores - cand_lm_scores.mean(dim=-1, keepdim=True)) / (lm_std + self.eps)
+                    fused = alpha * cand_emb_z + (1.0 - alpha) * cand_lm_z
+                    best_local = fused.argmax(dim=-1, keepdim=True)
+                    output_ids = cand_ids.gather(dim=-1, index=best_local).squeeze(-1)
+                elif strategy == "topk_sample":
+                    k = max(1, min(int(self.stgs_hard_embsim_top_k), emb_scores.shape[-1]))
+                    cand_ids = emb_scores.topk(k, dim=-1).indices
+                    cand_emb_scores = emb_scores.gather(dim=-1, index=cand_ids)
+                    tau = max(float(self.stgs_hard_embsim_sample_tau), self.eps)
+                    cand_probs = F.softmax(cand_emb_scores / tau, dim=-1)
+                    sampled_local = torch.distributions.Categorical(probs=cand_probs).sample().unsqueeze(-1)
+                    output_ids = cand_ids.gather(dim=-1, index=sampled_local).squeeze(-1)
+                elif strategy == "margin_fallback":
+                    nearest_ids = emb_scores.argmax(dim=-1)
+                    if emb_scores.shape[-1] < 2:
+                        output_ids = nearest_ids
+                    else:
+                        top2 = emb_scores.topk(2, dim=-1)
+                        margin = top2.values[..., 0] - top2.values[..., 1]
+                        is_ambiguous = margin < float(self.stgs_hard_embsim_margin)
+                        if self.stgs_hard_embsim_fallback == "categorical":
+                            fallback_ids = torch.distributions.Categorical(probs=emb_probs).sample()
+                        else:
+                            fallback_ids = emb_probs.argmax(dim=-1)
+                        output_ids = torch.where(is_ambiguous, fallback_ids, nearest_ids)
+                elif strategy == "lm_topk_restrict":
+                    k = max(1, min(int(self.stgs_hard_embsim_top_k), emb_scores.shape[-1]))
+                    lm_cand_ids = emb_probs.topk(k, dim=-1).indices
+                    cand_emb_scores = emb_scores.gather(dim=-1, index=lm_cand_ids)
+                    best_local = cand_emb_scores.argmax(dim=-1, keepdim=True)
+                    output_ids = lm_cand_ids.gather(dim=-1, index=best_local).squeeze(-1)
+                else:
+                    raise ValueError(f"Unknown stgs_hard_embsim_strategy: {strategy}")
+        elif self.stgs_hard_method == "argmax": # "argmax" 
+            output_ids = emb_probs.argmax(dim=-1, keepdim=False)
+        # batch_size x seq_len
         else:  # "categorical" (default) or fallback
-            output_ids = torch.distributions.Categorical(probs=y_soft).sample()
+            #output_ids = torch.distributions.Categorical(probs=y_soft).sample()
+            output_ids = torch.distributions.Categorical(probs=emb_probs).sample()
         # batch_size x seq_len
         del gumbel_logits
         y_soft = y_soft.to(x.dtype)

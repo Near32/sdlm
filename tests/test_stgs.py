@@ -156,3 +156,50 @@ class TestSTGS:
         assert y_soft.shape == (1, 3, vocab_size)
         # Eval: no dropout, so y_soft is a valid probability distribution
         assert torch.allclose(y_soft.sum(dim=-1), torch.ones(1, 3, device=device), atol=1e-4)
+
+
+def test_last_snr_shape_and_value():
+    """last_snr is (seq_len,) and scales correctly with logit variance and noise scale."""
+    import math
+    vocab_size = 50
+    seq_len = 5
+    batch_size = 3
+    stgs = STGS(vocab_size=vocab_size, stgs_hard=False, device="cpu")
+
+    # last_snr must be None before any forward call
+    assert stgs.last_snr is None
+
+    x = torch.randn(batch_size, seq_len, vocab_size)
+    stgs(x)
+
+    assert stgs.last_snr is not None
+    assert stgs.last_snr.shape == (seq_len,), f"Expected ({seq_len},), got {stgs.last_snr.shape}"
+    assert (stgs.last_snr >= 0).all(), "SNR must be non-negative"
+
+    # Logits with higher variance should yield higher SNR
+    x_low = torch.zeros(batch_size, seq_len, vocab_size)      # var ≈ 0
+    x_high = torch.randn(batch_size, seq_len, vocab_size) * 10  # var ≈ 100
+    stgs(x_low)
+    snr_low = stgs.last_snr.clone()
+    stgs(x_high)
+    snr_high = stgs.last_snr.clone()
+    assert (snr_high > snr_low).all(), "Higher logit variance → higher SNR"
+
+    # Doubling gumbel_noise_scale should reduce SNR by 4×
+    x_fixed = torch.randn(batch_size, seq_len, vocab_size)
+    stgs(x_fixed, gumbel_noise_scale=1.0)
+    snr_scale1 = stgs.last_snr.clone()
+    stgs(x_fixed, gumbel_noise_scale=2.0)
+    snr_scale2 = stgs.last_snr.clone()
+    ratio = snr_scale1 / snr_scale2.clamp(min=1e-12)
+    assert torch.allclose(ratio, torch.full_like(ratio, 4.0), rtol=0.05), \
+        f"Doubling noise_scale should reduce SNR by 4×, got ratio={ratio}"
+
+    # Doubling temperature should also reduce SNR by 4× (T² in denominator)
+    stgs_t1 = STGS(vocab_size=vocab_size, stgs_hard=False, device="cpu", init_temperature=1.0)
+    stgs_t2 = STGS(vocab_size=vocab_size, stgs_hard=False, device="cpu", init_temperature=2.0)
+    stgs_t1(x_fixed)
+    stgs_t2(x_fixed)
+    ratio_t = stgs_t1.last_snr / stgs_t2.last_snr.clamp(min=1e-12)
+    assert torch.allclose(ratio_t, torch.full_like(ratio_t, 4.0), rtol=0.05), \
+        f"Doubling temperature should reduce SNR by 4×, got ratio={ratio_t}"
