@@ -41,6 +41,7 @@ def gcg_optimize_inputs_hf(
     early_stop_on_exact_match: bool = False,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
+    candidate_batch_size: int = 8,
     per_epoch_callback: Optional[Callable[[int, torch.Tensor], Dict[str, float]]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -68,6 +69,7 @@ def gcg_optimize_inputs_hf(
         early_stop_on_exact_match: Stop early if exact match found
         lcs_ratio_threshold: Stop early if LCS ratio >= threshold
         batch_size: Batch size (for compatibility, not used in single-target)
+        candidate_batch_size: Number of candidate mutations to score per forward pass
         per_epoch_callback: Optional callable ``(epoch, logits) -> dict`` invoked at the
             end of each epoch (before ``wandb.log``). The returned dict is merged into
             ``wandb_log`` so that extra metrics (e.g. embsim) are logged together.
@@ -78,6 +80,7 @@ def gcg_optimize_inputs_hf(
         losses, lcs_ratio_history.
     """
     kwargs = kwargs or {}
+    candidate_batch_size = max(1, int(candidate_batch_size))
 
     # Get model's embedding layer
     embedding_layer = model.get_input_embeddings()
@@ -242,50 +245,58 @@ def gcg_optimize_inputs_hf(
             best_pred_tokens = pred_tokens.clone()
             best_loss = loss.item()
 
-            for _ in range(num_candidates):
-                # Select mutation positions
+            candidates_remaining = num_candidates
+            while candidates_remaining > 0:
+                current_batch_size = min(candidate_batch_size, candidates_remaining)
+                candidates_remaining -= current_batch_size
+
+                batched_pred_tokens = pred_tokens.expand(current_batch_size, -1).clone()
+
+                # Sample a minibatch of candidate mutations, then score them together.
                 new_token_pos = select_mutation_positions(
-                    grad=grad,
+                    grad=grad.expand(current_batch_size, -1, -1),
                     num_mutations=num_mutations,
                     pos_choice=pos_choice,
-                    batch_size=1,
+                    batch_size=current_batch_size,
                     seq_len=seq_len,
                 )
 
-                # Select token candidates
                 new_token_val = select_token_candidates(
-                    grad=grad,
+                    grad=grad.expand(current_batch_size, -1, -1),
                     new_token_pos=new_token_pos,
                     top_k=top_k,
                     token_choice=token_choice,
                     num_mutations=num_mutations,
-                    batch_size=1,
+                    batch_size=current_batch_size,
                 )
 
-                # Apply mutations
                 new_pred_tokens = apply_mutations(
-                    pred_tokens=pred_tokens,
+                    pred_tokens=batched_pred_tokens,
                     new_token_pos=new_token_pos,
                     new_token_val=new_token_val,
                 )
 
-                # Evaluate candidate
                 new_pred_embed = embedding_layer(new_pred_tokens)
-                new_combined = torch.cat([new_pred_embed, target_embeds], dim=1)
+                expanded_target_embeds = target_embeds.expand(current_batch_size, -1, -1)
+                new_combined = torch.cat([new_pred_embed, expanded_target_embeds], dim=1)
                 new_outputs = model(inputs_embeds=new_combined, return_dict=True)
                 new_logits = new_outputs.logits
                 new_target_logits = new_logits[:, seq_len - 1 : seq_len - 1 + target_length, :]
 
                 new_log_probs = F.softmax(new_target_logits, dim=-1).clamp(min=1e-12).log()
-                new_target_log_probs = new_log_probs.gather(2, target_tokens.unsqueeze(-1)).squeeze(-1)
+                expanded_target_tokens = target_tokens.expand(current_batch_size, -1)
+                new_target_log_probs = new_log_probs.gather(
+                    2, expanded_target_tokens.unsqueeze(-1)
+                ).squeeze(-1)
                 new_max_log_probs = new_log_probs.max(dim=-1).values
                 new_loss_diff = new_target_log_probs - new_max_log_probs
-                new_loss = -new_loss_diff.mean().item()
+                new_losses = -new_loss_diff.mean(dim=-1)
 
-                # Keep best candidate
-                if new_loss < best_loss:
-                    best_pred_tokens = new_pred_tokens.clone()
-                    best_loss = new_loss
+                min_loss, min_idx = new_losses.min(dim=0)
+                min_loss_value = min_loss.item()
+                if min_loss_value < best_loss:
+                    best_pred_tokens = new_pred_tokens[min_idx:min_idx + 1].clone()
+                    best_loss = min_loss_value
 
             # Update tokens to best candidate
             pred_tokens = best_pred_tokens

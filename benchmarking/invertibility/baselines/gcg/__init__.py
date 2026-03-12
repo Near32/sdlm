@@ -31,6 +31,7 @@ def gcg_optimize_inputs(
     early_stop_on_exact_match: bool = False,
     lcs_ratio_threshold: float = 1.0,
     batch_size: int = 1,
+    candidate_batch_size: int = 8,
     per_epoch_callback: Optional[Callable] = None,
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -64,6 +65,7 @@ def gcg_optimize_inputs(
         early_stop_on_exact_match: Stop early on exact match
         lcs_ratio_threshold: LCS ratio threshold for early stopping
         batch_size: Batch size (for compatibility)
+        candidate_batch_size: Candidate minibatch size for single-target scoring
         kwargs: Additional keyword arguments
 
     Returns:
@@ -122,6 +124,7 @@ def gcg_optimize_inputs(
             early_stop_on_exact_match=early_stop_on_exact_match,
             lcs_ratio_threshold=lcs_ratio_threshold,
             batch_size=batch_size,
+            candidate_batch_size=candidate_batch_size,
             per_epoch_callback=per_epoch_callback,
             kwargs=kwargs,
         )
@@ -163,6 +166,7 @@ def gcg_optimize_inputs(
             early_stop_on_exact_match=early_stop_on_exact_match,
             lcs_ratio_threshold=lcs_ratio_threshold,
             batch_size=batch_size,
+            candidate_batch_size=candidate_batch_size,
             model=model,
             kwargs=kwargs,
         )
