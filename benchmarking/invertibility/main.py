@@ -10,7 +10,8 @@ import copy
 import wandb
 import matplotlib.pyplot as plt
 from functools import partial
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
+from sdlm.stgs_diff_model import STGSDiffModel
 
 from gradient_estimators import (
     STGS,
@@ -1201,6 +1202,7 @@ def optimize_inputs(
     pre_prompt=None,
     seq_len=50,
     epochs=1000,
+    eval_only: bool = False,
     learning_rate=0.01,
     temperature = 0.5,
     bptt_temperature = 0.5,
@@ -1211,9 +1213,21 @@ def optimize_inputs(
     stgs_hard=True,
     stgs_hard_method="categorical",
     stgs_hard_embsim_probs="gumbel_soft",
+    stgs_hard_embsim_strategy="nearest",
+    stgs_hard_embsim_top_k=8,
+    stgs_hard_embsim_rerank_alpha=0.5,
+    stgs_hard_embsim_sample_tau=1.0,
+    stgs_hard_embsim_margin=0.0,
+    stgs_hard_embsim_fallback="argmax",
     bptt_stgs_hard=True,
     bptt_stgs_hard_method="categorical",
     bptt_stgs_hard_embsim_probs="gumbel_soft",
+    bptt_stgs_hard_embsim_strategy="nearest",
+    bptt_stgs_hard_embsim_top_k=8,
+    bptt_stgs_hard_embsim_rerank_alpha=0.5,
+    bptt_stgs_hard_embsim_sample_tau=1.0,
+    bptt_stgs_hard_embsim_margin=0.0,
+    bptt_stgs_hard_embsim_fallback="argmax",
     bptt_hidden_state_conditioning=False,
     plot_every=10,
     log_table_every=100,
@@ -1248,6 +1262,8 @@ def optimize_inputs(
     init_std=0.0,
     init_mlm_model="distilbert-base-uncased",
     init_mlm_top_k=50,
+    initial_learnable_logits: Optional[torch.Tensor] = None,
+    initial_learnable_temperatures: Optional[dict] = None,
     # Method selection (NEW)
     method="stgs",  # "stgs", "reinforce", "soda", "gcg"
     # Backend selection for SODA/GCG (NEW)
@@ -1269,8 +1285,10 @@ def optimize_inputs(
     gcg_pos_choice="uniform",
     gcg_token_choice="uniform",
     gcg_init_strategy="zeros",
+    gcg_candidate_batch_size=8,
     # Teacher forcing (for faster training)
     teacher_forcing=False,
+    bptt_teacher_forcing_via_diff_model: bool = False,
     # Prompt reconstruction evaluation (SODA-style)
     ground_truth_prompt_tokens=None,  # List[int] - ground truth prompt for prompt reconstruction metrics
     ground_truth_prompt=None,  # str - ground truth prompt string for logging
@@ -1302,6 +1320,7 @@ def optimize_inputs(
     temperature_anneal_epochs: int = 0,
     temperature_anneal_reg_lambda: float = 0.0,   # 0 = disabled
     temperature_anneal_reg_mode: str = "mse",      # "mse" or "one_sided"
+    temperature_loss_coupling_lambda: float = 0.0, # 0 = disabled; reg = λ*L/τ → pushes τ up when loss is high
     # Periodic discrete reinitialization
     discrete_reinit_epoch: int = 0,       # 0 = disabled; N = reinitialize every N epochs
     discrete_reinit_snap: str = "argmax", # "argmax" | "embsim-dot" | "embsim-cos"
@@ -1329,6 +1348,19 @@ def optimize_inputs(
     ppo_ref_update_period: int = 10,     # refresh reference every N epochs (0 = never)
     # LoRA-factored prompt logits (opt-in)
     logits_lora_rank: int = 0,           # 0 = disabled; >0 uses A@B decomposition
+    # Superposition metric callback (opt-in)
+    superposition_metric_every: int = 0,
+    superposition_metric_modes: str = "dot,cos,l2",
+    superposition_vocab_top_k: int = 256,
+    superposition_vocab_source: str = "wikipedia",  # "wikipedia" | "dataset" | "none"
+    superposition_vocab_dataset_path: Optional[str] = None,
+    superposition_vocab_hf_name: str = "lucadiliello/english_wikipedia",
+    superposition_vocab_hf_split: str = "train",
+    superposition_vocab_num_texts: int = 1000,
+    superposition_entropy_temperature: float = 1.0,
+    superposition_output_dir: Optional[str] = ".",
+    # Diversity analysis callback (opt-in)
+    diversity_callback: Optional[Callable[[int, torch.Tensor], dict]] = None,
     kwargs={},
 ):
     """
@@ -1363,6 +1395,9 @@ def optimize_inputs(
             base = {}
             for i, k in enumerate(keys):
                 base[k] = result[i] if i < len(result) else defaults[i]
+        # Ensure required common histories exist for dict-based baselines (e.g. GCG/O2P)
+        base.setdefault("prompt_metrics_history", empty_prompt_metrics)
+        base.setdefault("semantic_metrics_history", empty_semantic_metrics)
         # Pad discrete / all fields with empty defaults
         for prefix in ("discrete_", "all_", "embsim_"):
             base.setdefault(f"{prefix}generated_tokens", [])
@@ -1452,6 +1487,7 @@ def optimize_inputs(
             token_choice=gcg_token_choice,
             init_strategy=gcg_init_strategy,
             batch_size=batch_size,
+            candidate_batch_size=gcg_candidate_batch_size,
             per_epoch_callback=_cb,
             kwargs=kwargs,
         )
@@ -1607,15 +1643,29 @@ def optimize_inputs(
         "stgs_hard": stgs_hard,
         "stgs_hard_method": stgs_hard_method,
         "stgs_hard_embsim_probs": stgs_hard_embsim_probs,
+        "stgs_hard_embsim_strategy": stgs_hard_embsim_strategy,
+        "stgs_hard_embsim_top_k": stgs_hard_embsim_top_k,
+        "stgs_hard_embsim_rerank_alpha": stgs_hard_embsim_rerank_alpha,
+        "stgs_hard_embsim_sample_tau": stgs_hard_embsim_sample_tau,
+        "stgs_hard_embsim_margin": stgs_hard_embsim_margin,
+        "stgs_hard_embsim_fallback": stgs_hard_embsim_fallback,
         "bptt_stgs_hard": bptt_stgs_hard,
         "bptt_stgs_hard_method": bptt_stgs_hard_method,
         "bptt_stgs_hard_embsim_probs": bptt_stgs_hard_embsim_probs,
+        "bptt_stgs_hard_embsim_strategy": bptt_stgs_hard_embsim_strategy,
+        "bptt_stgs_hard_embsim_top_k": bptt_stgs_hard_embsim_top_k,
+        "bptt_stgs_hard_embsim_rerank_alpha": bptt_stgs_hard_embsim_rerank_alpha,
+        "bptt_stgs_hard_embsim_sample_tau": bptt_stgs_hard_embsim_sample_tau,
+        "bptt_stgs_hard_embsim_margin": bptt_stgs_hard_embsim_margin,
+        "bptt_stgs_hard_embsim_fallback": bptt_stgs_hard_embsim_fallback,
         "bptt_hidden_state_conditioning":bptt_hidden_state_conditioning,
         "plot_every": plot_every,
+        "eval_only": eval_only,
         "eps": eps,
         "bptt_eps": bptt_eps,
         "vocab_threshold": vocab_threshold,
         "batch_size": batch_size,
+        "initial_learnable_logits_provided": initial_learnable_logits is not None,
         "stgs_grad_variance_samples_cfg": stgs_grad_variance_samples,
         "stgs_grad_variance_period_cfg": stgs_grad_variance_period,
         "reinforce_grad_variance_samples_cfg": reinforce_grad_variance_samples,
@@ -1632,6 +1682,17 @@ def optimize_inputs(
         "reinforce_use_baseline": reinforce_use_baseline,
         "reinforce_baseline_beta": reinforce_baseline_beta,
         "teacher_forcing": teacher_forcing,
+        "bptt_teacher_forcing_via_diff_model": bptt_teacher_forcing_via_diff_model,
+        "superposition_metric_every": superposition_metric_every,
+        "superposition_metric_modes": superposition_metric_modes,
+        "superposition_vocab_top_k": superposition_vocab_top_k,
+        "superposition_vocab_source": superposition_vocab_source,
+        "superposition_vocab_dataset_path": superposition_vocab_dataset_path,
+        "superposition_vocab_hf_name": superposition_vocab_hf_name,
+        "superposition_vocab_hf_split": superposition_vocab_hf_split,
+        "superposition_vocab_num_texts": superposition_vocab_num_texts,
+        "superposition_entropy_temperature": superposition_entropy_temperature,
+        "superposition_output_dir": str(superposition_output_dir or "."),
         "loss_pos_weight_schedule": kwargs.get("loss_pos_weight_schedule", "uniform"),
         "loss_pos_weight_step": kwargs.get("loss_pos_weight_step", 1.0),
         "loss_pos_weight_base": kwargs.get("loss_pos_weight_base", 2.0),
@@ -1681,10 +1742,35 @@ def optimize_inputs(
     # Check shape:
     #print(f"Target tokens mapped shape: {target_tokens_mapped.shape}")
 
+    superposition_callback = None
+    if superposition_metric_every > 0:
+        try:
+            from superposition_analysis import build_superposition_callback
+
+            superposition_callback = build_superposition_callback(
+                tokenizer=tokenizer,
+                embedding_weights_subset=embedding_weights_subset,
+                allowed_tokens=allowed_tokens,
+                output_dir=str(superposition_output_dir or "."),
+                log_every=superposition_metric_every,
+                modes=superposition_metric_modes,
+                vocab_top_k=superposition_vocab_top_k,
+                vocab_source=superposition_vocab_source,
+                vocab_dataset_path=superposition_vocab_dataset_path,
+                vocab_hf_name=superposition_vocab_hf_name,
+                vocab_hf_split=superposition_vocab_hf_split,
+                vocab_num_texts=superposition_vocab_num_texts,
+                entropy_temperature=superposition_entropy_temperature,
+            )
+        except Exception as exc:
+            logging.warning("Superposition metric callback disabled: %s", exc)
+
     # Initialize learnable inputs (free positions only; fixed parts are separate)
     parameters = []
     lora_A = lora_B = None
     if logits_lora_rank > 0:
+        if initial_learnable_logits is not None:
+            raise ValueError("initial_learnable_logits is not supported with logits_lora_rank > 0.")
         lora_A, lora_B = initialize_lora_logits(
             n_free, allowed_vocab_size, logits_lora_rank, device,
             init_strategy=init_strategy,
@@ -1702,20 +1788,50 @@ def optimize_inputs(
         parameters.extend([lora_A, lora_B])
         free_logits = None   # sentinel: LoRA path
     else:
-        free_logits = initialize_learnable_inputs(
-            allowed_vocab_size, n_free, device,
-            init_strategy=init_strategy,
-            init_std=init_std,
-            embedding_weights=embedding_weights_subset,
-            target_token_ids=target_tokens_mapped[0],
-            model=model,
-            target_input_ids=target_tokens,
-            allowed_tokens=allowed_tokens,
-            mlm_model_name=init_mlm_model,
-            mlm_top_k=init_mlm_top_k,
-            target_text=target_text,
-            tokenizer=tokenizer,
-        )
+        if initial_learnable_logits is not None:
+            provided = initial_learnable_logits.detach()
+            if provided.dim() != 3 or provided.shape[0] != 1:
+                raise ValueError(
+                    f"initial_learnable_logits must have shape (1, seq_len, vocab), got {tuple(provided.shape)}"
+                )
+            # If full-vocab logits are provided while filter_vocab is active, project to allowed vocab.
+            if provided.shape[-1] == vocab_size and allowed_vocab_size != vocab_size:
+                provided = provided[:, :, allowed_tokens]
+            if provided.shape[-1] != allowed_vocab_size:
+                raise ValueError(
+                    "initial_learnable_logits vocab dimension mismatch: "
+                    f"got {provided.shape[-1]}, expected {allowed_vocab_size}"
+                )
+            # If full assembled seq_len was provided but n_free is a middle span, slice to free span.
+            if provided.shape[1] == seq_len and n_free != seq_len:
+                prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
+                provided = provided[:, prefix_len:prefix_len + n_free, :]
+            if provided.shape[1] != n_free:
+                raise ValueError(
+                    "initial_learnable_logits sequence dimension mismatch: "
+                    f"got {provided.shape[1]}, expected {n_free}"
+                )
+            free_logits = (
+                provided.to(device=device, dtype=embedding_weights_subset.dtype)
+                .clone()
+                .detach()
+                .requires_grad_(True)
+            )
+        else:
+            free_logits = initialize_learnable_inputs(
+                allowed_vocab_size, n_free, device,
+                init_strategy=init_strategy,
+                init_std=init_std,
+                embedding_weights=embedding_weights_subset,
+                target_token_ids=target_tokens_mapped[0],
+                model=model,
+                target_input_ids=target_tokens,
+                allowed_tokens=allowed_tokens,
+                mlm_model_name=init_mlm_model,
+                mlm_top_k=init_mlm_top_k,
+                target_text=target_text,
+                tokenizer=tokenizer,
+            )
         parameters.append(free_logits)
 
     # --- Learnable prompt length via soft EoS masking ---
@@ -1811,6 +1927,8 @@ def optimize_inputs(
     estimator_choice = gradient_estimator.lower()
     stgs_module = None
     bptt_stgs_module = None
+    bptt_diff_model = None
+    use_bptt_teacher_forcing_via_diff_model = False
     reinforce_helper = None
 
     if estimator_choice == "stgs":
@@ -1819,6 +1937,12 @@ def optimize_inputs(
             stgs_hard=stgs_hard,
             stgs_hard_method=stgs_hard_method,
             stgs_hard_embsim_probs=stgs_hard_embsim_probs,
+            stgs_hard_embsim_strategy=stgs_hard_embsim_strategy,
+            stgs_hard_embsim_top_k=stgs_hard_embsim_top_k,
+            stgs_hard_embsim_rerank_alpha=stgs_hard_embsim_rerank_alpha,
+            stgs_hard_embsim_sample_tau=stgs_hard_embsim_sample_tau,
+            stgs_hard_embsim_margin=stgs_hard_embsim_margin,
+            stgs_hard_embsim_fallback=stgs_hard_embsim_fallback,
             init_temperature=temperature,
             learnable_temperature=learnable_temperature,
             nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
@@ -1830,12 +1954,77 @@ def optimize_inputs(
         )
         parameters += list(stgs_module.parameters())
 
-        if bptt:
+        use_bptt_teacher_forcing_via_diff_model = (
+            bptt_teacher_forcing_via_diff_model
+            and bptt
+            and teacher_forcing
+            and bptt_stgs_hard
+        )
+        if use_bptt_teacher_forcing_via_diff_model and bptt_decouple_learnable_temperature:
+            logging.warning(
+                "bptt_teacher_forcing_via_diff_model=True does not support "
+                "bptt_decouple_learnable_temperature=True yet. "
+                "Falling back to legacy bptt_stgs behavior."
+            )
+            use_bptt_teacher_forcing_via_diff_model = False
+        if bptt and teacher_forcing and not use_bptt_teacher_forcing_via_diff_model:
+            logging.info(
+                "BPTT+teacher_forcing will use legacy autoregressive BPTT STGS path "
+                "(set --bptt_teacher_forcing_via_diff_model=True to use STGSDiffModel override path)."
+            )
+
+        if bptt and use_bptt_teacher_forcing_via_diff_model:
+            class _BPTTVocabShimTokenizer:
+                def __init__(self, vocab_size: int, pad_token_id: int, eos_token_id: int):
+                    self.vocab_size = vocab_size
+                    self.pad_token_id = pad_token_id
+                    self.eos_token_id = eos_token_id
+
+                def __len__(self):
+                    return self.vocab_size
+
+            eos_allowed = eos_idx_in_allowed if eos_idx_in_allowed >= 0 else 0
+            bptt_diff_model = STGSDiffModel(
+                model=model,
+                tokenizer=_BPTTVocabShimTokenizer(
+                    vocab_size=allowed_vocab_size,
+                    pad_token_id=eos_allowed,
+                    eos_token_id=eos_allowed,
+                ),
+                stgs_kwargs={
+                    "hard": bptt_stgs_hard,
+                    "temperature": bptt_temperature,
+                    "learnable_temperature": bptt_learnable_temperature,
+                    "hidden_state_conditioning": bptt_hidden_state_conditioning,
+                    "dropout": 0.0,
+                },
+                stgs_logits_generation=True,
+                device=None,
+            )
+            # Align the underlying STGS object with existing BPTT settings where supported.
+            bptt_diff_model.stgs.stgs_hard_method = bptt_stgs_hard_method
+            bptt_diff_model.stgs.stgs_hard_embsim_probs = bptt_stgs_hard_embsim_probs
+            bptt_diff_model.stgs.stgs_hard_embsim_strategy = bptt_stgs_hard_embsim_strategy
+            bptt_diff_model.stgs.stgs_hard_embsim_top_k = bptt_stgs_hard_embsim_top_k
+            bptt_diff_model.stgs.stgs_hard_embsim_rerank_alpha = bptt_stgs_hard_embsim_rerank_alpha
+            bptt_diff_model.stgs.stgs_hard_embsim_sample_tau = bptt_stgs_hard_embsim_sample_tau
+            bptt_diff_model.stgs.stgs_hard_embsim_margin = bptt_stgs_hard_embsim_margin
+            bptt_diff_model.stgs.stgs_hard_embsim_fallback = bptt_stgs_hard_embsim_fallback
+            bptt_diff_model.stgs.logits_normalize = bptt_logits_normalize
+            bptt_diff_model.stgs.eps = bptt_eps
+            parameters += list(bptt_diff_model.stgs.parameters())
+        elif bptt:
             bptt_stgs_module = STGS(
                 vocab_size=allowed_vocab_size,
                 stgs_hard=bptt_stgs_hard,
                 stgs_hard_method=bptt_stgs_hard_method,
                 stgs_hard_embsim_probs=bptt_stgs_hard_embsim_probs,
+                stgs_hard_embsim_strategy=bptt_stgs_hard_embsim_strategy,
+                stgs_hard_embsim_top_k=bptt_stgs_hard_embsim_top_k,
+                stgs_hard_embsim_rerank_alpha=bptt_stgs_hard_embsim_rerank_alpha,
+                stgs_hard_embsim_sample_tau=bptt_stgs_hard_embsim_sample_tau,
+                stgs_hard_embsim_margin=bptt_stgs_hard_embsim_margin,
+                stgs_hard_embsim_fallback=bptt_stgs_hard_embsim_fallback,
                 init_temperature=bptt_temperature,
                 learnable_temperature=bptt_learnable_temperature,
                 nbr_learnable_temperatures=target_length if bptt_decouple_learnable_temperature else None,
@@ -1845,6 +2034,119 @@ def optimize_inputs(
                 device=device,
             )
             parameters += list(bptt_stgs_module.parameters())
+
+        # Optional temperature parameter init from an external payload.
+        _temp_payload = initial_learnable_temperatures
+        if _temp_payload is not None:
+            if torch.is_tensor(_temp_payload):
+                _temp_payload = {"stgs_temperature_param": _temp_payload}
+            elif not isinstance(_temp_payload, dict):
+                raise ValueError(
+                    "initial_learnable_temperatures must be a dict or tensor, got "
+                    f"{type(initial_learnable_temperatures)}"
+                )
+
+            def _fit_payload_to_shape(src, target_shape, device_, dtype_, key):
+                src_t = src.detach() if torch.is_tensor(src) else torch.tensor(src)
+                src_t = src_t.to(device=device_, dtype=dtype_).flatten()
+                target_numel = 1
+                for d in target_shape:
+                    target_numel *= int(d)
+                if src_t.numel() == target_numel:
+                    return src_t.reshape(target_shape)
+                if src_t.numel() == 1:
+                    return src_t.repeat(target_numel).reshape(target_shape)
+                raise ValueError(
+                    f"{key} shape mismatch: got {tuple(src_t.shape)}, expected shape {tuple(target_shape)} "
+                    f"(or a scalar that can be broadcast)."
+                )
+
+            def _load_temperature(module, param_keys, effective_key):
+                if module is None:
+                    return
+                key = next((k for k in param_keys if k in _temp_payload), None)
+                src_param = _temp_payload[key] if key is not None else None
+                src_eff = _temp_payload.get(effective_key, None)
+
+                if src_param is None and src_eff is None:
+                    return
+
+                has_param = hasattr(module, "temperature_param")
+                eps_val = float(getattr(module, "eps", 1e-12))
+                init_tau = float(getattr(module, "init_temperature", 1.0))
+
+                # Highest priority: explicit temperature parameter payload.
+                if src_param is not None:
+                    if not has_param:
+                        logging.warning(
+                            "initial_learnable_temperatures contains '%s', but module has no "
+                            "temperature_param. Ignoring.",
+                            key,
+                        )
+                        return
+                    src_t = _fit_payload_to_shape(
+                        src=src_param,
+                        target_shape=module.temperature_param.shape,
+                        device_=module.temperature_param.device,
+                        dtype_=module.temperature_param.dtype,
+                        key=key,
+                    )
+                    with torch.no_grad():
+                        module.temperature_param.copy_(src_t)
+                    return
+
+                # Fallback: effective temperature payload.
+                eff_t = src_eff.detach() if torch.is_tensor(src_eff) else torch.tensor(src_eff)
+                eff_t = eff_t.to(
+                    device=module.temperature_param.device if has_param else device,
+                    dtype=module.temperature_param.dtype if has_param else torch.float32,
+                ).flatten()
+                if eff_t.numel() == 0:
+                    return
+
+                if has_param:
+                    eff_t = _fit_payload_to_shape(
+                        src=eff_t,
+                        target_shape=module.temperature_param.shape,
+                        device_=module.temperature_param.device,
+                        dtype_=module.temperature_param.dtype,
+                        key=effective_key,
+                    )
+                    with torch.no_grad():
+                        # Ensure provided effective temperatures are representable by
+                        # tau = eps + init_tau * (1 + tanh(param)).
+                        max_eff = float(eff_t.max().item())
+                        if max_eff >= (eps_val + 2.0 * init_tau * 0.999999):
+                            new_init = max(max_eff, init_tau)
+                            module.init_temperature = new_init
+                            init_tau = float(module.init_temperature)
+                        ratio = ((eff_t - eps_val) / max(init_tau, 1e-12)) - 1.0
+                        ratio = ratio.clamp(min=-0.999999, max=0.999999)
+                        param = torch.atanh(ratio)
+                        module.temperature_param.copy_(param.to(module.temperature_param.dtype))
+                else:
+                    if eff_t.numel() != 1:
+                        raise ValueError(
+                            f"{effective_key} provided {eff_t.numel()} values, but module does not have "
+                            "learnable temperature parameters. Provide a scalar or enable learnable temperature."
+                        )
+                    module.init_temperature = max(float(eff_t.item()), eps_val)
+
+            _load_temperature(
+                stgs_module,
+                param_keys=("stgs_temperature_param", "temperature_param"),
+                effective_key="stgs_effective_temperature",
+            )
+            _bptt_temp_module = (
+                bptt_diff_model.stgs
+                if bptt_diff_model is not None
+                else bptt_stgs_module
+            )
+            _load_temperature(
+                _bptt_temp_module,
+                param_keys=("bptt_temperature_param",),
+                effective_key="bptt_effective_temperature",
+            )
     elif estimator_choice == "reinforce":
         if bptt:
             raise ValueError("BPTT is currently not supported with the REINFORCE estimator.")
@@ -1875,6 +2177,8 @@ def optimize_inputs(
             bptt=bptt,
             bptt_stgs=bptt_stgs_module,
             filter_vocab=filter_vocab,
+            bptt_teacher_forcing_via_diff_model=use_bptt_teacher_forcing_via_diff_model,
+            bptt_diff_model=bptt_diff_model,
             teacher_forcing=teacher_forcing,
             target_tokens=target_tokens_mapped,
             compute_tf_completion_logits=('promptTfComplPerplexity' in losses),
@@ -1996,12 +2300,24 @@ def optimize_inputs(
                 if temperature_anneal_reg_mode == "one_sided":
                     temp_reg = F.relu(_eff_temp.mean() - target_tau_t).pow(2)
                 else:  # "mse"
-                    temp_reg = (_eff_temp.mean() - target_tau_t).pow(2)
+                    #temp_reg = (_eff_temp.mean() - target_tau_t).pow(2)
+                    temp_reg = (_eff_temp - target_tau_t).pow(2).mean()
                 backward_loss = backward_loss + temperature_anneal_reg_lambda * temp_reg
                 losses_dict["temperature_anneal_reg"] = temp_reg.detach()
 
+        # Loss-coupled temperature regularization: pushes τ up when main loss is high.
+        # reg = λ * L.detach() * mean(1/τ_i)  →  ∂reg/∂τ_i = -λ*L/(n*τ_i²) < 0
+        # Invert per-position first, then average — prevents high-τ positions from
+        # masking collapsed ones (mean(1/τ) ≥ 1/mean(τ) by Jensen's inequality).
+        if learnable_temperature and temperature_loss_coupling_lambda > 0.0:
+            _eff_temp = estimator_state.get("eff_temperature")
+            if torch.is_tensor(_eff_temp):
+                coupling_reg = temperature_loss_coupling_lambda * loss.detach() * (1.0 / _eff_temp.clamp(min=1e-6)).mean()
+                backward_loss = backward_loss + coupling_reg
+                losses_dict["temperature_loss_coupling_reg"] = coupling_reg.detach()
+
         # Adaptive Gumbel noise scaling (similar to temperature annealing)
-        if adaptive_gumbel_noise and stgs_module is not None:
+        if (not eval_only) and adaptive_gumbel_noise and stgs_module is not None:
             current_loss_val = loss.detach().item()
             if _loss_ema is None:
                 _loss_ema = current_loss_val
@@ -2034,10 +2350,10 @@ def optimize_inputs(
             )
             backward_loss = backward_loss + ppo_kl_lambda * ppo_kl
 
-        backward_loss.backward()
-
         estimator_metrics: Dict[str, float] = {}
-        if estimator_is_stgs:
+        if not eval_only:
+            backward_loss.backward()
+        if (not eval_only) and estimator_is_stgs:
             # Save gradients for all parameters  in the context:
             saved_grads = {
                 param: param.grad.clone() 
@@ -2130,7 +2446,7 @@ def optimize_inputs(
             # Restore gradients for all parameters
             for param, saved_grad in saved_grads.items():
                 param.grad = saved_grad
-        else:
+        elif not eval_only:
             # Save gradients for all parameters in the context:
             saved_grads = {
                 param: param.grad.clone() 
@@ -2159,13 +2475,14 @@ def optimize_inputs(
             for param, saved_grad in saved_grads.items():
                 param.grad = saved_grad
 
-        if max_gradient_norm != 0.0:
+        if (not eval_only) and max_gradient_norm != 0.0:
             torch.nn.utils.clip_grad_norm_(parameters, max_gradient_norm)
 
-        optimizer.step()
+        if not eval_only:
+            optimizer.step()
 
         # Exponential logit weight decay
-        if logit_decay > 0.0:
+        if (not eval_only) and logit_decay > 0.0:
             with torch.no_grad():
                 if lora_A is not None:
                     lora_A.data.mul_(logit_decay)
@@ -2174,12 +2491,12 @@ def optimize_inputs(
                     free_logits.data.mul_(logit_decay)
 
         # Roll reference snapshot every ppo_ref_update_period epochs
-        if ppo_kl_lambda > 0.0 and ppo_ref_update_period > 0:
+        if (not eval_only) and ppo_kl_lambda > 0.0 and ppo_ref_update_period > 0:
             if (epoch + 1) % ppo_ref_update_period == 0:
                 _ppo_ref_logits = assemble_logits().detach().clone()
 
         # Periodic discrete reinitialization
-        if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
+        if (not eval_only) and discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
             prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
             with torch.no_grad():
                 if lora_A is not None:
@@ -2205,7 +2522,7 @@ def optimize_inputs(
                     optimizer.state[free_logits] = {}   # reset momentum for a clean restart
 
         # Temperature annealing (only when not learnable_temperature)
-        if temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
+        if (not eval_only) and temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
             _n = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
             stgs_module.init_temperature = compute_annealed_temperature(
                 temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule)
@@ -2268,6 +2585,10 @@ def optimize_inputs(
                 temperature, temperature_anneal_min, epoch, _n, temperature_anneal_schedule
             )
 
+        if learnable_temperature and temperature_loss_coupling_lambda > 0.0:
+            if "temperature_loss_coupling_reg" in losses_dict:
+                wandb_log["temperature_loss_coupling_reg"] = losses_dict["temperature_loss_coupling_reg"].item()
+
         if stgs_module is not None:
             wandb_log["gumbel_noise_scale"] = getattr(stgs_module, 'gumbel_noise_scale', gumbel_noise_scale)
 
@@ -2295,6 +2616,14 @@ def optimize_inputs(
                         wandb_log[f"bptt_effective_temperature_{sidx}"] = bptt_eff_temperature[:, sidx].mean().item()
             elif isinstance(bptt_eff_temperature, (float, int)):
                 wandb_log["bptt_effective_temperature"] = float(bptt_eff_temperature)
+            _stgs_snr = estimator_state.get("stgs_snr")
+            if _stgs_snr is not None:
+                _snr_f = _stgs_snr.float()
+                wandb_log["stgs_snr_mean"] = _snr_f.mean().item()
+                wandb_log["stgs_snr_min"]  = _snr_f.min().item()
+                wandb_log["stgs_snr_max"]  = _snr_f.max().item()
+                for _i, _v in enumerate(_snr_f.tolist()):
+                    wandb_log[f"stgs_snr_pos_{_i}"] = _v
             wandb_log.update(estimator_metrics)
         else:
             advantage_val = estimator_state.get("reinforce_advantage")
@@ -2626,7 +2955,17 @@ def optimize_inputs(
         )
 
         wandb.log(wandb_log)
-        
+
+        if diversity_callback is not None:
+            _div_metrics = diversity_callback(epoch, assemble_logits().detach())
+            if _div_metrics:
+                wandb.log(_div_metrics)
+
+        if superposition_callback is not None:
+            _sup_metrics = superposition_callback(epoch, _free().detach())
+            if _sup_metrics:
+                wandb.log(_sup_metrics)
+
         if epoch % log_table_every == 0:
             wandb.log({"generated_output_table": copy.deepcopy(wandb_table)})
 
@@ -2687,9 +3026,59 @@ def optimize_inputs(
             break
 
     # Return the full assembled logits (detached) for downstream use
+    final_free_logits = _free().detach()
+    def _extract_temperature_payload():
+        payload = {}
+
+        def _extract_module(module, param_key, eff_key):
+            if module is None:
+                return
+            if hasattr(module, "temperature_param"):
+                tparam = module.temperature_param.detach().clone()
+                payload[param_key] = tparam
+                try:
+                    teff = module.eps + module.init_temperature * (1 + torch.tanh(tparam))
+                except Exception:
+                    teff = tparam
+                payload[eff_key] = teff.detach().clone()
+            else:
+                payload[eff_key] = torch.tensor(
+                    [float(getattr(module, "init_temperature", 0.0))],
+                    device=device,
+                )
+
+        _extract_module(stgs_module, "stgs_temperature_param", "stgs_effective_temperature")
+        _bptt_temp_module = (
+            bptt_diff_model.stgs
+            if bptt_diff_model is not None
+            else bptt_stgs_module
+        )
+        _extract_module(_bptt_temp_module, "bptt_temperature_param", "bptt_effective_temperature")
+        return payload
+
+    final_learnable_temperatures = _extract_temperature_payload()
+    if final_learnable_temperatures:
+        _temp_log = {}
+        if "stgs_effective_temperature" in final_learnable_temperatures:
+            _st = final_learnable_temperatures["stgs_effective_temperature"].float()
+            _temp_log["final_stgs_effective_temperature_mean"] = _st.mean().item()
+        if "bptt_effective_temperature" in final_learnable_temperatures:
+            _bt = final_learnable_temperatures["bptt_effective_temperature"].float()
+            _temp_log["final_bptt_effective_temperature_mean"] = _bt.mean().item()
+        if _temp_log:
+            wandb.log(_temp_log)
+
+    if superposition_callback is not None:
+        final_epoch = max(len(losses) - 1, 0)
+        _sup_final_metrics = superposition_callback(final_epoch, final_free_logits, force=True)
+        if _sup_final_metrics:
+            wandb.log(_sup_final_metrics)
+
     return {
         "generated_tokens":                   generated_tokens,
         "optimized_inputs":                   assemble_logits().detach(),
+        "learnable_logits":                   final_free_logits,
+        "learnable_temperatures":             final_learnable_temperatures,
         "losses":                             losses,
         "lcs_ratio_history":                  lcs_ratio_history,
         "prompt_metrics_history":             prompt_metrics_history,
@@ -2763,20 +3152,47 @@ def main():
     parser.add_argument("--bptt_eps", type=float, default=1e-10)
     parser.add_argument("--temperature", type=float, default=1e1)
     parser.add_argument("--learnable_temperature", type=str2bool, default=False)
+    parser.add_argument("--decouple_learnable_temperature", type=str2bool, default=False)
     parser.add_argument("--stgs_hard", type=str2bool, default=False)
     parser.add_argument("--stgs_hard_method", type=str, default="categorical",
-                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"])
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"])
     parser.add_argument("--stgs_hard_embsim_probs", type=str, default="gumbel_soft",
                         choices=["gumbel_soft", "input_logits"])
+    parser.add_argument("--stgs_hard_embsim_strategy", type=str, default="nearest",
+                        choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"])
+    parser.add_argument("--stgs_hard_embsim_top_k", type=int, default=8)
+    parser.add_argument("--stgs_hard_embsim_rerank_alpha", type=float, default=0.5)
+    parser.add_argument("--stgs_hard_embsim_sample_tau", type=float, default=1.0)
+    parser.add_argument("--stgs_hard_embsim_margin", type=float, default=0.0)
+    parser.add_argument("--stgs_hard_embsim_fallback", type=str, default="argmax",
+                        choices=["argmax", "categorical"])
     parser.add_argument("--bptt", type=str2bool, default=False)
     parser.add_argument("--bptt_temperature", type=float, default=1e1)
     parser.add_argument("--bptt_learnable_temperature", type=str2bool, default=False)
+    parser.add_argument("--bptt_decouple_learnable_temperature", type=str2bool, default=False)
     parser.add_argument("--bptt_stgs_hard", type=str2bool, default=False)
     parser.add_argument("--bptt_stgs_hard_method", type=str, default="categorical",
-                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"])
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"])
     parser.add_argument("--bptt_stgs_hard_embsim_probs", type=str, default="gumbel_soft",
                         choices=["gumbel_soft", "input_logits"])
+    parser.add_argument("--bptt_stgs_hard_embsim_strategy", type=str, default="nearest",
+                        choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"])
+    parser.add_argument("--bptt_stgs_hard_embsim_top_k", type=int, default=8)
+    parser.add_argument("--bptt_stgs_hard_embsim_rerank_alpha", type=float, default=0.5)
+    parser.add_argument("--bptt_stgs_hard_embsim_sample_tau", type=float, default=1.0)
+    parser.add_argument("--bptt_stgs_hard_embsim_margin", type=float, default=0.0)
+    parser.add_argument("--bptt_stgs_hard_embsim_fallback", type=str, default="argmax",
+                        choices=["argmax", "categorical"])
     parser.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
+    parser.add_argument("--teacher_forcing", type=str2bool, default=False,
+                        help="Use teacher forcing for completion loss computation.")
+    parser.add_argument("--bptt_teacher_forcing_via_diff_model", type=str2bool, default=False,
+                        help="When bptt=True and teacher_forcing=True in STGS mode, use STGSDiffModel "
+                             "teacher-forced hard straight-through outputs instead of a separate BPTT STGS module.")
+    parser.add_argument("--logits_normalize", type=str, default="none",
+                        choices=["none", "center", "zscore"])
+    parser.add_argument("--bptt_logits_normalize", type=str, default="none",
+                        choices=["none", "center", "zscore"])
     parser.add_argument("--plot_every", type=int, default=100000)
     parser.add_argument("--stgs_grad_variance_samples", type=int, default=0)
     parser.add_argument("--stgs_grad_variance_period", type=int, default=1)
@@ -2841,6 +3257,30 @@ def main():
                         choices=["mse", "one_sided"],
                         help="'mse': symmetric L2 to target; 'one_sided': L2 only when tau > target")
 
+    # Superposition diagnostics (opt-in)
+    parser.add_argument("--superposition_metric_every", type=int, default=0,
+                        help="Run superposition z_i-z_j diagnostics every N epochs (0 = disabled).")
+    parser.add_argument("--superposition_metric_modes", type=str, default="dot,cos,l2",
+                        help="Comma-separated modes for superposition maps: dot,cos,l2.")
+    parser.add_argument("--superposition_vocab_top_k", type=int, default=256,
+                        help="Top-K common tokens used to build z_i-z_j pair space "
+                             "(<=0 means all allowed tokens).")
+    parser.add_argument("--superposition_vocab_source", type=str, default="wikipedia",
+                        choices=["wikipedia", "dataset", "none"],
+                        help="Source used to rank common tokens for top-K subset.")
+    parser.add_argument("--superposition_vocab_dataset_path", type=str, default=None,
+                        help="Path to local dataset used when superposition_vocab_source=dataset.")
+    parser.add_argument("--superposition_vocab_hf_name", type=str, default="lucadiliello/english_wikipedia",
+                        help="HF dataset name used when superposition_vocab_source=wikipedia.")
+    parser.add_argument("--superposition_vocab_hf_split", type=str, default="train",
+                        help="HF split used when superposition_vocab_source=wikipedia.")
+    parser.add_argument("--superposition_vocab_num_texts", type=int, default=1000,
+                        help="Number of texts sampled to estimate token frequency for top-K ranking.")
+    parser.add_argument("--superposition_entropy_temperature", type=float, default=1.0,
+                        help="Temperature used in softmax(score/T) for entropy over (i,j) pairs.")
+    parser.add_argument("--superposition_output_dir", type=str, default=".",
+                        help="Directory for local superposition heatmaps.")
+
     # Prompt distribution entropy regularization
     parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
                         help="Weight for prompt distribution entropy regularization (0=disabled)")
@@ -2898,13 +3338,31 @@ def main():
         bptt_temperature=config['bptt_temperature'],
         bptt_learnable_temperature=config['bptt_learnable_temperature'],
         learnable_temperature=config['learnable_temperature'],
+        decouple_learnable_temperature=config.get('decouple_learnable_temperature', False),
+        bptt_decouple_learnable_temperature=config.get('bptt_decouple_learnable_temperature', False),
+        logits_normalize=config.get('logits_normalize', 'none'),
+        bptt_logits_normalize=config.get('bptt_logits_normalize', 'none'),
         stgs_hard=config['stgs_hard'],
         stgs_hard_method=config.get('stgs_hard_method', 'categorical'),
         stgs_hard_embsim_probs=config.get('stgs_hard_embsim_probs', 'gumbel_soft'),
+        stgs_hard_embsim_strategy=config.get('stgs_hard_embsim_strategy', 'nearest'),
+        stgs_hard_embsim_top_k=config.get('stgs_hard_embsim_top_k', 8),
+        stgs_hard_embsim_rerank_alpha=config.get('stgs_hard_embsim_rerank_alpha', 0.5),
+        stgs_hard_embsim_sample_tau=config.get('stgs_hard_embsim_sample_tau', 1.0),
+        stgs_hard_embsim_margin=config.get('stgs_hard_embsim_margin', 0.0),
+        stgs_hard_embsim_fallback=config.get('stgs_hard_embsim_fallback', 'argmax'),
         bptt_stgs_hard=config['bptt_stgs_hard'],
         bptt_stgs_hard_method=config.get('bptt_stgs_hard_method', 'categorical'),
         bptt_stgs_hard_embsim_probs=config.get('bptt_stgs_hard_embsim_probs', 'gumbel_soft'),
+        bptt_stgs_hard_embsim_strategy=config.get('bptt_stgs_hard_embsim_strategy', 'nearest'),
+        bptt_stgs_hard_embsim_top_k=config.get('bptt_stgs_hard_embsim_top_k', 8),
+        bptt_stgs_hard_embsim_rerank_alpha=config.get('bptt_stgs_hard_embsim_rerank_alpha', 0.5),
+        bptt_stgs_hard_embsim_sample_tau=config.get('bptt_stgs_hard_embsim_sample_tau', 1.0),
+        bptt_stgs_hard_embsim_margin=config.get('bptt_stgs_hard_embsim_margin', 0.0),
+        bptt_stgs_hard_embsim_fallback=config.get('bptt_stgs_hard_embsim_fallback', 'argmax'),
         bptt_hidden_state_conditioning=config['bptt_hidden_state_conditioning'],
+        teacher_forcing=config.get('teacher_forcing', False),
+        bptt_teacher_forcing_via_diff_model=config.get('bptt_teacher_forcing_via_diff_model', False),
         plot_every=config['plot_every'],
         stgs_grad_variance_samples=config['stgs_grad_variance_samples'],
         stgs_grad_variance_period=config['stgs_grad_variance_period'],
@@ -2947,6 +3405,16 @@ def main():
         temperature_anneal_epochs=config.get('temperature_anneal_epochs', 0),
         temperature_anneal_reg_lambda=config.get('temperature_anneal_reg_lambda', 0.0),
         temperature_anneal_reg_mode=config.get('temperature_anneal_reg_mode', 'mse'),
+        superposition_metric_every=config.get('superposition_metric_every', 0),
+        superposition_metric_modes=config.get('superposition_metric_modes', 'dot,cos,l2'),
+        superposition_vocab_top_k=config.get('superposition_vocab_top_k', 256),
+        superposition_vocab_source=config.get('superposition_vocab_source', 'wikipedia'),
+        superposition_vocab_dataset_path=config.get('superposition_vocab_dataset_path'),
+        superposition_vocab_hf_name=config.get('superposition_vocab_hf_name', 'lucadiliello/english_wikipedia'),
+        superposition_vocab_hf_split=config.get('superposition_vocab_hf_split', 'train'),
+        superposition_vocab_num_texts=config.get('superposition_vocab_num_texts', 1000),
+        superposition_entropy_temperature=config.get('superposition_entropy_temperature', 1.0),
+        superposition_output_dir=config.get('superposition_output_dir', '.'),
         kwargs=config,
     )
     generated_tokens = opt_result["generated_tokens"]
