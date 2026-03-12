@@ -363,6 +363,8 @@ def parse_args():
     parser.add_argument("--gcg_init_strategy", type=str, default="zeros",
                         choices=["zeros", "random"],
                         help="GCG: token initialization strategy")
+    parser.add_argument("--gcg_candidate_batch_size", type=int, default=8,
+                        help="GCG: number of candidate mutations to score per forward pass")
 
     # O2P-specific parameters
     parser.add_argument("--o2p_model_path", type=str, default=None,
@@ -615,6 +617,9 @@ def parse_args():
     parser.add_argument("--temperatureAnnealRegMode", type=str, default="mse",
                         choices=["mse", "one_sided"],
                         help="Temperature reg penalty: 'mse' (symmetric) or 'one_sided' (only when tau > target)")
+    parser.add_argument("--temperatureLossCouplingLambda", type=float, default=0.0,
+                        help="Weight for loss-coupled temperature regularization: "
+                             "reg = λ * L_main.detach() / τ pushes τ up when loss is high (0=disabled)")
 
     # Prompt distribution entropy regularization (opt-in)
     parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
@@ -665,6 +670,16 @@ def parse_args():
     parser.add_argument("--logits_lora_rank", type=int, default=0,
                         help="LoRA rank for prompt logit factorisation (0 = disabled, "
                              "uses standard free_logits; >0 uses A@B decomposition).")
+
+    # Diversity analysis (opt-in)
+    parser.add_argument("--diversity_n_samples", type=int, default=0,
+                        help="Number of Gumbel draws per temperature for diversity analysis "
+                             "(0 = disabled).")
+    parser.add_argument("--diversity_log_every", type=int, default=10,
+                        help="Run diversity analysis every N epochs (used when diversity_n_samples > 0).")
+    parser.add_argument("--diversity_temperatures", type=str, default="",
+                        help="Comma-separated temperatures for diversity analysis "
+                             "(e.g. '0.1,0.5,1.0,2.0'); empty falls back to the run temperature.")
 
     # Periodic discrete reinitialization (opt-in)
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,

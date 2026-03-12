@@ -225,7 +225,27 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
 
     # Tokenize target for later comparison
     target_tokens = tokenizer(target_text, return_tensors="pt").input_ids[0].cpu().tolist()
-    
+    target_output_dir = Path(f"{output_dir}/target_{target_id}")
+    target_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build diversity callback if requested
+    _diversity_cb = None
+    if config.get("diversity_n_samples", 0) > 0:
+        from diversity_analysis import build_diversity_callback
+        _diversity_temps_str = config.get("diversity_temperatures", "")
+        _diversity_temps = (
+            [float(t.strip()) for t in _diversity_temps_str.split(",") if t.strip()]
+            if _diversity_temps_str
+            else [float(config.get("temperature", 1.0))]
+        )
+        _diversity_cb = build_diversity_callback(
+            tokenizer=tokenizer,
+            temperatures=_diversity_temps,
+            n_samples=int(config["diversity_n_samples"]),
+            output_dir=str(target_output_dir),
+            log_every=int(config.get("diversity_log_every", 10)),
+        )
+
     # Optimize inputs for this target
     opt_result = optimize_inputs(
         model=model,
@@ -246,9 +266,21 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         stgs_hard=config.get("stgs_hard", True),
         stgs_hard_method=config.get("stgs_hard_method", "categorical"),
         stgs_hard_embsim_probs=config.get("stgs_hard_embsim_probs", "gumbel_soft"),
+        stgs_hard_embsim_strategy=config.get("stgs_hard_embsim_strategy", "nearest"),
+        stgs_hard_embsim_top_k=config.get("stgs_hard_embsim_top_k", 8),
+        stgs_hard_embsim_rerank_alpha=config.get("stgs_hard_embsim_rerank_alpha", 0.5),
+        stgs_hard_embsim_sample_tau=config.get("stgs_hard_embsim_sample_tau", 1.0),
+        stgs_hard_embsim_margin=config.get("stgs_hard_embsim_margin", 0.0),
+        stgs_hard_embsim_fallback=config.get("stgs_hard_embsim_fallback", "argmax"),
         bptt_stgs_hard=config.get("bptt_stgs_hard", True),
         bptt_stgs_hard_method=config.get("bptt_stgs_hard_method", "categorical"),
         bptt_stgs_hard_embsim_probs=config.get("bptt_stgs_hard_embsim_probs", "gumbel_soft"),
+        bptt_stgs_hard_embsim_strategy=config.get("bptt_stgs_hard_embsim_strategy", "nearest"),
+        bptt_stgs_hard_embsim_top_k=config.get("bptt_stgs_hard_embsim_top_k", 8),
+        bptt_stgs_hard_embsim_rerank_alpha=config.get("bptt_stgs_hard_embsim_rerank_alpha", 0.5),
+        bptt_stgs_hard_embsim_sample_tau=config.get("bptt_stgs_hard_embsim_sample_tau", 1.0),
+        bptt_stgs_hard_embsim_margin=config.get("bptt_stgs_hard_embsim_margin", 0.0),
+        bptt_stgs_hard_embsim_fallback=config.get("bptt_stgs_hard_embsim_fallback", "argmax"),
         bptt_hidden_state_conditioning=config.get("bptt_hidden_state_conditioning", False),
         plot_every=config.get("plot_every", 100),
         stgs_grad_variance_samples=config.get("stgs_grad_variance_samples", 0),
@@ -298,8 +330,10 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         gcg_pos_choice=config.get("gcg_pos_choice", "uniform"),
         gcg_token_choice=config.get("gcg_token_choice", "uniform"),
         gcg_init_strategy=config.get("gcg_init_strategy", "zeros"),
+        gcg_candidate_batch_size=config.get("gcg_candidate_batch_size", 8),
         # Teacher forcing (for faster training)
         teacher_forcing=config.get("teacher_forcing", False),
+        bptt_teacher_forcing_via_diff_model=config.get("bptt_teacher_forcing_via_diff_model", False),
         # Prompt reconstruction (SODA-style)
         ground_truth_prompt_tokens=ground_truth_prompt_tokens if is_prompt_reconstruction else None,
         ground_truth_prompt=ground_truth_prompt if is_prompt_reconstruction else None,
@@ -333,6 +367,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         temperature_anneal_epochs=config.get("temperature_anneal_epochs", 0),
         temperature_anneal_reg_lambda=config.get("temperatureAnnealRegLambda", 0.0),
         temperature_anneal_reg_mode=config.get("temperatureAnnealRegMode", "mse"),
+        temperature_loss_coupling_lambda=config.get("temperatureLossCouplingLambda", 0.0),
         discrete_reinit_epoch=config.get("discrete_reinit_epoch", 0),
         discrete_reinit_snap=config.get("discrete_reinit_snap", "argmax"),
         gumbel_noise_scale=config.get("gumbel_noise_scale", 1.0),
@@ -354,12 +389,28 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         ppo_kl_mode=config.get("ppo_kl_mode", "soft"),
         ppo_kl_epsilon=config.get("ppo_kl_epsilon", 0.0),
         ppo_ref_update_period=config.get("ppo_ref_update_period", 10),
+        diversity_callback=_diversity_cb,
+        superposition_metric_every=config.get("superposition_metric_every", 0),
+        superposition_metric_modes=config.get("superposition_metric_modes", "dot,cos,l2"),
+        superposition_vocab_top_k=config.get("superposition_vocab_top_k", 256),
+        superposition_vocab_source=config.get("superposition_vocab_source", "wikipedia"),
+        superposition_vocab_dataset_path=(
+            config.get("superposition_vocab_dataset_path")
+            or config.get("dataset_path")
+        ),
+        superposition_vocab_hf_name=config.get("superposition_vocab_hf_name", "lucadiliello/english_wikipedia"),
+        superposition_vocab_hf_split=config.get("superposition_vocab_hf_split", "train"),
+        superposition_vocab_num_texts=config.get("superposition_vocab_num_texts", 1000),
+        superposition_entropy_temperature=config.get("superposition_entropy_temperature", 1.0),
+        superposition_output_dir=str(target_output_dir / "superposition"),
         kwargs=config,
     )
 
     # Extract fields from result dict
     generated_tokens          = opt_result["generated_tokens"]
     optimized_inputs          = opt_result["optimized_inputs"]
+    learnable_logits          = opt_result.get("learnable_logits", optimized_inputs)
+    learnable_temperatures    = opt_result.get("learnable_temperatures", {})
     losses                    = opt_result["losses"]
     lcs_ratio_history         = opt_result["lcs_ratio_history"]
     prompt_metrics_history    = opt_result["prompt_metrics_history"]
@@ -492,9 +543,29 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
     metrics_logger.save_to_file(result, "result.json")
     
     # Save the tensor for future use
-    target_output_dir = Path(f"{output_dir}/target_{target_id}")
-    target_output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(optimized_inputs, target_output_dir / "optimized_inputs.pt")
+    optimized_inputs_path = target_output_dir / "optimized_inputs.pt"
+    learnable_logits_path = target_output_dir / "learnable_logits.pt"
+    learnable_temperatures_path = target_output_dir / "learnable_temperatures.pt"
+    torch.save(optimized_inputs, optimized_inputs_path)
+    torch.save(learnable_logits, learnable_logits_path)
+    torch.save(learnable_temperatures, learnable_temperatures_path)
+
+    if metrics_logger.wandb_run:
+        logits_artifact = wandb.Artifact(
+            name=f"learnable-logits-{run_id}-{target_id}",
+            type="tensor",
+            description="Final learnable logits at the end of sample optimization",
+        )
+        logits_artifact.add_file(str(learnable_logits_path))
+        metrics_logger.wandb_run.log_artifact(logits_artifact)
+
+        temps_artifact = wandb.Artifact(
+            name=f"learnable-temperatures-{run_id}-{target_id}",
+            type="tensor",
+            description="Final learnable temperatures at the end of sample optimization",
+        )
+        temps_artifact.add_file(str(learnable_temperatures_path))
+        metrics_logger.wandb_run.log_artifact(temps_artifact)
     
     # Finish logging
     metrics_logger.finish()
@@ -882,7 +953,7 @@ def parse_args():
     parser.add_argument("--stgs_hard", type=str2bool, default=True,
                         help="Whether to use hard ST-GS")
     parser.add_argument("--stgs_hard_method", type=str, default="categorical",
-                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"],
                         help="Hard token selection method for ST-GS: 'categorical' (Gumbel sample), "
                              "'embsim-dot' (nearest token by dot-product), "
                              "'embsim-cos' (nearest token by cosine similarity), "
@@ -892,6 +963,21 @@ def parse_args():
                         help="Probability source for soft embedding in embsim hard-token methods: "
                              "'gumbel_soft' (use y_soft from Gumbel-Softmax), "
                              "'input_logits' (use softmax(x) of raw input logits)")
+    parser.add_argument("--stgs_hard_embsim_strategy", type=str, default="nearest",
+                        choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"],
+                        help="Embsim post-selection strategy: nearest neighbor, top-k rerank, top-k sample, "
+                             "margin fallback, or LM-top-k-restricted nearest neighbor")
+    parser.add_argument("--stgs_hard_embsim_top_k", type=int, default=8,
+                        help="Top-k candidate size for topk_rerank/topk_sample/lm_topk_restrict embsim strategies")
+    parser.add_argument("--stgs_hard_embsim_rerank_alpha", type=float, default=0.5,
+                        help="Blend weight for topk_rerank: alpha*z(embsim) + (1-alpha)*z(lm_prob)")
+    parser.add_argument("--stgs_hard_embsim_sample_tau", type=float, default=1.0,
+                        help="Temperature over embsim scores for topk_sample")
+    parser.add_argument("--stgs_hard_embsim_margin", type=float, default=0.0,
+                        help="Nearest-vs-second-nearest margin threshold for margin_fallback")
+    parser.add_argument("--stgs_hard_embsim_fallback", type=str, default="argmax",
+                        choices=["argmax", "categorical"],
+                        help="Fallback distribution choice used by margin_fallback")
     parser.add_argument("--eps", type=float, default=1e-10,
                         help="Epsilon value for numerical stability")
     
@@ -954,6 +1040,8 @@ def parse_args():
     parser.add_argument("--gcg_init_strategy", type=str, default="zeros",
                         choices=["zeros", "random"],
                         help="GCG: token initialization strategy")
+    parser.add_argument("--gcg_candidate_batch_size", type=int, default=8,
+                        help="GCG: number of candidate mutations to score per forward pass")
 
     # O2P-specific parameters
     parser.add_argument("--o2p_model_path", type=str, default=None,
@@ -967,6 +1055,9 @@ def parse_args():
     parser.add_argument("--teacher_forcing", type=str2bool, default=False,
                         help="Use teacher forcing for faster training (single forward pass instead of autoregressive). "
                              "Changes loss semantics - predicts next token given correct prefix rather than own generations.")
+    parser.add_argument("--bptt_teacher_forcing_via_diff_model", type=str2bool, default=False,
+                        help="When bptt=True and teacher_forcing=True in STGS mode, use STGSDiffModel "
+                             "teacher-forced hard straight-through outputs instead of a separate BPTT STGS module.")
 
     # BPTT parameters
     parser.add_argument("--bptt", type=str2bool, default=False,
@@ -980,11 +1071,25 @@ def parse_args():
     parser.add_argument("--bptt_stgs_hard", type=str2bool, default=False,
                         help="Whether to use hard ST-GS for BPTT")
     parser.add_argument("--bptt_stgs_hard_method", type=str, default="categorical",
-                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"],
                         help="Hard token selection method for BPTT ST-GS")
     parser.add_argument("--bptt_stgs_hard_embsim_probs", type=str, default="gumbel_soft",
                         choices=["gumbel_soft", "input_logits"],
                         help="Probability source for soft embedding in BPTT embsim hard-token methods")
+    parser.add_argument("--bptt_stgs_hard_embsim_strategy", type=str, default="nearest",
+                        choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"],
+                        help="Embsim post-selection strategy for the BPTT STGS module")
+    parser.add_argument("--bptt_stgs_hard_embsim_top_k", type=int, default=8,
+                        help="Top-k candidate size for BPTT embsim top-k strategies")
+    parser.add_argument("--bptt_stgs_hard_embsim_rerank_alpha", type=float, default=0.5,
+                        help="Blend weight for BPTT topk_rerank")
+    parser.add_argument("--bptt_stgs_hard_embsim_sample_tau", type=float, default=1.0,
+                        help="Temperature over embsim scores for BPTT topk_sample")
+    parser.add_argument("--bptt_stgs_hard_embsim_margin", type=float, default=0.0,
+                        help="Margin threshold for BPTT margin_fallback")
+    parser.add_argument("--bptt_stgs_hard_embsim_fallback", type=str, default="argmax",
+                        choices=["argmax", "categorical"],
+                        help="Fallback choice used by BPTT margin_fallback")
     parser.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False,
                         help="Whether to condition BPTT on hidden states")
     parser.add_argument("--bptt_eps", type=float, default=1e-10,
@@ -1157,6 +1262,9 @@ def parse_args():
     parser.add_argument("--temperatureAnnealRegMode", type=str, default="mse",
                         choices=["mse", "one_sided"],
                         help="Temperature reg penalty: 'mse' (symmetric) or 'one_sided' (only when tau > target)")
+    parser.add_argument("--temperatureLossCouplingLambda", type=float, default=0.0,
+                        help="Weight for loss-coupled temperature regularization: "
+                             "reg = λ * L_main.detach() / τ pushes τ up when loss is high (0=disabled)")
 
     # Prompt distribution entropy regularization (opt-in)
     parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
@@ -1223,6 +1331,39 @@ def parse_args():
     parser.add_argument("--logits_lora_rank", type=int, default=0,
                         help="LoRA rank for prompt logit factorisation (0 = disabled, "
                              "uses standard free_logits; >0 uses A@B decomposition).")
+
+    # Diversity analysis (opt-in)
+    parser.add_argument("--diversity_n_samples", type=int, default=0,
+                        help="Number of Gumbel draws per temperature for diversity analysis "
+                             "(0 = disabled).")
+    parser.add_argument("--diversity_log_every", type=int, default=10,
+                        help="Run diversity analysis every N epochs (used when diversity_n_samples > 0).")
+    parser.add_argument("--diversity_temperatures", type=str, default="",
+                        help="Comma-separated temperatures for diversity analysis "
+                             "(e.g. '0.1,0.5,1.0,2.0'); empty falls back to the run temperature.")
+
+    # Superposition diagnostics (opt-in)
+    parser.add_argument("--superposition_metric_every", type=int, default=0,
+                        help="Run superposition z_i-z_j diagnostics every N epochs (0 = disabled).")
+    parser.add_argument("--superposition_metric_modes", type=str, default="dot,cos,l2",
+                        help="Comma-separated modes for superposition maps: dot,cos,l2.")
+    parser.add_argument("--superposition_vocab_top_k", type=int, default=256,
+                        help="Top-K common tokens used to build z_i-z_j pair space "
+                             "(<=0 means all allowed tokens).")
+    parser.add_argument("--superposition_vocab_source", type=str, default="wikipedia",
+                        choices=["wikipedia", "dataset", "none"],
+                        help="Source used to rank common tokens for top-K subset.")
+    parser.add_argument("--superposition_vocab_dataset_path", type=str, default=None,
+                        help="Path to local dataset used when superposition_vocab_source=dataset. "
+                             "If unset in batch mode, falls back to --dataset_path.")
+    parser.add_argument("--superposition_vocab_hf_name", type=str, default="lucadiliello/english_wikipedia",
+                        help="HF dataset name used when superposition_vocab_source=wikipedia.")
+    parser.add_argument("--superposition_vocab_hf_split", type=str, default="train",
+                        help="HF split used when superposition_vocab_source=wikipedia.")
+    parser.add_argument("--superposition_vocab_num_texts", type=int, default=1000,
+                        help="Number of texts sampled to estimate token frequency for top-K ranking.")
+    parser.add_argument("--superposition_entropy_temperature", type=float, default=1.0,
+                        help="Temperature used in softmax(score/T) for entropy over (i,j) pairs.")
 
     # Periodic discrete reinitialization (opt-in)
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
