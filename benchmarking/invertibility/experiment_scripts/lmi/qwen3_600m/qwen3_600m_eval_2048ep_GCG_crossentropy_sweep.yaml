@@ -1,0 +1,67 @@
+project: LMI-GCG
+entity: kevin-near32-org
+program: batch_optimize_main.py
+command:
+  - ${env}
+  - ./venv/bin/python
+  - ${program}
+  - ${args}
+method: grid
+metric:
+  name: loss
+  goal: minimize
+parameters:
+  dataset_path:
+    values: ["./data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1"]
+  output_dir:
+    values: ["results/qwen3_600m_2048ep_grid_gcg_sweep"]
+  model_name:
+    values: ["Qwen/Qwen3-0.6B"]
+  model_precision:
+    values: ["full"]
+  gradient_checkpointing:
+    values: ["False"]
+  losses:
+    values: ["crossentropy"]
+  seq_len:
+    values: [10, 80]
+  method:
+    values: ["gcg"]
+  baseline_backend:
+    values: ["hf"]
+  gcg_num_candidates:
+    values: [704]
+  gcg_top_k:
+    values: [128]
+  gcg_num_mutations:
+    values: [1]
+  gcg_pos_choice:
+    values: ["uniform"]
+  gcg_token_choice:
+    values: ["uniform"]
+  gcg_init_strategy:
+    values: ["zeros"]
+  gcg_candidate_batch_size:
+    values: [8]
+  epochs:
+    values: [2048]
+  plot_every:
+    values: [100000]
+  seed:
+    values: [10, 20, 30, 40, 50]
+  batch_size:
+    values: [8]
+  num_workers:
+    values: [1]
+  run_discrete_embsim_validation:
+    values: [True]
+  embsim_similarity:
+    values: ["l2"]
+  embsim_use_input_logits:
+    values: [True]
+  early_stop_on_exact_match:
+    values: [False]
+  early_stop_loss_threshold:
+    values: [0]
+  early_stop_embsim_lcs_ratio_threshold:
+    values: [1.0]

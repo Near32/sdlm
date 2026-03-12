@@ -6,10 +6,10 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --dataset_path="../../../data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
 --output_dir="results/qwen3-600m-base_STGS+Soft+LearnTau+SoftBPTT+LearnBTau+BS=16+LR=1e-1+SEED=2_test_k1-5-25-run" \
 --learning_rate=1.0e-1  \
---epochs 8192 \
+--epochs 512 \
 --model_precision full \
 --gradient_checkpointing=False \
---losses="hinge-margin=0" \
+--losses="crossentropy" \
 --loss_pos_weight_schedule="uniform" \
 --loss_pos_weight_step=2.0 \
 --loss_pos_weight_base=2.0 \
@@ -29,27 +29,34 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --stgs_grad_bias_reference_reward_scale=1.0 \
 --stgs_grad_bias_reference_baseline_beta=0.9 \
 \
---batch_size=32 \
+--batch_size=8 \
 --seed=10 \
 --num_workers=1 \
 \
---seq_len=10 \
+--seq_len=80 \
 \
 --stgs_hard=False \
 --stgs_hard_method="embsim-l2" \
 --stgs_hard_embsim_probs="gumbel_soft" \
+--stgs_hard_embsim_strategy="topk_sample" \
+--stgs_hard_embsim_top_k=8 \
+--stgs_hard_embsim_rerank_alpha=0.5 \
+--stgs_hard_embsim_sample_tau=1.0 \
+--stgs_hard_embsim_margin=0.0 \
+--stgs_hard_embsim_fallback="argmax" \
 --logits_normalize="none" \
 --logits_top_k=0 \
 --logits_top_p=1.0 \
 --logit_decay=0.0 \
 --learnable_temperature=True \
 --decouple_learnable_temperature=True \
+--temperatureLossCouplingLambda=0.0 \
 --temperature=100.0 \
 \
 --logits_lora_rank=4 \
 --stgs_input_dropout=0.0 \
 --stgs_output_dropout=0.0 \
---gumbel_noise_scale=1.0 \
+--gumbel_noise_scale=0.06125 \
 --adaptive_gumbel_noise=False \
 --adaptive_gumbel_noise_beta=0.9 \
 --adaptive_gumbel_noise_min_scale=0.0 \
@@ -66,11 +73,21 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --commitment_similarity="embsim-l2" \
 \
 --bptt=False \
+--bptt_teacher_forcing_via_diff_model=False \
 --bptt_stgs_hard=False \
---bptt_logits_normalize="none" \
+--bptt_stgs_hard_method="categorical" \
+--bptt_stgs_hard_embsim_probs="gumbel_soft" \
+--bptt_stgs_hard_embsim_strategy="nearest" \
+--bptt_stgs_hard_embsim_top_k=8 \
+--bptt_stgs_hard_embsim_rerank_alpha=0.5 \
+--bptt_stgs_hard_embsim_sample_tau=1.0 \
+--bptt_stgs_hard_embsim_margin=0.0 \
+--bptt_stgs_hard_embsim_fallback="argmax" \
+--bptt_logits_normalize="zscore" \
 --bptt_learnable_temperature=False \
+--bptt_decouple_learnable_temperature=False \
 --bptt_hidden_state_conditioning=False \
---bptt_temperature=100.0 \
+--bptt_temperature=1.0 \
 \
 --init_strategy='zeros' \
 --init_std=0.0 \
@@ -81,7 +98,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --early_stop_loss_threshold=0.0 \
 --early_stop_embsim_lcs_ratio_threshold=1.0 \
 \
---run_discrete_validation=False \
+--run_discrete_validation=True \
 --run_discrete_embsim_validation=True \
 --embsim_similarity="l2" \
 --embsim_teacher_forcing=False \
@@ -89,9 +106,9 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --embsim_temperature=1.0 \
 \
 --temperature_anneal_schedule="none" \
---temperature_anneal_min=0.05 \
+--temperature_anneal_min=0.75 \
 --temperature_anneal_epochs=2000 \
---temperatureAnnealRegLambda=0.01 \
+--temperatureAnnealRegLambda=0.1 \
 --temperatureAnnealRegMode="mse" \
 \
 --eos_reg_lambda=0.0 \
@@ -115,7 +132,16 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 \
 --semantic_metrics_every_n_epochs=128 \
 --bertscore_model=distilbert-base-uncased \
---sentencebert_model=all-MiniLM-L6-v2 
+--sentencebert_model=all-MiniLM-L6-v2 \
+\
+--superposition_metric_every=256 \
+--superposition_metric_modes="cos,l2" \
+--superposition_vocab_top_k=512 \
+--superposition_vocab_source="dataset" \
+--superposition_vocab_hf_name="lucadiliello/english_wikipedia" \
+--superposition_vocab_hf_split="train" \
+--superposition_vocab_num_texts=1000 \
+--superposition_entropy_temperature=1.0
 
 
 #--target_indices="0,1" 
