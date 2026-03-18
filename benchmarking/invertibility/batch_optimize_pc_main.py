@@ -668,6 +668,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         use_batched_eval=config.get("use_batched_eval", False),
         gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
         val_eval_before_training=config.get("val_eval_before_training", False),
+        initial_prompt_text=config.get("initial_prompt_text") or None,
         use_chat_template=config.get("use_chat_template", False),
         accumulate_embeds=config.get("efficient_generate", False),
         prompt_logits_transform=prompt_logits_transform,
@@ -918,6 +919,10 @@ def parse_args() -> argparse.Namespace:
     # Optimization
     p.add_argument("--losses", type=str, default="crossentropy")
     p.add_argument("--seq_len", type=int, default=20)
+    p.add_argument("--initial_prompt_text", type=str, default=None,
+                   help="Tokenize this text and use it as the initial prompt. "
+                        "Overrides --seq_len with the number of tokens in the text, "
+                        "and initializes free_logits as one-hot encodings of those tokens.")
     p.add_argument(
         "--epochs",
         type=int,

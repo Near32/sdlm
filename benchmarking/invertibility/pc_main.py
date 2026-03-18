@@ -1764,6 +1764,7 @@ def pc_optimize_inputs(
     losses: str = "crossentropy",
     # Optimization
     seq_len: int = 20,
+    initial_prompt_text: Optional[str] = None,
     epochs: int = 2000,
     learning_rate: float = 0.01,
     inner_batch_size: int = 4,
@@ -2034,6 +2035,19 @@ def pc_optimize_inputs(
                     x_embeds_cache[x_str] = embedding_layer(x_ids)
 
     # -----------------------------------------------------------------------
+    # Override seq_len from initial_prompt_text (if provided)
+    # -----------------------------------------------------------------------
+    _initial_prompt_token_ids: Optional[Tensor] = None
+    if initial_prompt_text:
+        _tok_out = tokenizer(initial_prompt_text, add_special_tokens=False, return_tensors="pt")
+        _initial_prompt_token_ids = _tok_out.input_ids[0].to(device)   # (n_tokens,)
+        seq_len = int(_initial_prompt_token_ids.shape[0])
+        logger.info(
+            "initial_prompt_text overrides seq_len → %d tokens: %r",
+            seq_len, initial_prompt_text,
+        )
+
+    # -----------------------------------------------------------------------
     # Build LossClass cache keyed by (y_raw_str, Y_len)
     # -----------------------------------------------------------------------
     lc_kwargs = dict(kwargs)
@@ -2098,6 +2112,19 @@ def pc_optimize_inputs(
             mlm_top_k=init_mlm_top_k,
         )
         parameters = [free_logits]
+
+    # One-hot initialization from initial_prompt_text
+    if _initial_prompt_token_ids is not None:
+        if logits_lora_rank > 0:
+            logger.warning(
+                "initial_prompt_text with logits_lora_rank > 0: seq_len is overridden "
+                "but logit initialization remains random (one-hot init unsupported for LoRA)."
+            )
+        else:
+            _oh = torch.zeros(1, seq_len, vocab_size, device=device)
+            _oh[0, torch.arange(seq_len, device=device), _initial_prompt_token_ids.long()] = 10.0
+            free_logits = _oh.detach().requires_grad_(True)
+            parameters = [free_logits]
 
     length_alpha = None
     eos_logit_template = None

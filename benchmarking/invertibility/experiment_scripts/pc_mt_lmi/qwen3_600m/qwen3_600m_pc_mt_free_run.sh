@@ -34,6 +34,9 @@ MAX_NEW_TOKENS_Y=4
 EPOCHS=2048
 LR=0.1
 SEQ_LEN=20
+# initial_prompt_text: non-empty string = tokenize and use as starting prompt, overrides SEQ_LEN;
+#   empty string = ignore (use SEQ_LEN and init_strategy instead)
+INITIAL_PROMPT_TEXT=""
 INNER_BATCH_SIZE=8
 LOSSES="crossentropy"
 
@@ -65,7 +68,7 @@ USE_BATCHED_EVAL=True
 GRADIENT_ACCUMULATION_STEPS=1
 # val_eval_before_training: True = run one validation epoch before the first training epoch (epoch -1);
 #   False = no pre-training validation (default)
-VAL_EVAL_BEFORE_TRAINING=False
+VAL_EVAL_BEFORE_TRAINING=True
 
 # --- Validation ---
 VAL_EVAL_EVERY=10
@@ -100,6 +103,11 @@ REASONING_GENERATE_EARLY_STOPPING=False
 RUN_NAME="${MODEL_KEY}_pc_mt_free_gsm8k_SL${SEQ_LEN}_EP${EPOCHS}_LR${LR}_SEED${OPT_SEED}"
 OUTPUT_DIR="results/pc_mt/${RUN_NAME}"
 SUPERPOSITION_OUTPUT_DIR="${OUTPUT_DIR}/superposition"
+
+INITIAL_PROMPT_TEXT_ARGS=()
+if [[ -n "${INITIAL_PROMPT_TEXT}" ]]; then
+    INITIAL_PROMPT_TEXT_ARGS=(--initial_prompt_text "${INITIAL_PROMPT_TEXT}")
+fi
 
 SUPERPOSITION_ARGS=()
 if [[ ${SUPERPOSITION_METRIC_EVERY} -gt 0 ]]; then
@@ -211,6 +219,7 @@ python -m ipdb -c c batch_optimize_pc_main.py \
     --wandb_project "sdlm-pc-mt-lmi" \
     --wandb_tags "qwen3-600m,free-r,chat-template,gsm8k" \
     --weave_project "sdlm-pc-mt-lmi" \
+    "${INITIAL_PROMPT_TEXT_ARGS[@]}" \
     "${SUPERPOSITION_ARGS[@]}"
 
 echo "Done: ${OUTPUT_DIR}"
