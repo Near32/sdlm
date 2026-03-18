@@ -328,7 +328,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         call_link_log_path=Path(config["output_dir"]) / "weave_call_links.log",
     )
 
-    # ---- test eval callback (periodic during training) ----
+    # ---- test eval callback (full test epoch during training) ----
     test_eval_every = config.get("test_eval_every", 0)
     test_eval_size = config.get("test_eval_size", len(test_pairs))
     test_pairs_eval = test_pairs[:test_eval_size] if test_eval_size < len(test_pairs) else test_pairs
@@ -382,7 +382,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         )
 
     def _test_eval_callback(epoch: int, fl: torch.Tensor) -> Dict:
-        if test_eval_every <= 0 or (epoch % test_eval_every != 0):
+        if test_eval_every <= 0 or ((epoch + 1) % test_eval_every != 0):
             return {}
         metrics = evaluate_shared_prompt(
             free_logits=fl,
@@ -710,7 +710,12 @@ def parse_args() -> argparse.Namespace:
     # Optimization
     p.add_argument("--losses", type=str, default="crossentropy")
     p.add_argument("--seq_len", type=int, default=20)
-    p.add_argument("--epochs", type=int, default=2000)
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=2000,
+        help="Number of full passes over the training split.",
+    )
     p.add_argument("--learning_rate", type=float, default=0.01)
     p.add_argument(
         "--logits_lora_b_learning_rate",
@@ -860,8 +865,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
 
     # Validation / test eval
-    p.add_argument("--val_eval_every", type=int, default=100)
-    p.add_argument("--test_eval_every", type=int, default=0)
+    p.add_argument(
+        "--val_eval_every",
+        type=int,
+        default=100,
+        help="Run one full validation epoch every N completed train epochs (0 = disabled).",
+    )
+    p.add_argument(
+        "--test_eval_every",
+        type=int,
+        default=0,
+        help="Run one full scheduled test epoch every N completed train epochs (0 = disabled).",
+    )
     p.add_argument("--test_eval_size", type=int, default=0,
                    help="0 = same as test_size")
 

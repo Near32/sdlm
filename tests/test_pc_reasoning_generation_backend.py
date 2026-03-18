@@ -398,3 +398,186 @@ def test_pc_optimize_inputs_propagates_reasoning_backend_to_validation(monkeypat
     assert len(captured_eval_kwargs) == 1
     assert captured_eval_kwargs[0]["reasoning_generation_backend"] == "hf_generate"
     assert captured_eval_kwargs[0]["reasoning_generate_kwargs"] == {"top_p": 0.6}
+
+
+def _configure_pc_optimize_test_runtime(monkeypatch, pc_main, *, train_step_traces=None):
+    class FakeTrainSTGS(torch.nn.Module):
+        def __init__(self, vocab_size, init_temperature=1.0, eps=1e-10, device="cpu", **kwargs):
+            super().__init__()
+            del kwargs
+            self.vocab_size = vocab_size
+            self.init_temperature = init_temperature
+            self.eps = eps
+            self.device = device
+            self.learnable_temperature = False
+
+    class FakeLoss:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeOptimizer:
+        def zero_grad(self):
+            return None
+
+        def step(self):
+            return None
+
+    def fake_forward_pass(**kwargs):
+        weave_extras = kwargs["weave_extras"]
+        weave_extras["y_pred_text"] = kwargs["y_target_text_raw"]
+        weave_extras.setdefault("lm_traces", []).append({})
+        return torch.ones((), dtype=torch.float32, requires_grad=True)
+
+    monkeypatch.setattr(pc_main, "STGS", FakeTrainSTGS)
+    monkeypatch.setattr(pc_main, "LossClass", FakeLoss)
+    monkeypatch.setattr(pc_main, "build_prompt_optimizer", lambda *args, **kwargs: FakeOptimizer())
+    monkeypatch.setattr(pc_main, "pc_forward_pass", fake_forward_pass)
+    monkeypatch.setattr(pc_main, "wandb", types.SimpleNamespace(run=None, log=lambda *args, **kwargs: None))
+    monkeypatch.setattr(pc_main.random, "shuffle", lambda items: None)
+    if train_step_traces is not None:
+        monkeypatch.setattr(
+            pc_main,
+            "weave_lm_train_step",
+            lambda **kwargs: train_step_traces.append(kwargs),
+        )
+
+
+def test_pc_optimize_inputs_runs_full_train_epochs_with_iteration_traces(monkeypatch):
+    pc_main = _load_pc_main_runtime()
+    model = _FakeModel()
+    tokenizer = _FakeTokenizer()
+    diff_model = _FakeDiffModel(vocab_size=model.config.vocab_size)
+    train_step_traces = []
+
+    _configure_pc_optimize_test_runtime(
+        monkeypatch,
+        pc_main,
+        train_step_traces=train_step_traces,
+    )
+    monkeypatch.setattr(
+        pc_main,
+        "evaluate_shared_prompt",
+        lambda **kwargs: {"any_correct": 0.0},
+    )
+
+    result = pc_main.pc_optimize_inputs(
+        model=model,
+        diff_model=diff_model,
+        tokenizer=tokenizer,
+        device="cpu",
+        model_precision="full",
+        train_triples=[
+            ("train-x1", "train-r1", "train-y1"),
+            ("train-x2", "train-r2", "train-y2"),
+            ("train-x3", "train-r3", "train-y3"),
+        ],
+        val_pairs=None,
+        extraction_prompt="answer:",
+        extraction_fns={"extractor": lambda text: text},
+        seq_len=2,
+        epochs=2,
+        inner_batch_size=2,
+    )
+
+    assert result["loss_history"] == [1.0, 1.0]
+    assert [entry["n_train"] for entry in result["train_accuracy_history"]] == [3.0, 3.0]
+
+    epoch0_traces = [trace for trace in train_step_traces if trace["epoch"] == 0]
+    epoch1_traces = [trace for trace in train_step_traces if trace["epoch"] == 1]
+    assert [trace["x_text_raw"] for trace in epoch0_traces] == ["train-x1", "train-x2", "train-x3"]
+    assert [trace["x_text_raw"] for trace in epoch1_traces] == ["train-x1", "train-x2", "train-x3"]
+    assert [trace["iteration"] for trace in epoch0_traces] == [0, 0, 1]
+    assert [trace["iteration"] for trace in epoch1_traces] == [0, 0, 1]
+    assert [trace["global_iteration"] for trace in train_step_traces] == [0, 0, 1, 2, 2, 3]
+
+
+def test_pc_optimize_inputs_schedules_validation_before_independent_test_epochs(monkeypatch):
+    pc_main = _load_pc_main_runtime()
+    model = _FakeModel()
+    tokenizer = _FakeTokenizer()
+    diff_model = _FakeDiffModel(vocab_size=model.config.vocab_size)
+    events = []
+
+    _configure_pc_optimize_test_runtime(monkeypatch, pc_main)
+
+    def fake_evaluate_shared_prompt(**kwargs):
+        events.append((kwargs["eval_split"], kwargs["epoch"]))
+        return {"any_correct": 0.0}
+
+    monkeypatch.setattr(pc_main, "evaluate_shared_prompt", fake_evaluate_shared_prompt)
+
+    def periodic_test_callback(epoch, fl):
+        del fl
+        if (epoch + 1) % 3 == 0:
+            events.append(("test", epoch))
+        return {}
+
+    result = pc_main.pc_optimize_inputs(
+        model=model,
+        diff_model=diff_model,
+        tokenizer=tokenizer,
+        device="cpu",
+        model_precision="full",
+        train_triples=[
+            ("train-x1", "train-r1", "train-y1"),
+            ("train-x2", "train-r2", "train-y2"),
+        ],
+        val_pairs=[("val-x", "val-y")],
+        extraction_prompt="answer:",
+        extraction_fns={"extractor": lambda text: text},
+        seq_len=2,
+        epochs=6,
+        inner_batch_size=1,
+        val_eval_every=2,
+        per_epoch_callback=periodic_test_callback,
+    )
+
+    assert [entry["epoch"] for entry in result["val_accuracy_history"]] == [1, 3, 5]
+    assert events == [
+        ("val", 1),
+        ("test", 2),
+        ("val", 3),
+        ("val", 5),
+        ("test", 5),
+    ]
+
+
+def test_pc_optimize_inputs_treats_large_batch_as_single_iteration_epoch(monkeypatch):
+    pc_main = _load_pc_main_runtime()
+    model = _FakeModel()
+    tokenizer = _FakeTokenizer()
+    diff_model = _FakeDiffModel(vocab_size=model.config.vocab_size)
+    train_step_traces = []
+
+    _configure_pc_optimize_test_runtime(
+        monkeypatch,
+        pc_main,
+        train_step_traces=train_step_traces,
+    )
+    monkeypatch.setattr(
+        pc_main,
+        "evaluate_shared_prompt",
+        lambda **kwargs: {"any_correct": 0.0},
+    )
+
+    result = pc_main.pc_optimize_inputs(
+        model=model,
+        diff_model=diff_model,
+        tokenizer=tokenizer,
+        device="cpu",
+        model_precision="full",
+        train_triples=[
+            ("train-x1", "train-r1", "train-y1"),
+            ("train-x2", "train-r2", "train-y2"),
+        ],
+        val_pairs=None,
+        extraction_prompt="answer:",
+        extraction_fns={"extractor": lambda text: text},
+        seq_len=2,
+        epochs=1,
+        inner_batch_size=8,
+    )
+
+    assert result["loss_history"] == [1.0]
+    assert result["train_accuracy_history"][0]["n_train"] == 2.0
+    assert [trace["iteration"] for trace in train_step_traces] == [0, 0]
