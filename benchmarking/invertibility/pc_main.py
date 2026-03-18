@@ -1572,6 +1572,172 @@ def evaluate_shared_prompt(
     return metrics
 
 
+def evaluate_shared_prompt_batched(
+    free_logits: Tensor,
+    eval_pairs: List[Tuple[str, str]],
+    model,
+    diff_model,
+    stgs_module,
+    embedding_weights: Tensor,
+    tokenizer,
+    device,
+    E_input_ids: Tensor,
+    E_embeds: Tensor,
+    extraction_fns: Dict[str, Callable],
+    max_new_tokens_reasoning: int,
+    max_new_tokens_answer: int,
+    eval_mode: str = "discrete",
+    reasoning_generation_backend: str = "diff",
+    reasoning_generate_kwargs: Optional[Dict] = None,
+    use_chat_template: bool = False,
+    epoch: int = 0,
+    eval_split: str = "eval",
+    x_ids_cache: Optional[Dict] = None,
+    x_embeds_cache: Optional[Dict] = None,
+    accumulate_embeds: bool = False,
+    prompt_logits_transform: Optional[Callable] = None,
+) -> Dict[str, float]:
+    """Batched counterpart of evaluate_shared_prompt.
+
+    Processes all eval_pairs in a single generate call (per stage).
+    Falls back to evaluate_shared_prompt when len(eval_pairs) <= 1.
+    """
+    if len(eval_pairs) <= 1:
+        return evaluate_shared_prompt(
+            free_logits=free_logits, eval_pairs=eval_pairs,
+            model=model, diff_model=diff_model, stgs_module=stgs_module,
+            embedding_weights=embedding_weights, tokenizer=tokenizer,
+            device=device, E_input_ids=E_input_ids, E_embeds=E_embeds,
+            extraction_fns=extraction_fns,
+            max_new_tokens_reasoning=max_new_tokens_reasoning,
+            max_new_tokens_answer=max_new_tokens_answer,
+            eval_mode=eval_mode,
+            reasoning_generation_backend=reasoning_generation_backend,
+            reasoning_generate_kwargs=reasoning_generate_kwargs or {},
+            use_chat_template=use_chat_template,
+            epoch=epoch, eval_split=eval_split,
+            x_ids_cache=x_ids_cache, x_embeds_cache=x_embeds_cache,
+            accumulate_embeds=accumulate_embeds,
+            prompt_logits_transform=prompt_logits_transform,
+        )
+
+    embedding_layer = model.get_input_embeddings()
+    p_ids = free_logits.detach().argmax(dim=-1)   # (1, seq_len)
+
+    # Tokenize all x inputs
+    x_ids_list = []
+    for x_str, _ in eval_pairs:
+        if x_ids_cache and x_str in x_ids_cache:
+            x_ids_list.append(x_ids_cache[x_str])
+        else:
+            x_ids_list.append(_tokenize_x(x_str, tokenizer, device, use_chat_template))
+
+    B = len(eval_pairs)
+
+    if eval_mode == "discrete":
+        # Stage 1: left-pad [x_i | p] token ids for batched reasoning generate
+        xp_seqs = [torch.cat([xi, p_ids], dim=1) for xi in x_ids_list]
+        max_xp  = max(s.shape[1] for s in xp_seqs)
+        xp_pad  = torch.full((B, max_xp), tokenizer.pad_token_id, dtype=torch.long, device=device)
+        xp_mask = torch.zeros(B, max_xp, dtype=torch.long, device=device)
+        for i, s in enumerate(xp_seqs):
+            L = s.shape[1]; xp_pad[i, max_xp-L:] = s[0]; xp_mask[i, max_xp-L:] = 1
+
+        r_gen = model.generate(
+            input_ids=xp_pad, attention_mask=xp_mask,
+            max_new_tokens=max_new_tokens_reasoning,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        R_ids = r_gen.sequences[:, max_xp:]   # (B, max_new_tokens_reasoning)
+
+        # Stage 2: left-pad [x_i | p | R_i | E]
+        xpRE_seqs = [
+            torch.cat([x_ids_list[i], p_ids, R_ids[i:i+1], E_input_ids], dim=1)
+            for i in range(B)
+        ]
+        max_xpRE = max(s.shape[1] for s in xpRE_seqs)
+        xpRE_pad  = torch.full((B, max_xpRE), tokenizer.pad_token_id, dtype=torch.long, device=device)
+        xpRE_mask = torch.zeros(B, max_xpRE, dtype=torch.long, device=device)
+        for i, s in enumerate(xpRE_seqs):
+            L = s.shape[1]; xpRE_pad[i, max_xpRE-L:] = s[0]; xpRE_mask[i, max_xpRE-L:] = 1
+
+        y_gen   = model.generate(
+            input_ids=xpRE_pad, attention_mask=xpRE_mask,
+            max_new_tokens=max_new_tokens_answer,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        Y_ids   = y_gen.sequences[:, max_xpRE:]   # (B, max_new_tokens_answer)
+        R_for_accuracy = R_ids
+
+    else:  # soft
+        if x_embeds_cache:
+            x_emb_list = [
+                x_embeds_cache.get(x_str) or embedding_layer(x_ids_list[i])
+                for i, (x_str, _) in enumerate(eval_pairs)
+            ]
+        else:
+            with torch.no_grad():
+                x_emb_list = [embedding_layer(xid) for xid in x_ids_list]
+
+        _, oh, _, _ = stgs_module(
+            free_logits, gumbel_noise_scale=0.0, embedding_weights=embedding_weights,
+        )
+        p_emb = oh @ embedding_weights.detach()   # (1, seq_len, d)
+
+        xp_seqs = [torch.cat([xe, p_emb], dim=1) for xe in x_emb_list]
+        xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, x_emb_list[0].dtype)
+        with torch.no_grad():
+            r_out = diff_model.generate(
+                inputs_embeds=xp_padded, attention_mask=xp_mask,
+                max_new_tokens=max_new_tokens_reasoning,
+                output_normal_logits=False, return_dict=True,
+                accumulate_embeds=accumulate_embeds,
+            )
+        R_emb = (
+            r_out.sampled_diff_embeds if r_out.sampled_diff_embeds is not None
+            else r_out.sampled_diff_one_hot @ embedding_weights.detach()
+        ).detach()
+        R_ids_soft = r_out.sampled_diff_tokens   # (B, R_gen_len) for text decoding
+
+        xpRE_seqs = [
+            torch.cat([x_emb_list[i], p_emb, R_emb[i:i+1], E_embeds], dim=1)
+            for i in range(B)
+        ]
+        xpRE_padded, xpRE_mask = _left_pad_embed_sequences(xpRE_seqs, device, x_emb_list[0].dtype)
+        with torch.no_grad():
+            y_out = diff_model.generate(
+                inputs_embeds=xpRE_padded, attention_mask=xpRE_mask,
+                max_new_tokens=max_new_tokens_answer,
+                output_normal_logits=False, return_dict=True,
+            )
+        Y_ids = y_out.sampled_diff_tokens          # (B, max_new_tokens_answer)
+        R_for_accuracy = R_ids_soft
+
+    # Aggregate accuracy
+    any_correct    = 0
+    all_correct    = 0
+    method_correct: Dict[str, int] = {m: 0 for m in extraction_fns}
+    for i, (_, y_raw) in enumerate(eval_pairs):
+        R_text = tokenizer.decode(R_for_accuracy[i].tolist(), skip_special_tokens=True)
+        Y_text = tokenizer.decode(Y_ids[i].tolist(), skip_special_tokens=True)
+        res = _compute_method_results(
+            R_text=R_text, Y_text=Y_text,
+            y_raw_str=y_raw, extraction_fns=extraction_fns,
+        )
+        for m, ok in res.items():
+            if ok: method_correct[m] += 1
+        any_correct += int(any(res.values()))
+        all_correct += int(all(res.values()))
+
+    out: Dict[str, float] = {
+        "any_correct": any_correct / max(B, 1),
+        "all_correct": all_correct / max(B, 1),
+    }
+    for m, cnt in method_correct.items():
+        out[f"{m}_correct"] = cnt / max(B, 1)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Core optimization loop
 # ---------------------------------------------------------------------------
