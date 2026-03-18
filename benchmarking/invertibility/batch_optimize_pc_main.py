@@ -667,6 +667,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         batched_stgs_noise_mode=config.get("batched_stgs_noise_mode", "shared"),
         use_batched_eval=config.get("use_batched_eval", False),
         gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
+        val_eval_before_training=config.get("val_eval_before_training", False),
         use_chat_template=config.get("use_chat_template", False),
         accumulate_embeds=config.get("efficient_generate", False),
         prompt_logits_transform=prompt_logits_transform,
@@ -1083,6 +1084,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gradient_accumulation_steps", type=int, default=1,
                    help="Accumulate gradients over N mini-batches before optimizer.step(). "
                         "Effective batch size = inner_batch_size × gradient_accumulation_steps.")
+    p.add_argument("--val_eval_before_training", type=str2bool, default=False,
+                   help="Run a validation epoch before the very first training epoch (epoch -1). "
+                        "Useful to record baseline accuracy before any gradient updates.")
 
     # Validation / test eval
     p.add_argument(

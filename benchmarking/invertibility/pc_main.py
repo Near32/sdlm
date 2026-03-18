@@ -1868,6 +1868,8 @@ def pc_optimize_inputs(
     use_batched_eval: bool = False,
     # Gradient accumulation
     gradient_accumulation_steps: int = 1,
+    # Pre-training validation
+    val_eval_before_training: bool = False,
     # Chat template
     use_chat_template: bool = False,
     # Memory / speed optimizations
@@ -2262,6 +2264,41 @@ def pc_optimize_inputs(
         leave=True,
     )
     optimizer.zero_grad()
+
+    # Pre-training validation (epoch -1)
+    if val_eval_before_training and val_pairs:
+        _eval_fn = evaluate_shared_prompt_batched if use_batched_eval else evaluate_shared_prompt
+        _pre_fl = _assemble_prompt_logits().detach()
+        _pre_val_metrics = _eval_fn(
+            free_logits=_pre_fl,
+            eval_pairs=val_pairs,
+            model=model,
+            diff_model=diff_model,
+            stgs_module=stgs_module,
+            embedding_weights=embedding_weights,
+            tokenizer=tokenizer,
+            device=device,
+            E_input_ids=E_input_ids,
+            E_embeds=E_embeds,
+            extraction_fns=extraction_fns,
+            max_new_tokens_reasoning=max_new_tokens_reasoning,
+            max_new_tokens_answer=max_new_tokens_answer,
+            eval_mode=val_prompt_eval_mode,
+            reasoning_generation_backend=reasoning_generation_backend,
+            reasoning_generate_kwargs=reasoning_generate_kwargs,
+            use_chat_template=use_chat_template,
+            epoch=-1,
+            eval_split="val",
+            x_ids_cache=x_ids_cache,
+            x_embeds_cache=x_embeds_cache if val_prompt_eval_mode == "soft" else None,
+            accumulate_embeds=accumulate_embeds,
+            prompt_logits_transform=prompt_logits_transform,
+        )
+        _pre_val_metrics["epoch"] = -1
+        val_accuracy_history.append(_pre_val_metrics)
+        if wandb.run is not None:
+            wandb.log({f"val/{k}": v for k, v in _pre_val_metrics.items()})
+
     try:
         for epoch in range(epochs):
             # Temperature annealing

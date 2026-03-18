@@ -50,11 +50,39 @@ LOGITS_TOP_P=1.0
 GUMBEL_NOISE_SCALE=0.06125
 INIT_STRATEGY="zeros"
 
+# --- Batched forward pass + gradient accumulation ---
+# use_batched_forward_pass: True = single batched GPU forward per mini-batch (faster on GPU);
+#   False = serial per-sample loop (current default, matches pre-batching behavior)
+USE_BATCHED_FORWARD_PASS=True
+# batched_stgs_noise_mode: "shared" = one Gumbel draw broadcast to all B samples (lower variance);
+#   "independent" = one draw per sample (higher exploration)
+BATCHED_STGS_NOISE_MODE="shared"
+# use_batched_eval: True = single batched generate per stage for all eval pairs (faster);
+#   False = serial per-sample eval loop (current default)
+USE_BATCHED_EVAL=True
+# gradient_accumulation_steps: N = accumulate gradients over N mini-batches before optimizer.step();
+#   1 = step every mini-batch (current default); >1 increases effective batch size without extra GPU memory
+GRADIENT_ACCUMULATION_STEPS=1
+# val_eval_before_training: True = run one validation epoch before the first training epoch (epoch -1);
+#   False = no pre-training validation (default)
+VAL_EVAL_BEFORE_TRAINING=False
+
 # --- Validation ---
 VAL_EVAL_EVERY=10
 TEST_EVAL_EVERY=20
 VAL_PROMPT_EVAL_MODE="soft"
 TEST_PROMPT_EVAL_MODE="soft"
+
+# --- Superposition metric ---
+SUPERPOSITION_METRIC_EVERY=0
+SUPERPOSITION_METRIC_MODES="l2" #dot,cos,l2
+SUPERPOSITION_VOCAB_TOP_K=256
+SUPERPOSITION_VOCAB_SOURCE="wikipedia"
+SUPERPOSITION_VOCAB_DATASET_PATH=""
+SUPERPOSITION_VOCAB_HF_NAME="lucadiliello/english_wikipedia"
+SUPERPOSITION_VOCAB_HF_SPLIT="train"
+SUPERPOSITION_VOCAB_NUM_TEXTS=1000
+SUPERPOSITION_ENTROPY_TEMPERATURE=1.0
 
 # --- Reasoning generation backend ---
 REASONING_GENERATION_BACKEND="hf_generate"
@@ -71,6 +99,27 @@ REASONING_GENERATE_EARLY_STOPPING=False
 
 RUN_NAME="${MODEL_KEY}_pc_mt_free_gsm8k_SL${SEQ_LEN}_EP${EPOCHS}_LR${LR}_SEED${OPT_SEED}"
 OUTPUT_DIR="results/pc_mt/${RUN_NAME}"
+SUPERPOSITION_OUTPUT_DIR="${OUTPUT_DIR}/superposition"
+
+SUPERPOSITION_ARGS=()
+if [[ ${SUPERPOSITION_METRIC_EVERY} -gt 0 ]]; then
+    SUPERPOSITION_ARGS=(
+        --superposition_metric_every "${SUPERPOSITION_METRIC_EVERY}"
+        --superposition_metric_modes "${SUPERPOSITION_METRIC_MODES}"
+        --superposition_vocab_top_k "${SUPERPOSITION_VOCAB_TOP_K}"
+        --superposition_vocab_source "${SUPERPOSITION_VOCAB_SOURCE}"
+        --superposition_vocab_hf_name "${SUPERPOSITION_VOCAB_HF_NAME}"
+        --superposition_vocab_hf_split "${SUPERPOSITION_VOCAB_HF_SPLIT}"
+        --superposition_vocab_num_texts "${SUPERPOSITION_VOCAB_NUM_TEXTS}"
+        --superposition_entropy_temperature "${SUPERPOSITION_ENTROPY_TEMPERATURE}"
+        --superposition_output_dir "${SUPERPOSITION_OUTPUT_DIR}"
+    )
+    if [[ -n "${SUPERPOSITION_VOCAB_DATASET_PATH}" ]]; then
+        SUPERPOSITION_ARGS+=(
+            --superposition_vocab_dataset_path "${SUPERPOSITION_VOCAB_DATASET_PATH}"
+        )
+    fi
+fi
 
 echo ""
 echo "=============================================="
@@ -144,6 +193,12 @@ python -m ipdb -c c batch_optimize_pc_main.py \
     --diff_model_temperature 1.0 \
     --diff_model_hard True \
     \
+    --use_batched_forward_pass ${USE_BATCHED_FORWARD_PASS} \
+    --batched_stgs_noise_mode ${BATCHED_STGS_NOISE_MODE} \
+    --use_batched_eval ${USE_BATCHED_EVAL} \
+    --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
+    --val_eval_before_training ${VAL_EVAL_BEFORE_TRAINING} \
+    \
     --val_eval_every ${VAL_EVAL_EVERY} \
     --test_eval_every ${TEST_EVAL_EVERY} \
     --val_prompt_eval_mode ${VAL_PROMPT_EVAL_MODE} \
@@ -155,6 +210,7 @@ python -m ipdb -c c batch_optimize_pc_main.py \
     --run_name "${RUN_NAME}" \
     --wandb_project "sdlm-pc-mt-lmi" \
     --wandb_tags "qwen3-600m,free-r,chat-template,gsm8k" \
-    --weave_project "sdlm-pc-mt-lmi"
+    --weave_project "sdlm-pc-mt-lmi" \
+    "${SUPERPOSITION_ARGS[@]}"
 
 echo "Done: ${OUTPUT_DIR}"
