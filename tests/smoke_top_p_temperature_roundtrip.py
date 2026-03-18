@@ -22,9 +22,16 @@ def _install_mock_main() -> None:
     mock_main = types.ModuleType("main")
 
     def setup_model_and_tokenizer(model_name, device, model_precision):
-        return object(), object()
+        class _Tok:
+            def __call__(self, text, return_tensors="pt"):
+                return types.SimpleNamespace(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
+
+        return object(), _Tok()
 
     def optimize_inputs(**kwargs):
+        assert kwargs.get("eval_only") is True, "top_p_lcs_sweep should run optimize_inputs in eval_only mode."
+        assert kwargs.get("learnable_temperature") is True, "Should auto-enable learnable temperature from payload."
+        assert kwargs.get("decouple_learnable_temperature") is True, "Should auto-enable decoupled temperatures from vector payload."
         top_p = float(kwargs["logits_top_p"])
         init_temps = kwargs.get("initial_learnable_temperatures")
         if init_temps is not None and not isinstance(init_temps, dict):
@@ -69,7 +76,7 @@ def main() -> int:
 
         torch.save(torch.randn(1, 4, 16), target_dir / "learnable_logits.pt")
         torch.save(
-            {"stgs_temperature_param": torch.tensor([0.7], dtype=torch.float32)},
+            {"stgs_temperature_param": torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)},
             target_dir / "learnable_temperatures.pt",
         )
 
@@ -87,6 +94,8 @@ def main() -> int:
                 str(logits_root),
                 "--target_indices",
                 "0",
+                "--seq_len",
+                "4",
                 "--top_p_values",
                 "1.0,0.8",
                 "--output_dir",

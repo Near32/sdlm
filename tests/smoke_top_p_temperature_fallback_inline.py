@@ -27,6 +27,7 @@ def _install_mock_main() -> None:
         return object(), _Tok()
 
     def optimize_inputs(**kwargs):
+        assert kwargs.get("eval_only") is True, "top_p_lcs_sweep should run optimize_inputs in eval_only mode."
         assert kwargs.get("learnable_temperature") is False
         assert kwargs.get("bptt_learnable_temperature") is False
         init_temps = kwargs.get("initial_learnable_temperatures")
