@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
 import logging
 import argparse
 import copy
@@ -12,6 +11,7 @@ import matplotlib.pyplot as plt
 from functools import partial
 from typing import Callable, Dict, Optional
 from sdlm.stgs_diff_model import STGSDiffModel
+from sdlm.utils.tqdm_utils import tqdm
 
 from gradient_estimators import (
     STGS,
@@ -28,6 +28,16 @@ from evaluation import (
     run_embsim_validation_pass,
     build_embsim_wandb_metrics,
     build_embsim_epoch_callback,
+    compute_embsim_probs,
+)
+from product_of_speaker import (
+    ProductOfSpeakerFactory,
+    render_pos_single_target_prompt,
+)
+from optimizer_utils import (
+    build_prompt_optimizer,
+    normalize_lookahead_levels,
+    reset_optimizer_state_for_positions,
 )
 
 
@@ -219,7 +229,6 @@ def initialize_lora_logits(seq_len, vocab_size, rank, device,
         lora_B = B.unsqueeze(0).detach().to(full_logits.dtype).requires_grad_(True)
     return lora_A, lora_B
 
-
 def filter_vocabulary(embedding_weights, seed_vector, target_token_ids, threshold=0.5):
     """
     Compute cosine similarities between each vocabulary token embedding and seed_vector.
@@ -372,6 +381,49 @@ def make_commitment_position_weights(
         raise ValueError(f"Unknown commitment_pos_weight_schedule: {schedule!r}")
 
 
+def _project_logits_to_discrete_tokens(
+    current_logits: torch.Tensor,
+    embedding_weights: torch.Tensor,
+    snap_method: str = "argmax",
+    eps: float = 1e-8,
+    embsim_probs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Project per-position logits to discrete token ids using the selected rule."""
+    if snap_method == "argmax":
+        return current_logits.argmax(dim=-1)                         # (1, seq_len)
+    probs = embsim_probs if embsim_probs is not None else torch.softmax(current_logits, dim=-1)
+    if snap_method == "embsim-dot":
+        soft_emb = torch.matmul(probs, embedding_weights)
+        sim      = torch.matmul(soft_emb, embedding_weights.T)
+        return sim.argmax(dim=-1)
+    elif snap_method == "embsim-l2":
+        soft_emb = torch.matmul(probs, embedding_weights)
+        soft_sq  = (soft_emb ** 2).sum(dim=-1, keepdim=True)
+        emb_sq   = (embedding_weights ** 2).sum(dim=-1)
+        cross    = torch.matmul(soft_emb, embedding_weights.T)
+        l2_sq    = soft_sq - 2 * cross + emb_sq
+        return l2_sq.argmin(dim=-1)
+    else:  # "embsim-cos"
+        soft_emb = torch.matmul(probs, embedding_weights)
+        soft_norm = F.normalize(soft_emb, dim=-1, eps=eps)
+        e_norm    = F.normalize(embedding_weights, dim=-1, eps=eps)
+        sim       = torch.matmul(soft_norm, e_norm.T)
+        return sim.argmax(dim=-1)
+
+
+def compute_position_entropies(
+    logits: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+    probs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return per-position categorical entropies for logits or probabilities."""
+    if probs is None:
+        if logits is None:
+            raise ValueError("compute_position_entropies requires logits or probs")
+        probs = torch.softmax(logits, dim=-1)
+    return -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1)
+
+
 def snap_free_logits(
     free_logits: torch.Tensor,
     current_logits: torch.Tensor,
@@ -381,10 +433,20 @@ def snap_free_logits(
     snap_method: str = "argmax",
     spike_value: float = 10.0,
     eps: float = 1e-8,
+    discrete_reinit_prob: float = 1.0,
+    discrete_reinit_topk: int = 0,
+    off_support_logit: float = -1e4,
+    position_mask: Optional[torch.Tensor] = None,
+    embsim_probs: Optional[torch.Tensor] = None,
 ) -> None:
     """
-    In-place reinitialization of free_logits to a spiked one-hot distribution
-    pointing at the current discrete projection of the soft prompt.
+    In-place reinitialization of free_logits to a discrete projection target.
+
+    Default behavior matches the legacy spiked one-hot reset. When
+    discrete_reinit_topk > 0 and discrete_reinit_prob < 1, the snapped token
+    keeps probability mass discrete_reinit_prob and the remaining mass is
+    spread uniformly across the top-k tokens from the original distribution
+    (excluding the snapped token if it overlaps).
 
     Args:
         free_logits:       (batch, n_free, vocab) — learnable parameter to overwrite in-place.
@@ -393,47 +455,97 @@ def snap_free_logits(
         n_free:            Number of free (learnable) positions.
         prefix_len:        Number of positions occupied by fixed prefix (may be 0).
         snap_method:       "argmax" | "embsim-dot" | "embsim-cos" — projection method.
-        spike_value:       Logit value placed at the selected token (default 10.0).
-        eps:               Numerical stability epsilon for cosine normalization.
+        spike_value:       Legacy logit value placed at the selected token when top-k support is disabled.
+        eps:               Numerical stability epsilon for cosine normalization and log-prob conversion.
+        discrete_reinit_prob:
+                           Probability mass assigned to the snapped token in top-k mode.
+        discrete_reinit_topk:
+                           Number of pre-reinit top-k tokens that share the residual mass.
+        off_support_logit: Logit assigned to tokens outside the preserved support in top-k mode.
+        position_mask:     Optional boolean mask of shape (n_free,) selecting which positions to reinitialize.
+        embsim_probs:      Optional per-position token distribution used for embsim snapping and top-k support.
     """
-    batch_size, _, vocab_size = free_logits.shape
+    if not 0.0 <= discrete_reinit_prob <= 1.0:
+        raise ValueError(f"discrete_reinit_prob must be in [0, 1], got {discrete_reinit_prob}")
+    if discrete_reinit_topk < 0:
+        raise ValueError(f"discrete_reinit_topk must be >= 0, got {discrete_reinit_topk}")
 
-    if snap_method == "argmax":
-        snapped = current_logits.argmax(dim=-1)                      # (1, seq_len)
-    elif snap_method == "embsim-dot":
-        probs    = torch.softmax(current_logits, dim=-1)
-        soft_emb = torch.matmul(probs, embedding_weights)
-        sim      = torch.matmul(soft_emb, embedding_weights.T)
-        snapped  = sim.argmax(dim=-1)
-    elif snap_method == "embsim-l2":
-        probs    = torch.softmax(current_logits, dim=-1)
-        soft_emb = torch.matmul(probs, embedding_weights)
-        soft_sq  = (soft_emb ** 2).sum(dim=-1, keepdim=True)
-        emb_sq   = (embedding_weights ** 2).sum(dim=-1)
-        cross    = torch.matmul(soft_emb, embedding_weights.T)
-        l2_sq    = soft_sq - 2 * cross + emb_sq
-        snapped  = l2_sq.argmin(dim=-1)
-    else:  # "embsim-cos"
-        probs    = torch.softmax(current_logits, dim=-1)
-        soft_emb = torch.matmul(probs, embedding_weights)
-        soft_norm = F.normalize(soft_emb, dim=-1, eps=eps)
-        e_norm    = F.normalize(embedding_weights, dim=-1, eps=eps)
-        sim       = torch.matmul(soft_norm, e_norm.T)
-        snapped   = sim.argmax(dim=-1)
+    batch_size, _, vocab_size = free_logits.shape
+    snapped = _project_logits_to_discrete_tokens(
+        current_logits=current_logits,
+        embedding_weights=embedding_weights,
+        snap_method=snap_method,
+        eps=eps,
+        embsim_probs=embsim_probs,
+    )
 
     # Extract the free portion from the assembled sequence
     free_snapped = snapped[:1, prefix_len:prefix_len + n_free]       # (1, n_free)
+    if position_mask is None:
+        position_mask_flat = torch.ones(n_free, dtype=torch.bool, device=free_logits.device)
+    else:
+        position_mask_flat = position_mask.to(device=free_logits.device, dtype=torch.bool).view(-1)
+        if position_mask_flat.numel() != n_free:
+            raise ValueError(
+                f"position_mask must have {n_free} elements, got {position_mask_flat.numel()}"
+            )
+    selected_positions = position_mask_flat.nonzero(as_tuple=False).squeeze(-1)
+    if selected_positions.numel() == 0:
+        return
 
-    # Spike the chosen token at each free position
-    new_logits = torch.zeros(batch_size, n_free, vocab_size,
-                             device=free_logits.device, dtype=free_logits.dtype)
-    new_logits.scatter_(-1, free_snapped.expand(batch_size, -1).unsqueeze(-1), spike_value)
+    use_topk_support = discrete_reinit_topk > 0 and discrete_reinit_prob < 1.0
+    new_logits = free_logits.detach().clone()
+    selected_snapped = free_snapped[:, selected_positions]
+    if not use_topk_support:
+        replacement_logits = torch.zeros(batch_size, selected_positions.numel(), vocab_size,
+                                         device=free_logits.device, dtype=free_logits.dtype)
+        replacement_logits.scatter_(-1, selected_snapped.expand(batch_size, -1).unsqueeze(-1), spike_value)
+        new_logits[:, selected_positions, :] = replacement_logits
+        free_logits.data.copy_(new_logits)
+        return
+
+    keep_k = min(discrete_reinit_topk, max(vocab_size - 1, 0))
+    if embsim_probs is None:
+        free_current_logits = current_logits[:1, prefix_len:prefix_len + n_free, :]
+        selected_current_probs = torch.softmax(free_current_logits[:, selected_positions, :], dim=-1)
+    else:
+        selected_current_probs = embsim_probs[:1, prefix_len:prefix_len + n_free, :][:, selected_positions, :]
+    support_probs = torch.zeros(1, selected_positions.numel(), vocab_size,
+                                device=free_logits.device, dtype=free_logits.dtype)
+    support_probs.scatter_(-1, selected_snapped.unsqueeze(-1), discrete_reinit_prob)
+
+    residual_prob = max(0.0, 1.0 - discrete_reinit_prob)
+    if keep_k > 0 and residual_prob > 0.0:
+        candidate_k = min(vocab_size, keep_k + 1)
+        topk_ids = selected_current_probs.topk(candidate_k, dim=-1).indices.squeeze(0)
+        snapped_ids = selected_snapped.squeeze(0)
+
+        for pos in range(selected_positions.numel()):
+            candidate_ids = topk_ids[pos]
+            candidate_ids = candidate_ids[candidate_ids != snapped_ids[pos]]
+            candidate_ids = candidate_ids[:keep_k]
+            if candidate_ids.numel() == 0:
+                support_probs[0, pos, snapped_ids[pos]] = 1.0
+                continue
+            support_probs[0, pos, candidate_ids] = residual_prob / candidate_ids.numel()
+
+    log_support_probs = torch.log(support_probs.clamp_min(eps))
+    support_mask = support_probs > 0
+    replacement_logits = torch.full((batch_size, selected_positions.numel(), vocab_size), off_support_logit,
+                                    device=free_logits.device, dtype=free_logits.dtype)
+    expanded_mask = support_mask.expand(batch_size, -1, -1)
+    replacement_logits[expanded_mask] = log_support_probs.expand(batch_size, -1, -1)[expanded_mask]
+    new_logits = free_logits.detach().clone()
+    new_logits[:, selected_positions, :] = replacement_logits
     free_logits.data.copy_(new_logits)
 
 
 def snap_lora_logits(lora_A, lora_B, current_logits, embedding_weights,
                      n_free, prefix_len, snap_method, optimizer,
-                     spike_value=10.0, eps=1e-8):
+                     spike_value=10.0, eps=1e-8,
+                     discrete_reinit_prob=1.0, discrete_reinit_topk=0,
+                     off_support_logit=-1e4, position_mask: Optional[torch.Tensor] = None,
+                     embsim_probs: Optional[torch.Tensor] = None):
     """
     Re-express a snapped one-hot logit matrix as a rank-r LoRA factorisation.
     Reuses the token-selection logic of snap_free_logits, then SVD-factorizes the
@@ -441,10 +553,11 @@ def snap_lora_logits(lora_A, lora_B, current_logits, embedding_weights,
     """
     rank = lora_A.shape[-1]
     vocab_size = lora_B.shape[-1]
-    tmp = torch.zeros(1, n_free, vocab_size, device=lora_A.device, dtype=lora_A.dtype,
-                      requires_grad=False)
+    tmp = current_logits[:1, prefix_len:prefix_len + n_free, :].detach().clone().to(lora_A.dtype)
     snap_free_logits(tmp, current_logits, embedding_weights,
-                     n_free, prefix_len, snap_method, spike_value, eps)
+                     n_free, prefix_len, snap_method, spike_value, eps,
+                     discrete_reinit_prob, discrete_reinit_topk, off_support_logit, position_mask,
+                     embsim_probs)
     # tmp now holds the spiked target (1, n_free, vocab_size)
 
     # SVD-factorize the spiked matrix
@@ -459,8 +572,8 @@ def snap_lora_logits(lora_A, lora_B, current_logits, embedding_weights,
     lora_A.data.copy_(A.unsqueeze(0))
     lora_B.data.copy_(B.unsqueeze(0))
     if optimizer is not None:
-        optimizer.state[lora_A] = {}
-        optimizer.state[lora_B] = {}
+        reset_optimizer_state_for_positions(optimizer, lora_A)
+        reset_optimizer_state_for_positions(optimizer, lora_B)
 
 
 def generate_completions(model, input_embeddings, target_length, temperature=1.0, pre_prompt=None):
@@ -1204,6 +1317,8 @@ def optimize_inputs(
     epochs=1000,
     eval_only: bool = False,
     learning_rate=0.01,
+    lookahead_k=0,
+    lookahead_alpha: float = 0.5,
     temperature = 0.5,
     bptt_temperature = 0.5,
     learnable_temperature=False,
@@ -1324,6 +1439,10 @@ def optimize_inputs(
     # Periodic discrete reinitialization
     discrete_reinit_epoch: int = 0,       # 0 = disabled; N = reinitialize every N epochs
     discrete_reinit_snap: str = "argmax", # "argmax" | "embsim-dot" | "embsim-cos"
+    discrete_reinit_prob: float = 1.0,    # snapped-token probability in top-k reinit mode
+    discrete_reinit_topk: int = 0,        # preserve top-k pre-reinit tokens with residual mass
+    discrete_reinit_entropy_threshold: float = 0.0,  # 0 = disabled; >0 reinit low-entropy positions
+    discrete_reinit_embsim_probs: str = "input_logits",  # "input_logits" | "gumbel_soft"
     # Gumbel noise scale (fixed or adaptive)
     gumbel_noise_scale: float = 1.0,
     adaptive_gumbel_noise: bool = False,
@@ -1348,6 +1467,7 @@ def optimize_inputs(
     ppo_ref_update_period: int = 10,     # refresh reference every N epochs (0 = never)
     # LoRA-factored prompt logits (opt-in)
     logits_lora_rank: int = 0,           # 0 = disabled; >0 uses A@B decomposition
+    logits_lora_b_learning_rate: Optional[float] = None,
     # Superposition metric callback (opt-in)
     superposition_metric_every: int = 0,
     superposition_metric_modes: str = "dot,cos,l2",
@@ -1361,6 +1481,16 @@ def optimize_inputs(
     superposition_output_dir: Optional[str] = ".",
     # Diversity analysis callback (opt-in)
     diversity_callback: Optional[Callable[[int, torch.Tensor], dict]] = None,
+    # Logit assembly callback / strategy
+    assemble_strategy: str = "identity",
+    assemble_callback: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    pos_lm_name: Optional[str] = None,
+    pos_prompt: Optional[str] = None,
+    pos_prompt_template: Optional[str] = None,
+    pos_use_chat_template: bool = False,
+    pos_lm_temperature: float = 1.0,
+    pos_lm_top_p: float = 1.0,
+    pos_lm_top_k: int = 0,
     kwargs={},
 ):
     """
@@ -1375,7 +1505,34 @@ def optimize_inputs(
         ... (other parameters documented below)
     """
     # Dispatch to SODA/GCG if requested
+    if discrete_reinit_entropy_threshold < 0.0:
+        raise ValueError(
+            f"discrete_reinit_entropy_threshold must be >= 0, got {discrete_reinit_entropy_threshold}"
+        )
+    if discrete_reinit_embsim_probs not in {"input_logits", "gumbel_soft"}:
+        raise ValueError(
+            f"discrete_reinit_embsim_probs must be 'input_logits' or 'gumbel_soft', "
+            f"got {discrete_reinit_embsim_probs!r}"
+        )
+
     method_lower = method.lower() if method else "stgs"
+    assemble_strategy = (assemble_strategy or "identity").lower()
+    lookahead_levels = normalize_lookahead_levels(lookahead_k)
+
+    if not 0.0 <= lookahead_alpha <= 1.0:
+        raise ValueError(f"lookahead_alpha must be in [0, 1], got {lookahead_alpha}")
+    if lookahead_levels and method_lower not in ("stgs", "reinforce"):
+        raise ValueError(
+            f"Lookahead is only supported for method='stgs' or method='reinforce'; got {method!r}"
+        )
+
+    if method_lower in ("soda", "gcg", "o2p") and (
+        assemble_strategy != "identity" or assemble_callback is not None
+    ):
+        raise ValueError(
+            "assemble_strategy and assemble_callback are currently only supported "
+            "for the STGS/REINFORCE optimization path."
+        )
 
     # Helper to wrap baseline returns as dicts with empty discrete/all fields
     def _wrap_baseline_result(result):
@@ -1633,6 +1790,9 @@ def optimize_inputs(
         "epochs": epochs,
         "losses": losses,
         "learning_rate": learning_rate,
+        "lookahead_k": lookahead_levels,
+        "lookahead_alpha": lookahead_alpha,
+        "logits_lora_b_learning_rate": logits_lora_b_learning_rate,
         "bptt":bptt,
         "temperature": temperature,
         "bptt_temperature": bptt_temperature,
@@ -1693,6 +1853,15 @@ def optimize_inputs(
         "superposition_vocab_num_texts": superposition_vocab_num_texts,
         "superposition_entropy_temperature": superposition_entropy_temperature,
         "superposition_output_dir": str(superposition_output_dir or "."),
+        "assemble_strategy": assemble_strategy,
+        "product_of_speaker_lm_name": pos_lm_name or kwargs.get("model_name"),
+        "product_of_speaker_prompt": pos_prompt,
+        "product_of_speaker_prompt_template": pos_prompt_template,
+        "product_of_speaker_use_chat_template": pos_use_chat_template,
+        "product_of_speaker_temperature": pos_lm_temperature,
+        "product_of_speaker_top_p": pos_lm_top_p,
+        "product_of_speaker_top_k": pos_lm_top_k,
+        "product_of_speaker_max_token_len": seq_len,
         "loss_pos_weight_schedule": kwargs.get("loss_pos_weight_schedule", "uniform"),
         "loss_pos_weight_step": kwargs.get("loss_pos_weight_step", 1.0),
         "loss_pos_weight_base": kwargs.get("loss_pos_weight_base", 2.0),
@@ -1866,6 +2035,36 @@ def optimize_inputs(
             "prompt_length_learnable=True requires n_free > 1; feature disabled for this run."
         )
 
+    if assemble_callback is None:
+        if assemble_strategy == "identity":
+            pass
+        elif assemble_strategy == "product_of_speaker":
+            pos_factory = ProductOfSpeakerFactory(
+                model=model,
+                tokenizer=tokenizer,
+                allowed_tokens=allowed_tokens,
+                seq_len=seq_len,
+                base_model_name=kwargs.get("model_name"),
+                pos_lm_name=pos_lm_name,
+                pos_use_chat_template=pos_use_chat_template,
+                pos_lm_temperature=pos_lm_temperature,
+                pos_lm_top_p=pos_lm_top_p,
+                pos_lm_top_k=pos_lm_top_k,
+                logits_filter_penalty=logits_filter_penalty,
+            )
+            pos_prompt_text = render_pos_single_target_prompt(
+                pos_prompt_template=pos_prompt_template,
+                pos_prompt=pos_prompt,
+                target_text=target_text,
+            )
+            wandb.log({"product_of_speaker_rendered_prompt": pos_prompt_text})
+            assemble_callback = lambda assembled: pos_factory.transform_logits(
+                assembled,
+                pos_prompt_text,
+            )
+        else:
+            raise ValueError(f"Unknown assemble_strategy '{assemble_strategy}'.")
+
     # Assembly function: build the full (1, seq_len, allowed_vocab_size) logits each step.
     # When no fixed parts exist and learnable length is disabled, returns free_logits directly (zero overhead).
     def _free():
@@ -1873,7 +2072,7 @@ def optimize_inputs(
         return lora_A @ lora_B if lora_A is not None else free_logits
 
     if fixed_prefix is None and fixed_suffix is None:
-        def assemble_logits():
+        def _assemble_base_logits():
             if length_alpha is None:
                 return _free()
             lambda_t = n_free * torch.sigmoid(length_alpha)
@@ -1882,7 +2081,7 @@ def optimize_inputs(
             gates_3d = gates.unsqueeze(0).unsqueeze(-1)
             return gates_3d * _free() + (1.0 - gates_3d) * eos_logit_template
     else:
-        def assemble_logits():
+        def _assemble_base_logits():
             if length_alpha is None:
                 active_free = _free()
             else:
@@ -1899,6 +2098,12 @@ def optimize_inputs(
             if fixed_suffix is not None:
                 parts.append(fixed_suffix)
             return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
+    def assemble_logits():
+        assembled = _assemble_base_logits()
+        if assemble_callback is None:
+            return assembled
+        return assemble_callback(assembled)
     
     token_overlap_metric = TokenOverlapMetric(
         target_text=target_text,
@@ -2075,15 +2280,9 @@ def optimize_inputs(
                 eps_val = float(getattr(module, "eps", 1e-12))
                 init_tau = float(getattr(module, "init_temperature", 1.0))
 
-                # Highest priority: explicit temperature parameter payload.
-                if src_param is not None:
-                    if not has_param:
-                        logging.warning(
-                            "initial_learnable_temperatures contains '%s', but module has no "
-                            "temperature_param. Ignoring.",
-                            key,
-                        )
-                        return
+                # Prefer explicit effective temperatures when provided (more portable across
+                # runs with different init_temperature).
+                if src_param is not None and has_param and src_eff is None:
                     src_t = _fit_payload_to_shape(
                         src=src_param,
                         target_shape=module.temperature_param.shape,
@@ -2094,6 +2293,21 @@ def optimize_inputs(
                     with torch.no_grad():
                         module.temperature_param.copy_(src_t)
                     return
+                if src_param is not None and not has_param and src_eff is None:
+                    logging.warning(
+                        "initial_learnable_temperatures contains '%s', but module has no "
+                        "temperature_param and no '%s' was provided. Ignoring.",
+                        key,
+                        effective_key,
+                    )
+                    return
+                if src_param is not None and not has_param and src_eff is not None:
+                    logging.info(
+                        "initial_learnable_temperatures contains '%s' but module has no "
+                        "temperature_param; using '%s' instead.",
+                        key,
+                        effective_key,
+                    )
 
                 # Fallback: effective temperature payload.
                 eff_t = src_eff.detach() if torch.is_tensor(src_eff) else torch.tensor(src_eff)
@@ -2128,9 +2342,11 @@ def optimize_inputs(
                     if eff_t.numel() != 1:
                         raise ValueError(
                             f"{effective_key} provided {eff_t.numel()} values, but module does not have "
-                            "learnable temperature parameters. Provide a scalar or enable learnable temperature."
+                            "learnable temperature parameters. Enable learnable+decoupled temperature to "
+                            "load per-position temperatures."
                         )
-                    module.init_temperature = max(float(eff_t.item()), eps_val)
+                    eff_scalar = float(eff_t.item())
+                    module.init_temperature = max(eff_scalar, eps_val)
 
             _load_temperature(
                 stgs_module,
@@ -2158,7 +2374,14 @@ def optimize_inputs(
     else:
         raise ValueError(f"Unknown gradient estimator '{gradient_estimator}'.")
 
-    optimizer = optim.Adam(parameters, lr=learning_rate)
+    optimizer = build_prompt_optimizer(
+        parameters,
+        learning_rate=learning_rate,
+        lora_B=lora_B,
+        logits_lora_b_learning_rate=logits_lora_b_learning_rate,
+        lookahead_k=lookahead_levels,
+        lookahead_alpha=lookahead_alpha,
+    )
 
     if estimator_choice == "stgs":
         _stgs_base = partial(
@@ -2495,31 +2718,85 @@ def optimize_inputs(
             if (epoch + 1) % ppo_ref_update_period == 0:
                 _ppo_ref_logits = assemble_logits().detach().clone()
 
-        # Periodic discrete reinitialization
-        if (not eval_only) and discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
+        discrete_reinit_applied = False
+        discrete_reinit_num_positions = 0
+        discrete_reinit_entropy_mean = None
+        discrete_reinit_entropy_min = None
+
+        # Discrete reinitialization: periodic, entropy-triggered, or periodic with entropy filter.
+        should_check_entropy = discrete_reinit_entropy_threshold > 0.0
+        period_due = discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0
+        threshold_due = discrete_reinit_epoch == 0 and should_check_entropy
+        if (not eval_only) and (period_due or threshold_due):
             prefix_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
             with torch.no_grad():
-                if lora_A is not None:
+                current_logits = assemble_logits().detach()
+                reinit_probs = None
+                reinit_mask = None
+                needs_reinit_probs = (
+                    should_check_entropy
+                    or discrete_reinit_snap.startswith("embsim-")
+                    or discrete_reinit_topk > 0
+                )
+                if needs_reinit_probs:
+                    reinit_probs = compute_embsim_probs(
+                        current_logits,
+                        stgs_module=stgs_module if discrete_reinit_embsim_probs == "gumbel_soft" else None,
+                        batch_size=batch_size,
+                        embsim_temperature=1.0,
+                        probs_source=discrete_reinit_embsim_probs,
+                    )
+                if should_check_entropy:
+                    free_probs = (
+                        reinit_probs[:1, prefix_len:prefix_len + n_free, :]
+                        if reinit_probs is not None
+                        else None
+                    )
+                    free_current_logits = None if free_probs is not None else current_logits[:1, prefix_len:prefix_len + n_free, :]
+                    free_entropies = compute_position_entropies(free_current_logits, eps=eps, probs=free_probs)
+                    reinit_mask = free_entropies.squeeze(0) < discrete_reinit_entropy_threshold
+                    discrete_reinit_entropy_mean = free_entropies.mean().item()
+                    discrete_reinit_entropy_min = free_entropies.min().item()
+                if reinit_mask is not None:
+                    discrete_reinit_num_positions = int(reinit_mask.sum().item())
+                    if discrete_reinit_num_positions == 0:
+                        reinit_mask = None
+                elif period_due:
+                    discrete_reinit_num_positions = n_free
+
+                if reinit_mask is None:
+                    discrete_reinit_applied = period_due and not should_check_entropy
+                else:
+                    discrete_reinit_applied = discrete_reinit_num_positions > 0
+                if discrete_reinit_applied and lora_A is not None:
                     snap_lora_logits(
                         lora_A=lora_A,
                         lora_B=lora_B,
-                        current_logits=assemble_logits().detach(),
+                        current_logits=current_logits,
                         embedding_weights=embedding_weights_subset,
                         n_free=n_free,
                         prefix_len=prefix_len,
                         snap_method=discrete_reinit_snap,
                         optimizer=optimizer,
+                        discrete_reinit_prob=discrete_reinit_prob,
+                        discrete_reinit_topk=discrete_reinit_topk,
+                        position_mask=reinit_mask,
+                        embsim_probs=reinit_probs,
                     )
-                else:
+                elif discrete_reinit_applied:
                     snap_free_logits(
                         free_logits=free_logits,
-                        current_logits=assemble_logits().detach(),
+                        current_logits=current_logits,
                         embedding_weights=embedding_weights_subset,
                         n_free=n_free,
                         prefix_len=prefix_len,
                         snap_method=discrete_reinit_snap,
+                        discrete_reinit_prob=discrete_reinit_prob,
+                        discrete_reinit_topk=discrete_reinit_topk,
+                        position_mask=reinit_mask,
+                        embsim_probs=reinit_probs,
                     )
-                    optimizer.state[free_logits] = {}   # reset momentum for a clean restart
+                    reset_optimizer_state_for_positions(optimizer, free_logits, reinit_mask)
 
         # Temperature annealing (only when not learnable_temperature)
         if (not eval_only) and temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
@@ -2595,8 +2872,11 @@ def optimize_inputs(
         if adaptive_gumbel_noise and _loss_ema is not None:
             wandb_log["gumbel_loss_ema"] = _loss_ema
 
-        if discrete_reinit_epoch > 0 and (epoch + 1) % discrete_reinit_epoch == 0:
-            wandb_log["discrete_reinit"] = 1
+        wandb_log["discrete_reinit"] = int(discrete_reinit_applied)
+        wandb_log["discrete_reinit_num_positions"] = discrete_reinit_num_positions
+        if discrete_reinit_entropy_mean is not None:
+            wandb_log["discrete_reinit_entropy_mean"] = discrete_reinit_entropy_mean
+            wandb_log["discrete_reinit_entropy_min"] = discrete_reinit_entropy_min
 
         if length_alpha is not None:
             with torch.no_grad():
@@ -3068,7 +3348,7 @@ def optimize_inputs(
         if _temp_log:
             wandb.log(_temp_log)
 
-    if superposition_callback is not None:
+    if superposition_callback is not None and not eval_only:
         final_epoch = max(len(losses) - 1, 0)
         _sup_final_metrics = superposition_callback(final_epoch, final_free_logits, force=True)
         if _sup_final_metrics:
@@ -3147,6 +3427,19 @@ def main():
     parser.add_argument("--promptTfComplLambda", type=float, default=0.0,
                         help="Weight for prompt + teacher-forced completion perplexity loss")
     parser.add_argument("--learning_rate", type=float, default=1e-1)
+    parser.add_argument("--lookahead_k", type=str, default="0",
+                        help="Lookahead sync period(s) in optimizer steps. "
+                             "Use 0 to disable, a single integer for one level, "
+                             "or a comma-separated list such as '8,80,800' for nested levels.")
+    parser.add_argument("--lookahead_alpha", type=float, default=0.5,
+                        help="Lookahead interpolation factor between slow and fast weights.")
+    parser.add_argument(
+        "--logits_lora_b_learning_rate",
+        type=float,
+        default=None,
+        help="Optional learning rate override for LoRA prompt-logit matrix B. "
+             "Ignored when logits_lora_rank <= 0.",
+    )
     parser.add_argument("--max_gradient_norm", type=float, default=0.0)
     parser.add_argument("--eps", type=float, default=1e-10)
     parser.add_argument("--bptt_eps", type=float, default=1e-10)
@@ -3256,6 +3549,26 @@ def main():
     parser.add_argument("--temperature_anneal_reg_mode", type=str, default="mse",
                         choices=["mse", "one_sided"],
                         help="'mse': symmetric L2 to target; 'one_sided': L2 only when tau > target")
+    parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
+                        help="Snap free_logits to discrete projection every N epochs (0 = disabled)")
+    parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
+                        choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
+                        help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_prob", type=float, default=1.0,
+                        help="In top-k discrete reinit mode, probability mass assigned to the snapped token")
+    parser.add_argument("--discrete_reinit_topk", type=int, default=0,
+                        help="Preserve this many top-k tokens from the pre-reinit distribution "
+                             "with the residual probability mass")
+    parser.add_argument("--discrete_reinit_entropy_threshold", type=float, default=0.0,
+                        help="Per-position entropy threshold for discrete reinit. 0 disables it. "
+                             "If set with discrete_reinit_epoch > 0, it filters reinit to positions "
+                             "below the threshold; if discrete_reinit_epoch=0, it is checked every epoch.")
+    parser.add_argument("--discrete_reinit_embsim_probs", type=str, default="input_logits",
+                        choices=["input_logits", "gumbel_soft"],
+                        help="Distribution source used for embsim-based discrete reinit and entropy gating. "
+                             "'input_logits' uses softmax over prompt logits; 'gumbel_soft' uses the STGS "
+                             "soft output and therefore includes temperature, normalization, Gumbel noise, "
+                             "and dropout effects.")
 
     # Superposition diagnostics (opt-in)
     parser.add_argument("--superposition_metric_every", type=int, default=0,
@@ -3298,6 +3611,24 @@ def main():
                         help="Text string whose tokens form a fixed one-hot prefix")
     parser.add_argument("--fixed_suffix_text", type=str, default=None,
                         help="Text string whose tokens form a fixed one-hot suffix")
+    parser.add_argument("--assemble_strategy", type=str, default="identity",
+                        choices=["identity", "product_of_speaker"],
+                        help="Transform applied to assembled prompt logits before optimization.")
+    parser.add_argument("--pos_lm_name", type=str, default=None,
+                        help="Auxiliary LM used by product_of_speaker. Defaults to --model_name.")
+    parser.add_argument("--pos_prompt", type=str, default=None,
+                        help="Fixed task prompt used to seed the product_of_speaker LM.")
+    parser.add_argument("--pos_prompt_template", type=str, default=None,
+                        help="PoS prompt template for single-target runs. Supports {target}.")
+    parser.add_argument("--pos_use_chat_template", type=str2bool, default=False,
+                        help="Wrap the product_of_speaker prompt with tokenizer.apply_chat_template "
+                             "when the auxiliary tokenizer provides one.")
+    parser.add_argument("--pos_lm_temperature", type=float, default=1.0,
+                        help="Temperature applied to the auxiliary LM logits in product_of_speaker.")
+    parser.add_argument("--pos_lm_top_p", type=float, default=1.0,
+                        help="Top-p filter applied to the auxiliary LM logits in product_of_speaker.")
+    parser.add_argument("--pos_lm_top_k", type=int, default=0,
+                        help="Top-k filter applied to the auxiliary LM logits in product_of_speaker.")
 
     args = parser.parse_args()
     config = vars(args)
@@ -3334,6 +3665,9 @@ def main():
         seq_len=config['seq_len'],
         epochs=config['epochs'],
         learning_rate=config['learning_rate'],
+        lookahead_k=config.get('lookahead_k', 0),
+        lookahead_alpha=config.get('lookahead_alpha', 0.5),
+        logits_lora_b_learning_rate=config.get('logits_lora_b_learning_rate'),
         temperature=config['temperature'],
         bptt_temperature=config['bptt_temperature'],
         bptt_learnable_temperature=config['bptt_learnable_temperature'],
@@ -3391,9 +3725,23 @@ def main():
         fixed_gt_suffix_rank2_n=config.get('fixed_gt_suffix_rank2_n', 0),
         fixed_prefix_text=config.get('fixed_prefix_text'),
         fixed_suffix_text=config.get('fixed_suffix_text'),
+        assemble_strategy=config.get('assemble_strategy', 'identity'),
+        pos_lm_name=config.get('pos_lm_name'),
+        pos_prompt=config.get('pos_prompt'),
+        pos_prompt_template=config.get('pos_prompt_template'),
+        pos_use_chat_template=config.get('pos_use_chat_template', False),
+        pos_lm_temperature=config.get('pos_lm_temperature', 1.0),
+        pos_lm_top_p=config.get('pos_lm_top_p', 1.0),
+        pos_lm_top_k=config.get('pos_lm_top_k', 0),
         early_stop_on_exact_match=config.get('early_stop_on_exact_match', False),
         early_stop_loss_threshold=config.get('early_stop_loss_threshold', 0.01),
         early_stop_embsim_lcs_ratio_threshold=config.get('early_stop_embsim_lcs_ratio_threshold', 1.0),
+        discrete_reinit_epoch=config.get('discrete_reinit_epoch', 0),
+        discrete_reinit_snap=config.get('discrete_reinit_snap', 'argmax'),
+        discrete_reinit_prob=config.get('discrete_reinit_prob', 1.0),
+        discrete_reinit_topk=config.get('discrete_reinit_topk', 0),
+        discrete_reinit_entropy_threshold=config.get('discrete_reinit_entropy_threshold', 0.0),
+        discrete_reinit_embsim_probs=config.get('discrete_reinit_embsim_probs', 'input_logits'),
         run_discrete_validation=config.get('run_discrete_validation', False),
         run_discrete_embsim_validation=config.get('run_discrete_embsim_validation', False),
         embsim_similarity=config.get('embsim_similarity', 'cossim'),
