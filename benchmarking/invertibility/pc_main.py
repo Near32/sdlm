@@ -10,6 +10,7 @@ Generative structure:
 Loss is CE (or composable LossClass losses) on Y tokens against y.
 """
 
+import copy
 import sys
 import random
 import logging
@@ -133,23 +134,6 @@ def collect_pc_main_incompatibilities(
             f"{', '.join(sorted(PC_SUPPORTED_INIT_STRATEGIES))} in PC mode; got {init_strategy!r}."
         )
 
-    if config.get("superposition_metric_every", 0) > 0 or _explicitly_requested(
-        explicit_args,
-        [
-            "superposition_metric_every",
-            "superposition_metric_modes",
-            "superposition_vocab_top_k",
-            "superposition_vocab_source",
-            "superposition_vocab_dataset_path",
-            "superposition_vocab_hf_name",
-            "superposition_vocab_hf_split",
-            "superposition_vocab_num_texts",
-            "superposition_entropy_temperature",
-            "superposition_output_dir",
-        ],
-    ):
-        issues.append("--superposition_* diagnostics are not implemented for PC optimization.")
-
     if _explicitly_requested(
         explicit_args,
         [
@@ -246,6 +230,30 @@ def _effective_temperature_tensor(stgs_module: STGS) -> Tensor:
         device=stgs_module.device,
         dtype=torch.float32,
     )
+
+
+def _gradient_stats(grad_tensor: Optional[Tensor]) -> Dict[str, float]:
+    if grad_tensor is None:
+        return {
+            "prompt_grad_norm": 0.0,
+            "non_zero_grads": 0,
+            "grad_mean": 0.0,
+            "grad_max": 0.0,
+            "grad_min": 0.0,
+            "grad_std": 0.0,
+        }
+
+    grad_tensor = grad_tensor.detach()
+    grad_abs = grad_tensor.abs()
+    non_zero = grad_abs > 0
+    return {
+        "prompt_grad_norm": float(grad_tensor.norm().item()),
+        "non_zero_grads": int(non_zero.sum().item()),
+        "grad_mean": float(grad_tensor.mean().item()),
+        "grad_max": float(grad_tensor.max().item()),
+        "grad_min": float(grad_abs[non_zero].min().item()) if non_zero.any() else 0.0,
+        "grad_std": float(grad_tensor.std().item()),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +714,32 @@ def pc_forward_pass(
 
 
 # ---------------------------------------------------------------------------
+# Batched helpers
+# ---------------------------------------------------------------------------
+
+def _left_pad_embed_sequences(
+    sequences: List[Tensor],  # each (1, L_i, d)
+    device,
+    dtype,
+) -> Tuple[Tensor, Tensor]:
+    """Left-pad (1, L_i, d) tensors → (B, max_L, d) with attention_mask (B, max_L).
+
+    Zeros are prepended so real tokens are right-aligned.
+    attention_mask: 0 = padding, 1 = real token.
+    """
+    B = len(sequences)
+    max_L = max(s.shape[1] for s in sequences)
+    d = sequences[0].shape[2]
+    padded = torch.zeros(B, max_L, d, device=device, dtype=dtype)
+    attention_mask = torch.zeros(B, max_L, device=device, dtype=torch.long)
+    for i, seq in enumerate(sequences):
+        L_i = seq.shape[1]
+        padded[i, max_L - L_i:] = seq[0]
+        attention_mask[i, max_L - L_i:] = 1
+    return padded, attention_mask
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -799,7 +833,9 @@ def evaluate_shared_prompt(
     prompt_logits_transform: Optional[
         Callable[[Tensor, Sequence[Tuple[str, str]]], Tensor]
     ] = None,
-) -> Dict[str, float]:
+    return_examples: bool = False,
+    max_examples: Optional[int] = None,
+):
     """
     Evaluate the shared prompt on eval_pairs.
 
@@ -823,6 +859,7 @@ def evaluate_shared_prompt(
     any_correct_count = 0
     all_correct_count = 0
     n_eval = len(eval_pairs)
+    example_rows: List[Dict[str, Any]] = []
 
     E_text_rendered = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=False)
     E_text_clean = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=True)
@@ -1205,6 +1242,22 @@ def evaluate_shared_prompt(
                 all_c = all(method_results.values())
                 any_correct_count += int(any_c)
                 all_correct_count += int(all_c)
+                if return_examples and (max_examples is None or len(example_rows) < max_examples):
+                    example_rows.append({
+                        "sample_index": sample_count - 1,
+                        "split": eval_split,
+                        "epoch": epoch,
+                        "eval_mode": eval_mode,
+                        "reasoning_generation_backend": reasoning_generation_backend,
+                        "input_text": x_str,
+                        "target_answer": y_raw_str,
+                        "prompt_text": p_text_weave,
+                        "generated_reasoning": R_text,
+                        "generated_answer": Y_text,
+                        "any_correct": int(any_c),
+                        "all_correct": int(all_c),
+                        **{f"correct_{method}": int(is_correct) for method, is_correct in method_results.items()},
+                    })
                 eval_metrics = _metrics_from_accuracy_counts(
                     per_method_correct=per_method_correct,
                     any_correct_count=any_correct_count,
@@ -1242,6 +1295,8 @@ def evaluate_shared_prompt(
         n_examples=n_eval,
         extraction_fns=extraction_fns,
     )
+    if return_examples:
+        return metrics, example_rows
     return metrics
 
 
@@ -1347,6 +1402,16 @@ def pc_optimize_inputs(
     ppo_kl_mode: str = "soft",
     ppo_kl_epsilon: float = 0.0,
     ppo_ref_update_period: int = 10,
+    superposition_metric_every: int = 0,
+    superposition_metric_modes: str = "dot,cos,l2",
+    superposition_vocab_top_k: int = 256,
+    superposition_vocab_source: str = "wikipedia",
+    superposition_vocab_dataset_path: Optional[str] = None,
+    superposition_vocab_hf_name: str = "lucadiliello/english_wikipedia",
+    superposition_vocab_hf_split: str = "train",
+    superposition_vocab_num_texts: int = 1000,
+    superposition_entropy_temperature: float = 1.0,
+    superposition_output_dir: Optional[str] = ".",
     fixed_gt_prefix_n: int = 0,
     fixed_gt_suffix_n: int = 0,
     fixed_gt_prefix_rank2_n: int = 0,
@@ -1671,6 +1736,29 @@ def pc_optimize_inputs(
             parts.append(fixed_suffix)
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
+    superposition_callback = None
+    if superposition_metric_every > 0:
+        try:
+            from superposition_analysis import build_superposition_callback
+
+            superposition_callback = build_superposition_callback(
+                tokenizer=tokenizer,
+                embedding_weights_subset=embedding_weights,
+                allowed_tokens=allowed_tokens,
+                output_dir=str(superposition_output_dir or "."),
+                log_every=superposition_metric_every,
+                modes=superposition_metric_modes,
+                vocab_top_k=superposition_vocab_top_k,
+                vocab_source=superposition_vocab_source,
+                vocab_dataset_path=superposition_vocab_dataset_path,
+                vocab_hf_name=superposition_vocab_hf_name,
+                vocab_hf_split=superposition_vocab_hf_split,
+                vocab_num_texts=superposition_vocab_num_texts,
+                entropy_temperature=superposition_entropy_temperature,
+            )
+        except Exception as exc:
+            logger.warning("Superposition metric callback disabled: %s", exc)
+
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
@@ -1682,6 +1770,46 @@ def pc_optimize_inputs(
     anneal_total = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
     _ppo_ref_logits: Optional[Tensor] = None
     global_iteration = 0
+    prompt_history_table = None
+    exact_match_hits_table = None
+    table_log_every = 10
+    if wandb.run is not None:
+        prompt_history_columns = [
+            "epoch",
+            "prompt_token_ids",
+            "prompt_text",
+            "train_loss",
+            "temperature",
+            "effective_temperature",
+            "bptt_effective_temperature",
+            "gumbel_noise_scale",
+            "grad_norm",
+            "prompt_grad_norm",
+            "non_zero_grads",
+            "discrete_reinit",
+            "discrete_reinit_num_positions",
+            "train_any_correct",
+            "train_all_correct",
+            "val_any_correct",
+            "val_all_correct",
+        ]
+        for method_name in extraction_fns:
+            prompt_history_columns.append(f"train_{method_name}")
+        for method_name in extraction_fns:
+            prompt_history_columns.append(f"val_{method_name}")
+        prompt_history_table = wandb.Table(columns=prompt_history_columns)
+        exact_match_hits_columns = [
+            "epoch",
+            "split",
+            "prompt_token_ids",
+            "prompt_text",
+            "loss",
+            "any_correct",
+            "all_correct",
+        ]
+        for method_name in extraction_fns:
+            exact_match_hits_columns.append(method_name)
+        exact_match_hits_table = wandb.Table(columns=exact_match_hits_columns)
 
     epoch_pbar = tqdm(
         total=epochs,
@@ -1965,6 +2093,72 @@ def pc_optimize_inputs(
                             all_params.append(length_alpha)
                         total_norm = torch.nn.utils.clip_grad_norm_(all_params, max_gradient_norm).item()
 
+                    if wandb.run is not None:
+                        _iter_grad_leaf = lora_A if lora_A is not None else free_logits
+                        iter_grad_stats = _gradient_stats(
+                            _iter_grad_leaf.grad if _iter_grad_leaf is not None else None
+                        )
+                        iter_log = {
+                            "iter/loss": mean_batch_loss,
+                            "iter/epoch": epoch,
+                            "iter/iteration": iteration,
+                            "iter/global_iteration": global_iteration,
+                            "iter/batch_size": n_batch,
+                            "iter/temperature": current_temperature,
+                            "iter/gumbel_noise_scale": current_gumbel_scale,
+                            "iter/grad_norm": total_norm if total_norm is not None else iter_grad_stats["prompt_grad_norm"],
+                            "iter/discrete_reinit": int(discrete_reinit_applied),
+                            "iter/discrete_reinit_num_positions": discrete_reinit_num_positions,
+                        }
+                        iter_log.update({f"iter/{k}": v for k, v in iter_grad_stats.items()})
+                        iter_log.update({f"iter/train/{k}": v for k, v in train_metrics_running.items()})
+                        iter_log.update({f"iter/{k}": v for k, v in reg_log.items()})
+                        if discrete_reinit_entropy_mean is not None:
+                            iter_log["iter/discrete_reinit_entropy_mean"] = discrete_reinit_entropy_mean
+                            iter_log["iter/discrete_reinit_entropy_min"] = discrete_reinit_entropy_min
+                        if length_alpha is not None:
+                            iter_log["iter/effective_prompt_length"] = float(
+                                (n_free * torch.sigmoid(length_alpha)).detach().item()
+                            )
+                            iter_log["iter/length_alpha"] = float(length_alpha.detach().item())
+                        iter_eff_temperature = _effective_temperature_tensor(stgs_module).float()
+                        if iter_eff_temperature is not None:
+                            iter_log["iter/effective_temperature"] = float(iter_eff_temperature.mean().item())
+                            if decouple_learnable_temperature and iter_eff_temperature.ndim > 1:
+                                for idx in range(iter_eff_temperature.shape[-1]):
+                                    iter_log[f"iter/effective_temperature_{idx}"] = float(
+                                        iter_eff_temperature[..., idx].mean().item()
+                                    )
+                        iter_bptt_eff_temperature = (
+                            _effective_temperature_tensor(diff_model.stgs).float()
+                            if hasattr(diff_model, "stgs") and diff_model.stgs is not None
+                            else None
+                        )
+                        if iter_bptt_eff_temperature is not None:
+                            iter_log["iter/bptt_effective_temperature"] = float(
+                                iter_bptt_eff_temperature.mean().item()
+                            )
+                            if bptt_decouple_learnable_temperature and iter_bptt_eff_temperature.ndim > 1:
+                                for idx in range(iter_bptt_eff_temperature.shape[-1]):
+                                    iter_log[f"iter/bptt_effective_temperature_{idx}"] = float(
+                                        iter_bptt_eff_temperature[..., idx].mean().item()
+                                    )
+                        if (
+                            learnable_temperature
+                            and temperature_anneal_reg_lambda > 0.0
+                            and temperature_anneal_schedule != "none"
+                        ):
+                            iter_log["iter/temperature_anneal_target"] = compute_annealed_temperature(
+                                temperature,
+                                temperature_anneal_min,
+                                epoch,
+                                anneal_total,
+                                temperature_anneal_schedule,
+                            )
+                        if adaptive_gumbel_noise and ema_loss is not None:
+                            iter_log["iter/gumbel_loss_ema"] = float(ema_loss)
+                        wandb.log(iter_log)
+
                     optimizer.step()
 
                     # Logit decay
@@ -1995,8 +2189,9 @@ def pc_optimize_inputs(
 
             # Cache fl and p_text once per epoch after parameter update
             fl_epoch = _assemble_prompt_logits().detach()
+            p_token_ids_epoch = fl_epoch.argmax(dim=-1).squeeze(0).tolist()
             p_text_epoch = tokenizer.decode(
-                fl_epoch.argmax(dim=-1).squeeze(0).tolist(),
+                p_token_ids_epoch,
                 skip_special_tokens=False,
             )
 
@@ -2016,6 +2211,14 @@ def pc_optimize_inputs(
             ema_loss = epoch_avg_loss if ema_loss is None else (
                 adaptive_gumbel_noise_beta * ema_loss + (1 - adaptive_gumbel_noise_beta) * epoch_avg_loss
             )
+            _grad_leaf = lora_A if lora_A is not None else free_logits
+            grad_stats = _gradient_stats(_grad_leaf.grad if _grad_leaf is not None else None)
+            eff_temperature = _effective_temperature_tensor(stgs_module).float()
+            bptt_eff_temperature = (
+                _effective_temperature_tensor(diff_model.stgs).float()
+                if hasattr(diff_model, "stgs") and diff_model.stgs is not None
+                else None
+            )
 
             # W&B logging
             if wandb.run is not None:
@@ -2028,11 +2231,13 @@ def pc_optimize_inputs(
                     "temperature": current_temperature,
                     "gumbel_noise_scale": current_gumbel_scale,
                     "epoch": epoch,
+                    "allowed_vocab_size": vocab_size,
+                    "vocab_size": vocab_size,
                 }
                 log_dict.update({f"train/{k}": v for k, v in train_metrics_epoch.items()})
                 log_dict.update(epoch_reg_log)
-                if total_norm is not None:
-                    log_dict["grad_norm"] = total_norm
+                log_dict.update(grad_stats)
+                log_dict["grad_norm"] = total_norm if total_norm is not None else grad_stats["prompt_grad_norm"]
                 log_dict["discrete_reinit"] = int(discrete_reinit_applied)
                 log_dict["discrete_reinit_num_positions"] = discrete_reinit_num_positions
                 if discrete_reinit_entropy_mean is not None:
@@ -2041,6 +2246,36 @@ def pc_optimize_inputs(
                 if length_alpha is not None:
                     log_dict["effective_prompt_length"] = float((n_free * torch.sigmoid(length_alpha)).detach().item())
                     log_dict["length_alpha"] = float(length_alpha.detach().item())
+                if temperature_anneal_schedule != "none" and not learnable_temperature:
+                    log_dict["annealed_temperature"] = current_temperature
+                if eff_temperature is not None:
+                    log_dict["effective_temperature"] = float(eff_temperature.mean().item())
+                    if decouple_learnable_temperature and eff_temperature.ndim > 1:
+                        for idx in range(eff_temperature.shape[-1]):
+                            log_dict[f"effective_temperature_{idx}"] = float(eff_temperature[..., idx].mean().item())
+                if bptt_eff_temperature is not None:
+                    log_dict["bptt_effective_temperature"] = float(bptt_eff_temperature.mean().item())
+                    if bptt_decouple_learnable_temperature and bptt_eff_temperature.ndim > 1:
+                        for idx in range(bptt_eff_temperature.shape[-1]):
+                            log_dict[f"bptt_effective_temperature_{idx}"] = float(
+                                bptt_eff_temperature[..., idx].mean().item()
+                            )
+                if (
+                    learnable_temperature
+                    and temperature_anneal_reg_lambda > 0.0
+                    and temperature_anneal_schedule != "none"
+                ):
+                    log_dict["temperature_anneal_target"] = compute_annealed_temperature(
+                        temperature,
+                        temperature_anneal_min,
+                        epoch,
+                        anneal_total,
+                        temperature_anneal_schedule,
+                    )
+                if adaptive_gumbel_noise and ema_loss is not None:
+                    log_dict["gumbel_loss_ema"] = float(ema_loss)
+                log_dict["train/p_text"] = p_text_epoch
+                log_dict["train/p_token_ids"] = p_token_ids_epoch
                 wandb.log(log_dict)
 
             # Weave epoch-level trace
@@ -2053,6 +2288,7 @@ def pc_optimize_inputs(
             )
 
             val_any_correct = None
+            val_metrics = None
             # Validation
             if val_eval_every > 0 and (epoch + 1) % val_eval_every == 0 and val_pairs:
                 val_metrics = evaluate_shared_prompt(
@@ -2092,6 +2328,61 @@ def pc_optimize_inputs(
                 if cb_metrics and wandb.run is not None:
                     wandb.log(cb_metrics)
 
+            if superposition_callback is not None and wandb.run is not None:
+                _sup_metrics = superposition_callback(epoch, _get_free_logits().detach())
+                if _sup_metrics:
+                    wandb.log(_sup_metrics)
+
+            if prompt_history_table is not None:
+                row = [
+                    epoch,
+                    p_token_ids_epoch,
+                    p_text_epoch,
+                    epoch_avg_loss,
+                    current_temperature,
+                    float(eff_temperature.mean().item()) if eff_temperature is not None else None,
+                    float(bptt_eff_temperature.mean().item()) if bptt_eff_temperature is not None else None,
+                    current_gumbel_scale,
+                    total_norm if total_norm is not None else grad_stats["prompt_grad_norm"],
+                    grad_stats["prompt_grad_norm"],
+                    grad_stats["non_zero_grads"],
+                    int(discrete_reinit_applied),
+                    discrete_reinit_num_positions,
+                    train_metrics_epoch.get("any_correct"),
+                    train_metrics_epoch.get("all_correct"),
+                    None if val_metrics is None else val_metrics.get("any_correct"),
+                    None if val_metrics is None else val_metrics.get("all_correct"),
+                ]
+                for method_name in extraction_fns:
+                    row.append(train_metrics_epoch.get(f"accuracy_{method_name}"))
+                for method_name in extraction_fns:
+                    row.append(None if val_metrics is None else val_metrics.get(f"accuracy_{method_name}"))
+                prompt_history_table.add_data(*row)
+                if epoch % table_log_every == 0 or epoch == epochs - 1:
+                    wandb.log({"prompt_history_table": copy.deepcopy(prompt_history_table)})
+
+            if exact_match_hits_table is not None:
+                hit_rows = []
+                if float(train_metrics_epoch.get("all_correct", 0.0)) >= 1.0:
+                    hit_rows.append(("train", train_metrics_epoch))
+                if val_metrics is not None and float(val_metrics.get("all_correct", 0.0)) >= 1.0:
+                    hit_rows.append(("val", val_metrics))
+                for split_name, split_metrics in hit_rows:
+                    row = [
+                        epoch,
+                        split_name,
+                        p_token_ids_epoch,
+                        p_text_epoch,
+                        epoch_avg_loss,
+                        split_metrics.get("any_correct"),
+                        split_metrics.get("all_correct"),
+                    ]
+                    for method_name in extraction_fns:
+                        row.append(split_metrics.get(f"accuracy_{method_name}"))
+                    exact_match_hits_table.add_data(*row)
+                if hit_rows:
+                    wandb.log({"exact_match_hits": copy.deepcopy(exact_match_hits_table)})
+
             epoch_postfix = {
                 "loss": f"{epoch_avg_loss:.4f}",
                 "n_train": epoch_train_examples,
@@ -2127,6 +2418,26 @@ def pc_optimize_inputs(
         bptt_module=getattr(diff_model, "stgs", None),
         device=device,
     )
+    if superposition_callback is not None:
+        final_epoch = max(len(loss_history) - 1, 0)
+        _sup_final_metrics = superposition_callback(final_epoch, final_learnable_logits, force=True)
+        if _sup_final_metrics and wandb.run is not None:
+            wandb.log(_sup_final_metrics)
+    if wandb.run is not None:
+        summary_payload = {
+            "final_prompt_text": final_p_text,
+            "final_prompt_token_ids": final_p_tokens,
+            "final_train_loss": loss_history[-1] if loss_history else None,
+            "final_train_any_correct": train_accuracy_history[-1].get("any_correct", 0.0) if train_accuracy_history else 0.0,
+            "final_train_all_correct": train_accuracy_history[-1].get("all_correct", 0.0) if train_accuracy_history else 0.0,
+            "best_train_any_correct": max((entry.get("any_correct", 0.0) for entry in train_accuracy_history), default=0.0),
+            "best_val_any_correct": max((entry.get("any_correct", 0.0) for entry in val_accuracy_history), default=0.0),
+        }
+        if prompt_history_table is not None:
+            wandb.log({"prompt_history_table": copy.deepcopy(prompt_history_table)})
+        if exact_match_hits_table is not None and exact_match_hits_table.data:
+            wandb.log({"exact_match_hits": copy.deepcopy(exact_match_hits_table)})
+        wandb.run.summary.update({k: v for k, v in summary_payload.items() if v is not None})
 
     return {
         "final_p_logits": final_prompt_logits,
