@@ -227,7 +227,7 @@ def _effective_temperature_tensor(stgs_module: STGS) -> Tensor:
         return stgs_module.eps + stgs_module.init_temperature * (1 + torch.tanh(stgs_module.temperature_param))
     return torch.tensor(
         [float(getattr(stgs_module, "init_temperature", 1.0))],
-        device=stgs_module.device,
+        device=getattr(stgs_module, "device", "cpu"),
         dtype=torch.float32,
     )
 
