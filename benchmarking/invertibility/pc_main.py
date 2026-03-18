@@ -739,6 +739,89 @@ def _left_pad_embed_sequences(
     return padded, attention_mask
 
 
+def pc_forward_pass_batched_tf(
+    diff_model,
+    stgs_module,
+    loss_instances: List,                        # one LossClass per sample
+    free_logits: Tensor,                         # (1, seq_len, vocab)
+    embedding_weights: Tensor,                   # (vocab, d)
+    x_embeds_list: List[Tensor],                 # [(1, x_len_i, d), ...]
+    R_gt_embeds_list: List[Optional[Tensor]],    # [(1, R_len_i, d) or None, ...]
+    E_embeds: Tensor,                            # (1, E_len, d)
+    Y_tokens_list: List[Tensor],                 # [(1, Y_len_i), ...]
+    gumbel_noise_scale: float = 1.0,
+    stgs_noise_mode: str = "shared",             # "shared" | "independent"
+) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+    """Batched teacher-forcing forward pass (teacher_forcing_r=True, bptt=False).
+
+    Assembles [x_i | p_i | R_gt_i | E | Y_i[:-1]] for each sample,
+    left-pads to a common length, and runs a single diff_model.forward call.
+
+    Returns:
+        losses:        list of B scalar loss tensors (grad-connected)
+        y_logits_list: list of B (1, Y_len_i, vocab) detached tensors for
+                       training accuracy decoding
+    """
+    B = len(x_embeds_list)
+    device = x_embeds_list[0].device
+    dtype  = x_embeds_list[0].dtype
+
+    # --- Build per-sample or shared p_embeds ---
+    if stgs_noise_mode == "independent":
+        p_rows = []
+        for _ in range(B):
+            _, oh, _, _ = stgs_module(
+                free_logits, gumbel_noise_scale=gumbel_noise_scale,
+                embedding_weights=embedding_weights,
+            )
+            p_rows.append((oh @ embedding_weights.detach()).squeeze(0))
+        p_embeds_batch = torch.stack(p_rows, dim=0)   # (B, seq_len, d)
+    else:
+        _, oh, _, _ = stgs_module(
+            free_logits, gumbel_noise_scale=gumbel_noise_scale,
+            embedding_weights=embedding_weights,
+        )
+        p_embeds_batch = (oh @ embedding_weights.detach()).expand(B, -1, -1)
+
+    # --- Build full sequences [x | p | R_gt | E | Y[:-1]] per sample ---
+    sequences = []
+    y_lens    = []
+    for i in range(B):
+        parts = [x_embeds_list[i], p_embeds_batch[i:i+1]]
+        if R_gt_embeds_list[i] is not None:
+            parts.append(R_gt_embeds_list[i])
+        parts.append(E_embeds)
+        Y_len_i = Y_tokens_list[i].shape[1]
+        y_lens.append(Y_len_i)
+        if Y_len_i > 1:
+            Y_emb = embedding_weights[Y_tokens_list[i].squeeze(0)].unsqueeze(0)
+            parts.append(Y_emb[:, :-1, :])
+        sequences.append(torch.cat(parts, dim=1))
+
+    padded, attention_mask = _left_pad_embed_sequences(sequences, device, dtype)
+    output = diff_model.forward(
+        inputs_embeds=padded,
+        attention_mask=attention_mask,
+        output_normal_logits=True,
+    )
+    # output.logits: (B, max_total_len, vocab)
+
+    losses, y_logits_list = [], []
+    for i in range(B):
+        y_logits_i = output.logits[i:i+1, -y_lens[i]:, :]  # right-aligned
+        d = loss_instances[i].compute_loss({
+            "generated_logits":    y_logits_i,
+            "prompt_logits":       free_logits,
+            "prompt_argmax_ids":   free_logits.argmax(dim=-1),
+            "completion_ids":      Y_tokens_list[i],
+            "tf_generated_logits": None,
+            "prompt_input_logits": free_logits,
+        })
+        losses.append(d["sumloss"])
+        y_logits_list.append(y_logits_i.detach())
+    return losses, y_logits_list
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
