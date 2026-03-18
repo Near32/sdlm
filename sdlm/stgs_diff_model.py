@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Dict, Union, Tuple
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 from torch import Tensor
 
-from tqdm import tqdm
+from .utils.tqdm_utils import tqdm
 import gc
 
 from .stgs import STGS
@@ -21,6 +22,7 @@ class STGSOutput(CausalLMOutputWithPast):
         self.sampled_diff_one_hot = kwargs.pop('sampled_diff_one_hot', None)
         self.sampled_diff_embeds = kwargs.pop('sampled_diff_embeds', None)  # (B, T, embed_dim)
         self.temperature = kwargs.pop('temperature', None)
+        self.base_generate_output = kwargs.pop('base_generate_output', None)
         super().__init__(*args, **kwargs)
 
     input_logits: Tensor
@@ -29,6 +31,7 @@ class STGSOutput(CausalLMOutputWithPast):
     sampled_diff_one_hot: Tensor
     sampled_diff_embeds: Tensor
     temperature: Tensor
+    base_generate_output: object
     
     def __getitem__(self, key):
         return getattr(self, key)
@@ -280,7 +283,7 @@ class STGSDiffModel(PreTrainedModel,GenerationMixin):
             output_diff_one_hots = False
             output_normal_logits = True
             diff_output_ids, diff_one_hot = None, None
-            temperature, stgs_logits = None, None
+            temperature, stgs_logits = torch.zeros((1,), device=logits.device), None
         
         # Compute loss if labels are provided
         loss = None
@@ -342,6 +345,7 @@ class STGSDiffModel(PreTrainedModel,GenerationMixin):
         use_stgs_logits_generation: Optional[bool] = None,
         return_cache: Optional[bool] = False,
         accumulate_embeds: bool = False,
+        generation_backend: str = "diff",
         **kwargs
     ) -> Tensor:
         """
@@ -364,8 +368,38 @@ class STGSDiffModel(PreTrainedModel,GenerationMixin):
         if return_cache and not kwargs.get('return_dict', False):
             raise ValueError("return_cache=True requires return_dict=True")
 
-        return_dict = kwargs.get('return_dict', False)
+        kwargs = dict(kwargs)
+        return_dict = kwargs.pop('return_dict', False)
         use_bpttoken = use_bpttoken or self.use_bpttoken
+
+        if generation_backend not in {"diff", "hf_generate"}:
+            raise ValueError(
+                "generation_backend must be either 'diff' or 'hf_generate', "
+                f"got {generation_backend!r}"
+            )
+        if generation_backend == "hf_generate":
+            return self._generate_with_hf_backend(
+                input_ids=input_ids,
+                input_one_hots=input_one_hots,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                output_hidden_states=output_hidden_states,
+                output_diff_tokens=output_diff_tokens,
+                output_diff_one_hots=output_diff_one_hots,
+                output_normal_logits=output_normal_logits,
+                output_stgs_logits=output_stgs_logits,
+                num_beams=num_beams,
+                use_bpttoken=use_bpttoken,
+                use_diff_tokens=use_diff_tokens,
+                use_soft_embeds=use_soft_embeds,
+                return_cache=return_cache,
+                accumulate_embeds=accumulate_embeds,
+                return_dict=return_dict,
+                **kwargs,
+            )
 
         if use_bpttoken and num_beams > 1:
             raise ValueError("BPTT is not compatible with beam search (num_beams > 1)")
@@ -588,103 +622,112 @@ class STGSDiffModel(PreTrainedModel,GenerationMixin):
         if max_length is not None:
             max_new_tokens = max_length - input_len +1
         assert max_new_tokens is not None
-        for it in tqdm(range(1, max_new_tokens)):
-            # Forward pass with past key values for efficient generation
-            #torch.cuda.empty_cache()
-            #gc.collect()
-            
-            _attn_mask = attention_mask[:, :_mask_pos].detach() if accumulate_embeds else attention_mask.detach()
-            outputs = self.forward(
-                inputs_embeds=next_token_embedding,
-                attention_mask=_attn_mask,
-                past_key_values=past_key_values,
-                **kwargs
-            )
-            # WARNING: logits are not normalized, but stgs_logits are normalized
+        generation_pbar = tqdm(
+            total=max(max_new_tokens - 1, 0),
+            desc="Diff generation",
+            leave=False,
+        )
+        try:
+            for it in range(1, max_new_tokens):
+                # Forward pass with past key values for efficient generation
+                #torch.cuda.empty_cache()
+                #gc.collect()
 
-            past_key_values = outputs.past_key_values
-            
-            # Get elements for ONLY THE NEXT TOKEN:
-            if not use_diff_tokens:
-                next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
-                next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
-            else:
-                next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
-            if next_token_logits is not None:
-                # PREVIOUSLY:
-                # next_token_id = next_token_logits.argmax(-1)
-                # NOW: we sample with the temperature, because nothing asked for argmax:
-                next_token_tlogits = (next_token_logits/eff_temperature).to(torch.float32)
-                next_token_id = torch.distributions.categorical.Categorical(
-                    logits=next_token_tlogits,
-                ).sample()
-                next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
-            else:
-                #assert self.stgs_logits_generation
-                assert 'stgs' in eff_logits_generation
-            
-            if not use_diff_tokens:
-                next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
+                _attn_mask = attention_mask[:, :_mask_pos].detach() if accumulate_embeds else attention_mask.detach()
+                outputs = self.forward(
+                    inputs_embeds=next_token_embedding,
+                    attention_mask=_attn_mask,
+                    past_key_values=past_key_values,
+                    **kwargs
+                )
+                # WARNING: logits are not normalized, but stgs_logits are normalized
 
-                for ok, ov in outputs.items():
-                    if ok not in all_dict \
-                    or ov is None:  continue
-                    if len(ov.shape) >= 2 \
-                    and ok != 'input_logits':
-                        ov = ov[:,-1:]
-                    all_dict[ok].append(ov)
+                past_key_values = outputs.past_key_values
+
+                # Get elements for ONLY THE NEXT TOKEN:
+                if not use_diff_tokens:
+                    next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+                    next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+                else:
+                    next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+                if next_token_logits is not None:
+                    # PREVIOUSLY:
+                    # next_token_id = next_token_logits.argmax(-1)
+                    # NOW: we sample with the temperature, because nothing asked for argmax:
+                    next_token_tlogits = (next_token_logits/eff_temperature).to(torch.float32)
+                    next_token_id = torch.distributions.categorical.Categorical(
+                        logits=next_token_tlogits,
+                    ).sample()
+                    next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+                else:
+                    #assert self.stgs_logits_generation
+                    assert 'stgs' in eff_logits_generation
+
+                if not use_diff_tokens:
+                    next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
+
+                    for ok, ov in outputs.items():
+                        if ok not in all_dict \
+                        or ov is None:  continue
+                        if len(ov.shape) >= 2 \
+                        and ok != 'input_logits':
+                            ov = ov[:,-1:]
+                        all_dict[ok].append(ov)
+                    #if self.stgs_logits_generation:
+                    if 'stgs' in eff_logits_generation:
+                        # Normalized
+                        if not accumulate_embeds:
+                            all_one_hot.append(next_token_stgs_one_hot)
+                        all_sampled_ids.append(next_token_stgs_id)
+                    else:
+                        # Need normalization, with temperature
+                        if not accumulate_embeds:
+                            if use_soft_embeds:
+                                all_one_hot.append(F.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype))
+                            else:
+                                all_one_hot.append(F.one_hot(next_token_id, num_classes=self.model.config.vocab_size).to(next_token_logits.dtype))
+                        all_sampled_ids.append(next_token_id)
+
+                # Get embeddings for the next token
+                #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
                 #if self.stgs_logits_generation:
                 if 'stgs' in eff_logits_generation:
-                    # Normalized
-                    if not accumulate_embeds:
-                        all_one_hot.append(next_token_stgs_one_hot)
-                    all_sampled_ids.append(next_token_stgs_id)
-                else:
-                    # Need normalization, with temperature
-                    if not accumulate_embeds:
-                        if use_soft_embeds:
-                            all_one_hot.append(F.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype))
-                        else:
-                            all_one_hot.append(F.one_hot(next_token_id, num_classes=self.model.config.vocab_size).to(next_token_logits.dtype))
-                    all_sampled_ids.append(next_token_id)
-
-            # Get embeddings for the next token
-            #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
-            #if self.stgs_logits_generation:
-            if 'stgs' in eff_logits_generation:
-                if use_diff_tokens:
-                    next_token_embedding = embedding_layer(next_token_stgs_id.long())
-                elif accumulate_embeds:
-                    next_token_embedding = torch.matmul(next_token_stgs_one_hot, embedding_layer.weight.unsqueeze(0).detach())
-                    all_soft_embeds.append(next_token_embedding)
-                else:
-                    next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
-            else:
-                if use_soft_embeds:
-                    next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype)
-                    next_token_embedding = torch.matmul(next_token_logits_temp_distr, embedding_layer.weight.unsqueeze(0))
-                    if accumulate_embeds:
+                    if use_diff_tokens:
+                        next_token_embedding = embedding_layer(next_token_stgs_id.long())
+                    elif accumulate_embeds:
+                        next_token_embedding = torch.matmul(next_token_stgs_one_hot, embedding_layer.weight.unsqueeze(0).detach())
                         all_soft_embeds.append(next_token_embedding)
+                    else:
+                        next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
                 else:
-                    #next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1)#.to(next_token_logits.dtype)
-                    #sampled_next_token_id = torch.distributions.categorical.Categorical(
-                    #    probs=next_token_logits_temp_distr,
-                    #).sample()
-                    next_token_embedding = embedding_layer(all_sampled_ids[-1].long())
-            # batch_size x 1 x embedding_dim
+                    if use_soft_embeds:
+                        next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1).to(next_token_logits.dtype)
+                        next_token_embedding = torch.matmul(next_token_logits_temp_distr, embedding_layer.weight.unsqueeze(0))
+                        if accumulate_embeds:
+                            all_soft_embeds.append(next_token_embedding)
+                    else:
+                        #next_token_logits_temp_distr = torch.softmax((next_token_logits/eff_temperature).to(torch.float32), dim=-1)#.to(next_token_logits.dtype)
+                        #sampled_next_token_id = torch.distributions.categorical.Categorical(
+                        #    probs=next_token_logits_temp_distr,
+                        #).sample()
+                        next_token_embedding = embedding_layer(all_sampled_ids[-1].long())
+                # batch_size x 1 x embedding_dim
 
-            if not use_bpttoken:
-                next_token_embedding = next_token_embedding.detach()
+                if not use_bpttoken:
+                    next_token_embedding = next_token_embedding.detach()
 
-            if accumulate_embeds:
-                _mask_pos += 1  # pre-allocated mask already has 1s; just advance pointer
-            else:
-                with torch.no_grad():
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-                    ], dim=-1)
-            # batch_size x seq_len+it+1
+                if accumulate_embeds:
+                    _mask_pos += 1  # pre-allocated mask already has 1s; just advance pointer
+                else:
+                    with torch.no_grad():
+                        attention_mask = torch.cat([
+                            attention_mask,
+                            torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+                        ], dim=-1)
+                # batch_size x seq_len+it+1
+                generation_pbar.update(1)
+        finally:
+            generation_pbar.close()
 
         if not use_diff_tokens and not accumulate_embeds:
             all_one_hot = torch.cat(all_one_hot, dim=1)
@@ -736,6 +779,135 @@ class STGSDiffModel(PreTrainedModel,GenerationMixin):
         if accumulate_embeds:
             return torch.cat(all_soft_embeds, dim=1)
         return all_one_hot
+
+    def _supports_generate_inputs_embeds(self) -> bool:
+        try:
+            parameters = inspect.signature(self.model.prepare_inputs_for_generation).parameters
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return "inputs_embeds" in parameters
+
+    def _generate_with_hf_backend(
+        self,
+        *,
+        input_ids: Optional[Tensor],
+        input_one_hots: Optional[Tensor],
+        inputs_embeds: Optional[Tensor],
+        attention_mask: Optional[Tensor],
+        max_length: Optional[int],
+        max_new_tokens: Optional[int],
+        temperature: Optional[float],
+        output_hidden_states: Optional[bool],
+        output_diff_tokens: Optional[bool],
+        output_diff_one_hots: Optional[bool],
+        output_normal_logits: Optional[bool],
+        output_stgs_logits: Optional[bool],
+        num_beams: Optional[int],
+        use_bpttoken: Optional[bool],
+        use_diff_tokens: Optional[bool],
+        use_soft_embeds: Optional[bool],
+        return_cache: Optional[bool],
+        accumulate_embeds: bool,
+        return_dict: bool,
+        **kwargs,
+    ) -> Union[STGSOutput, Tensor]:
+        unsupported = []
+        if use_bpttoken:
+            unsupported.append("use_bpttoken")
+        if return_cache:
+            unsupported.append("return_cache")
+        if accumulate_embeds:
+            unsupported.append("accumulate_embeds")
+        if output_diff_one_hots:
+            unsupported.append("output_diff_one_hots")
+        if output_normal_logits:
+            unsupported.append("output_normal_logits")
+        if output_stgs_logits:
+            unsupported.append("output_stgs_logits")
+        if unsupported:
+            raise ValueError(
+                "generation_backend='hf_generate' only supports tokens-only outputs; "
+                f"unsupported options requested: {', '.join(unsupported)}"
+            )
+
+        # Internal wrapper kwargs conflict with the wrapped model.generate return contract.
+        kwargs.pop("return_dict_in_generate", None)
+
+        with torch.no_grad():
+            if attention_mask is None:
+                if input_ids is not None:
+                    attention_mask = (input_ids != self.pad_token_id).long()
+                elif input_one_hots is not None:
+                    attention_mask = (input_one_hots.sum(-1) != 0).long()
+                elif inputs_embeds is not None:
+                    attention_mask = torch.ones(
+                        (inputs_embeds.size(0), inputs_embeds.size(1)),
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+
+        embedding_layer = self.model.get_input_embeddings()
+        prompt_len = 0
+        generate_kwargs = dict(kwargs)
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask
+        if max_length is not None:
+            generate_kwargs["max_length"] = max_length
+        if max_new_tokens is not None:
+            generate_kwargs["max_new_tokens"] = max_new_tokens
+        if temperature is not None:
+            generate_kwargs["temperature"] = temperature
+        if num_beams is not None:
+            generate_kwargs["num_beams"] = num_beams
+        if output_hidden_states:
+            generate_kwargs["output_hidden_states"] = True
+        generate_kwargs["return_dict_in_generate"] = True
+
+        if inputs_embeds is None and input_one_hots is not None:
+            inputs_embeds = torch.matmul(
+                input_one_hots,
+                embedding_layer.weight.unsqueeze(0).detach(),
+            )
+
+        hf_inputs: Dict[str, Tensor] = {}
+        if inputs_embeds is not None:
+            if not self._supports_generate_inputs_embeds():
+                raise ValueError(
+                    f"generation_backend='hf_generate' requires {self.model.__class__.__name__} "
+                    "to support model.generate(inputs_embeds=...)."
+                )
+            hf_inputs["inputs_embeds"] = inputs_embeds
+            if input_ids is not None:
+                hf_inputs["input_ids"] = input_ids
+                prompt_len = input_ids.size(1)
+        elif input_ids is not None:
+            hf_inputs["input_ids"] = input_ids
+            prompt_len = input_ids.size(1)
+        else:
+            raise ValueError(
+                "generation_backend='hf_generate' requires input_ids, input_one_hots, or inputs_embeds."
+            )
+
+        try:
+            with torch.no_grad():
+                base_generate_output = self.model.generate(**hf_inputs, **generate_kwargs)
+        except Exception as exc:
+            raise ValueError(
+                "generation_backend='hf_generate' failed for "
+                f"{self.model.__class__.__name__} while calling model.generate(inputs_embeds=...) "
+                "in pure mode (no synthesized input_ids were added). "
+                f"Underlying error: {exc}"
+            ) from exc
+
+        sequences = getattr(base_generate_output, "sequences", base_generate_output)
+        generated_tokens = sequences[:, prompt_len:] if prompt_len > 0 else sequences
+
+        if return_dict:
+            return STGSOutput(
+                sampled_diff_tokens=generated_tokens,
+                base_generate_output=base_generate_output,
+            )
+        return generated_tokens
 
     def continue_from_cache(
         self,
