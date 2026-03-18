@@ -47,9 +47,11 @@ def _load_pc_main():
     weave_module = stub_modules["pc_weave_logging"]
     weave_module.build_lm_trace_payload = lambda *args, **kwargs: {}
     weave_module.build_trace_segment = lambda *args, **kwargs: {}
+    weave_module.is_weave_active = lambda: False
     weave_module.weave_lm_train_step = lambda *args, **kwargs: None
     weave_module.weave_lm_eval_step = lambda *args, **kwargs: None
     weave_module.weave_epoch_summary = lambda *args, **kwargs: None
+    weave_module.weave_prompt_init = lambda *args, **kwargs: None
 
     saved_modules = {}
     for name, module in stub_modules.items():
@@ -176,9 +178,11 @@ def _load_pc_main_runtime():
     weave_module = stub_modules["pc_weave_logging"]
     weave_module.build_lm_trace_payload = lambda *args, **kwargs: {}
     weave_module.build_trace_segment = lambda *args, **kwargs: {}
+    weave_module.is_weave_active = lambda: False
     weave_module.weave_lm_train_step = lambda *args, **kwargs: None
     weave_module.weave_lm_eval_step = lambda *args, **kwargs: None
     weave_module.weave_epoch_summary = lambda *args, **kwargs: None
+    weave_module.weave_prompt_init = lambda *args, **kwargs: None
 
     saved_modules = {}
     for name, module in stub_modules.items():

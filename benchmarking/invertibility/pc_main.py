@@ -51,9 +51,11 @@ from evaluation import compute_embsim_probs
 from pc_weave_logging import (
     build_lm_trace_payload,
     build_trace_segment,
+    is_weave_active,
     weave_lm_train_step,
     weave_lm_eval_step,
     weave_epoch_summary,
+    weave_prompt_init,
 )
 
 logger = logging.getLogger("pc_main")
@@ -230,6 +232,20 @@ def _effective_temperature_tensor(stgs_module: STGS) -> Tensor:
         device=getattr(stgs_module, "device", "cpu"),
         dtype=torch.float32,
     )
+
+
+def _temperature_component_means(temperature_tensor: Tensor) -> List[float]:
+    temperature_tensor = temperature_tensor.float()
+    if temperature_tensor.ndim > 0 and temperature_tensor.shape[-1] == 1:
+        temperature_tensor = temperature_tensor.squeeze(-1)
+    if temperature_tensor.ndim == 0:
+        return [float(temperature_tensor.item())]
+    if temperature_tensor.ndim == 1:
+        return [float(value.item()) for value in temperature_tensor]
+    return [
+        float(temperature_tensor[:, idx].mean().item())
+        for idx in range(temperature_tensor.shape[1])
+    ]
 
 
 def _gradient_stats(grad_tensor: Optional[Tensor]) -> Dict[str, float]:
@@ -2115,14 +2131,71 @@ def pc_optimize_inputs(
 
     # One-hot initialization from initial_prompt_text
     if _initial_prompt_token_ids is not None:
+        _oh = torch.zeros(1, seq_len, vocab_size, device=device)
+        _oh[0, torch.arange(seq_len, device=device), _initial_prompt_token_ids.long()] = 10.0
+
         if logits_lora_rank > 0:
-            logger.warning(
-                "initial_prompt_text with logits_lora_rank > 0: seq_len is overridden "
-                "but logit initialization remains random (one-hot init unsupported for LoRA)."
+            # SVD rank-r approximation of the one-hot logit matrix into lora_A @ lora_B.
+            mat = _oh.squeeze(0).float()                   # (seq_len, vocab_size)
+            U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+            r = min(logits_lora_rank, S.shape[0])
+            sq = S[:r].sqrt()
+            A = (U[:, :r] * sq.unsqueeze(0)).to(device)   # (seq_len, r)
+            B = (sq.unsqueeze(1) * Vh[:r, :]).to(device)  # (r, vocab_size)
+            lora_A = A.unsqueeze(0).detach().to(_oh.dtype).requires_grad_(True)
+            lora_B = B.unsqueeze(0).detach().to(_oh.dtype).requires_grad_(True)
+            parameters = [lora_A, lora_B]
+
+            # Measure reconstruction quality.
+            reconstructed = (lora_A.detach() @ lora_B.detach()).squeeze(0)  # (seq_len, vocab)
+            recon_ids = reconstructed.argmax(dim=-1).cpu().tolist()
+            requested_ids = _initial_prompt_token_ids.cpu().tolist()
+            requested_text_dec = tokenizer.decode(requested_ids, skip_special_tokens=False)
+            reconstructed_text_dec = tokenizer.decode(recon_ids, skip_special_tokens=False)
+            recon_error = float(
+                (_oh.squeeze(0).float() - reconstructed.float()).norm().item()
             )
+            is_exact = (recon_ids == requested_ids)
+
+            # Loud warning — printed to both stdout and stderr so it is
+            # impossible to miss in logs or terminal output.
+            _SEP = "!" * 72
+            _msg_lines = [
+                "",
+                _SEP,
+                "  LOSSY INIT WARNING: initial_prompt_text + logits_lora_rank > 0",
+                f"  Rank-{r} SVD of one-hot logits (seq_len={seq_len}, vocab={vocab_size})",
+                f"  Requested    : {requested_text_dec!r}",
+                f"  Argmax(lora) : {reconstructed_text_dec!r}",
+                f"  Token-exact  : {is_exact}",
+                f"  ||M - AB||_F : {recon_error:.4f}",
+                _SEP,
+                "",
+            ]
+            _msg = "\n".join(_msg_lines)
+            print(_msg, flush=True)
+            print(_msg, file=sys.stderr, flush=True)
+            logger.warning(
+                "initial_prompt_text with logits_lora_rank=%d: rank-%d SVD approximation. "
+                "requested=%r  argmax_init=%r  token_exact=%s  recon_error=%.4f",
+                logits_lora_rank, r,
+                requested_text_dec, reconstructed_text_dec,
+                is_exact, recon_error,
+            )
+
+            if is_weave_active():
+                weave_prompt_init(
+                    requested_text=requested_text_dec,
+                    requested_token_ids=requested_ids,
+                    reconstructed_text=reconstructed_text_dec,
+                    reconstructed_token_ids=recon_ids,
+                    reconstruction_error=recon_error,
+                    lora_rank=r,
+                    seq_len=seq_len,
+                    is_exact=is_exact,
+                )
+
         else:
-            _oh = torch.zeros(1, seq_len, vocab_size, device=device)
-            _oh[0, torch.arange(seq_len, device=device), _initial_prompt_token_ids.long()] = 10.0
             free_logits = _oh.detach().requires_grad_(True)
             parameters = [free_logits]
 
@@ -2688,11 +2761,9 @@ def pc_optimize_inputs(
                         iter_eff_temperature = _effective_temperature_tensor(stgs_module).float()
                         if iter_eff_temperature is not None:
                             iter_log["iter/effective_temperature"] = float(iter_eff_temperature.mean().item())
-                            if decouple_learnable_temperature and iter_eff_temperature.ndim > 1:
-                                for idx in range(iter_eff_temperature.shape[-1]):
-                                    iter_log[f"iter/effective_temperature_{idx}"] = float(
-                                        iter_eff_temperature[..., idx].mean().item()
-                                    )
+                            if decouple_learnable_temperature:
+                                for idx, temp_mean in enumerate(_temperature_component_means(iter_eff_temperature)):
+                                    iter_log[f"iter/effective_temperature_{idx}"] = temp_mean
                         iter_bptt_eff_temperature = (
                             _effective_temperature_tensor(diff_model.stgs).float()
                             if hasattr(diff_model, "stgs") and diff_model.stgs is not None
@@ -2702,11 +2773,9 @@ def pc_optimize_inputs(
                             iter_log["iter/bptt_effective_temperature"] = float(
                                 iter_bptt_eff_temperature.mean().item()
                             )
-                            if bptt_decouple_learnable_temperature and iter_bptt_eff_temperature.ndim > 1:
-                                for idx in range(iter_bptt_eff_temperature.shape[-1]):
-                                    iter_log[f"iter/bptt_effective_temperature_{idx}"] = float(
-                                        iter_bptt_eff_temperature[..., idx].mean().item()
-                                    )
+                            if bptt_decouple_learnable_temperature:
+                                for idx, temp_mean in enumerate(_temperature_component_means(iter_bptt_eff_temperature)):
+                                    iter_log[f"iter/bptt_effective_temperature_{idx}"] = temp_mean
                         if (
                             learnable_temperature
                             and temperature_anneal_reg_lambda > 0.0
@@ -2819,16 +2888,14 @@ def pc_optimize_inputs(
                     log_dict["annealed_temperature"] = current_temperature
                 if eff_temperature is not None:
                     log_dict["effective_temperature"] = float(eff_temperature.mean().item())
-                    if decouple_learnable_temperature and eff_temperature.ndim > 1:
-                        for idx in range(eff_temperature.shape[-1]):
-                            log_dict[f"effective_temperature_{idx}"] = float(eff_temperature[..., idx].mean().item())
+                    if decouple_learnable_temperature:
+                        for idx, temp_mean in enumerate(_temperature_component_means(eff_temperature)):
+                            log_dict[f"effective_temperature_{idx}"] = temp_mean
                 if bptt_eff_temperature is not None:
                     log_dict["bptt_effective_temperature"] = float(bptt_eff_temperature.mean().item())
-                    if bptt_decouple_learnable_temperature and bptt_eff_temperature.ndim > 1:
-                        for idx in range(bptt_eff_temperature.shape[-1]):
-                            log_dict[f"bptt_effective_temperature_{idx}"] = float(
-                                bptt_eff_temperature[..., idx].mean().item()
-                            )
+                    if bptt_decouple_learnable_temperature:
+                        for idx, temp_mean in enumerate(_temperature_component_means(bptt_eff_temperature)):
+                            log_dict[f"bptt_effective_temperature_{idx}"] = temp_mean
                 if (
                     learnable_temperature
                     and temperature_anneal_reg_lambda > 0.0

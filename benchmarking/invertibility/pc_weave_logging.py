@@ -271,6 +271,37 @@ def weave_lm_eval_step(**payload: Any) -> Dict[str, Any]:
     return weave_lm_call(payload)
 
 
+@_op(name="pc/prompt_init")
+def weave_prompt_init(
+    requested_text: str,
+    requested_token_ids: List[int],
+    reconstructed_text: str,
+    reconstructed_token_ids: List[int],
+    reconstruction_error: float,
+    lora_rank: int,
+    seq_len: int,
+    is_exact: bool,
+) -> Dict[str, Any]:
+    """
+    Trace the initial prompt text vs its LoRA rank-r SVD approximation.
+
+    Called once at optimization start when initial_prompt_text is set and
+    logits_lora_rank > 0.  Records both the intended text and the argmax of
+    the reconstructed logits (lora_A @ lora_B) so the user can verify how
+    well the rank-r factorisation preserves the desired starting point.
+    """
+    return {
+        "requested_text": requested_text,
+        "requested_token_ids": requested_token_ids,
+        "reconstructed_text": reconstructed_text,
+        "reconstructed_token_ids": reconstructed_token_ids,
+        "reconstruction_error": reconstruction_error,
+        "lora_rank": lora_rank,
+        "seq_len": seq_len,
+        "is_exact": is_exact,
+    }
+
+
 @_op(name="pc/epoch_summary")
 def weave_epoch_summary(
     epoch: int,
