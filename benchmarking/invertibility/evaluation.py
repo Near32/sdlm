@@ -18,6 +18,28 @@ from typing import Any, Callable, Dict, List, Optional
 from metrics_registry import lcs_length
 
 
+def compute_embsim_probs(
+    optimized_logits: torch.Tensor,
+    stgs_module=None,
+    batch_size: int = 1,
+    embsim_temperature: float = 1.0,
+    probs_source: str = "input_logits",
+) -> torch.Tensor:
+    """Build the soft token distribution used for embedding-similarity operations."""
+    with torch.no_grad():
+        if probs_source == "gumbel_soft":
+            if stgs_module is None:
+                raise ValueError("probs_source='gumbel_soft' requires stgs_module")
+            gs_logits = optimized_logits.repeat(batch_size, 1, 1)
+            _, _, _, y_soft = stgs_module.forward(gs_logits)
+            return y_soft[0:1]
+        if probs_source != "input_logits":
+            raise ValueError(f"Unknown probs_source: {probs_source}")
+        if embsim_temperature == 0.0:
+            raise ValueError("embsim_temperature must be non-zero")
+        return torch.softmax(optimized_logits / embsim_temperature, dim=-1)
+
+
 def run_discrete_validation_pass(optimized_logits, allowed_tokens, model, tokenizer,
                                   target_length, device, pre_prompt=None):
     """Greedy decode using only argmax hard token IDs — no soft embeddings."""
@@ -72,15 +94,13 @@ def run_embsim_validation_pass(optimized_logits, embedding_weights_subset, allow
                     temperature). Default 1.0 (backward-compatible, no behaviour change).
     """
     with torch.no_grad():
-        if stgs_module is not None:
-            # Replicate logits to batch_size, draw batch_size GS samples, average y_soft
-            gs_logits = optimized_logits.repeat(batch_size, 1, 1)   # (batch_size, seq_len, allowed_vocab)
-            _, _, _, y_soft = stgs_module.forward(gs_logits)         # (batch_size, seq_len, allowed_vocab)
-            probs = y_soft[0:1]#.mean(dim=0, keepdim=True)                 # (1, seq_len, allowed_vocab)
-        else:
-            if embsim_temperature == 0.0:
-                raise ValueError("embsim_temperature must be non-zero")
-            probs = torch.softmax(optimized_logits / embsim_temperature, dim=-1)  # (1, seq_len, allowed_vocab)
+        probs = compute_embsim_probs(
+            optimized_logits,
+            stgs_module=stgs_module,
+            batch_size=batch_size,
+            embsim_temperature=embsim_temperature,
+            probs_source="gumbel_soft" if stgs_module is not None else "input_logits",
+        )
         soft_emb = torch.matmul(probs, embedding_weights_subset)     # (1, seq_len, embed_dim)
 
         if similarity == "dotproduct":
