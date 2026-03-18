@@ -285,6 +285,43 @@ def _materialize_temperature_payload(
     return _clone_temperature_payload(base_payload)
 
 
+def _infer_temperature_mode_from_payload(payload) -> Dict[str, Optional[bool]]:
+    """Infer learnable/decoupled temperature modes from loaded temperature payload."""
+    out: Dict[str, Optional[bool]] = {
+        "stgs_learnable": None,
+        "stgs_decouple": None,
+        "bptt_learnable": None,
+        "bptt_decouple": None,
+    }
+    if not isinstance(payload, dict):
+        return out
+
+    def _numel(key: str) -> Optional[int]:
+        if key not in payload or payload[key] is None:
+            return None
+        v = payload[key]
+        t = v.detach() if torch.is_tensor(v) else torch.tensor(v)
+        return int(t.numel())
+
+    stgs_n = _numel("stgs_temperature_param")
+    if stgs_n is None:
+        stgs_n = _numel("temperature_param")
+    if stgs_n is None:
+        stgs_n = _numel("stgs_effective_temperature")
+    if stgs_n is not None and stgs_n > 0:
+        out["stgs_learnable"] = True
+        out["stgs_decouple"] = stgs_n > 1
+
+    bptt_n = _numel("bptt_temperature_param")
+    if bptt_n is None:
+        bptt_n = _numel("bptt_effective_temperature")
+    if bptt_n is not None and bptt_n > 0:
+        out["bptt_learnable"] = True
+        out["bptt_decouple"] = bptt_n > 1
+
+    return out
+
+
 def _run_single_target_sweep(
     args: argparse.Namespace,
     model,
@@ -303,6 +340,17 @@ def _run_single_target_sweep(
 
     records: List[Dict] = []
     temperature_paths: List[Dict] = []
+    inferred_modes = _infer_temperature_mode_from_payload(initial_temperatures)
+    if not force_non_learnable_temperatures and inferred_modes["stgs_learnable"]:
+        if not args.learnable_temperature:
+            logging.info("Auto-enabling learnable_temperature from loaded temperature payload.")
+        if inferred_modes["stgs_decouple"] and not args.decouple_learnable_temperature:
+            logging.info("Auto-enabling decouple_learnable_temperature from loaded temperature payload.")
+    if not force_non_learnable_temperatures and inferred_modes["bptt_learnable"]:
+        if not args.bptt_learnable_temperature:
+            logging.info("Auto-enabling bptt_learnable_temperature from loaded temperature payload.")
+        if inferred_modes["bptt_decouple"] and not args.bptt_decouple_learnable_temperature:
+            logging.info("Auto-enabling bptt_decouple_learnable_temperature from loaded temperature payload.")
 
     for idx, top_p in enumerate(top_p_values):
         torch.manual_seed(args.seed)
@@ -311,6 +359,16 @@ def _run_single_target_sweep(
 
         use_learnable_temperature = args.learnable_temperature and (not force_non_learnable_temperatures)
         use_bptt_learnable_temperature = args.bptt_learnable_temperature and (not force_non_learnable_temperatures)
+        use_decouple_learnable_temperature = args.decouple_learnable_temperature and use_learnable_temperature
+        use_bptt_decouple_learnable_temperature = args.bptt_decouple_learnable_temperature and use_bptt_learnable_temperature
+        if not force_non_learnable_temperatures and inferred_modes["stgs_learnable"]:
+            use_learnable_temperature = True
+            use_decouple_learnable_temperature = bool(inferred_modes["stgs_decouple"])
+        if not force_non_learnable_temperatures and inferred_modes["bptt_learnable"]:
+            use_bptt_learnable_temperature = True
+            use_bptt_decouple_learnable_temperature = bool(inferred_modes["bptt_decouple"])
+        # Compute superposition diagnostics once per target (first top_p call only).
+        superposition_every_this_call = args.superposition_metric_every if idx == 0 else 0
 
         opt_result = optimize_inputs(
             model=model,
@@ -327,9 +385,9 @@ def _run_single_target_sweep(
             temperature=args.temperature,
             bptt_temperature=args.bptt_temperature,
             learnable_temperature=use_learnable_temperature,
-            decouple_learnable_temperature=args.decouple_learnable_temperature and use_learnable_temperature,
+            decouple_learnable_temperature=use_decouple_learnable_temperature,
             bptt_learnable_temperature=use_bptt_learnable_temperature,
-            bptt_decouple_learnable_temperature=args.bptt_decouple_learnable_temperature and use_bptt_learnable_temperature,
+            bptt_decouple_learnable_temperature=use_bptt_decouple_learnable_temperature,
             teacher_forcing=args.teacher_forcing,
             bptt_teacher_forcing_via_diff_model=args.bptt_teacher_forcing_via_diff_model,
             stgs_hard=args.stgs_hard,
@@ -356,6 +414,20 @@ def _run_single_target_sweep(
             embsim_use_input_logits=args.embsim_use_input_logits,
             embsim_teacher_forcing=args.embsim_teacher_forcing,
             embsim_temperature=args.embsim_temperature,
+            superposition_metric_every=superposition_every_this_call,
+            superposition_metric_modes=args.superposition_metric_modes,
+            superposition_vocab_top_k=args.superposition_vocab_top_k,
+            superposition_vocab_source=args.superposition_vocab_source,
+            superposition_vocab_dataset_path=(
+                args.superposition_vocab_dataset_path
+                if args.superposition_vocab_dataset_path
+                else args.dataset_path
+            ),
+            superposition_vocab_hf_name=args.superposition_vocab_hf_name,
+            superposition_vocab_hf_split=args.superposition_vocab_hf_split,
+            superposition_vocab_num_texts=args.superposition_vocab_num_texts,
+            superposition_entropy_temperature=args.superposition_entropy_temperature,
+            superposition_output_dir=str(output_dir / "superposition"),
             plot_every=10_000_000,
             kwargs=vars(args),
         )
@@ -639,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Threaded to optimize_inputs teacher_forcing.")
     p.add_argument("--bptt_teacher_forcing_via_diff_model", type=str2bool, default=False,
                    help="Threaded to optimize_inputs bptt_teacher_forcing_via_diff_model.")
-    p.add_argument("--stgs_hard", type=str2bool, default=True)
+    p.add_argument("--stgs_hard", type=str2bool, default=False)
     p.add_argument("--stgs_hard_method", type=str, default="categorical")
     p.add_argument("--stgs_hard_embsim_probs", type=str, default="gumbel_soft")
     p.add_argument("--bptt_stgs_hard", type=str2bool, default=False)
@@ -672,6 +744,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--embsim_use_input_logits", type=str2bool, default=True)
     p.add_argument("--embsim_teacher_forcing", type=str2bool, default=False)
     p.add_argument("--embsim_temperature", type=float, default=1.0)
+
+    p.add_argument("--superposition_metric_every", type=int, default=0,
+                   help="Run superposition z_i-z_j diagnostics every N epochs; in this sweep it is "
+                        "executed once per target (first top_p call only) when >0.")
+    p.add_argument("--superposition_metric_modes", type=str, default="dot,cos,l2",
+                   help="Comma-separated superposition modes: dot,cos,l2.")
+    p.add_argument("--superposition_vocab_top_k", type=int, default=256,
+                   help="Top-K token subset size used for superposition pair space (<=0 means all allowed).")
+    p.add_argument("--superposition_vocab_source", type=str, default="wikipedia",
+                   choices=["wikipedia", "dataset", "none"],
+                   help="Source used to rank tokens for superposition top-K subset.")
+    p.add_argument("--superposition_vocab_dataset_path", type=str, default=None,
+                   help="Optional dataset path used when superposition_vocab_source=dataset "
+                        "(defaults to --dataset_path in dataset mode).")
+    p.add_argument("--superposition_vocab_hf_name", type=str, default="lucadiliello/english_wikipedia",
+                   help="HF dataset name used when superposition_vocab_source=wikipedia.")
+    p.add_argument("--superposition_vocab_hf_split", type=str, default="train",
+                   help="HF split used when superposition_vocab_source=wikipedia.")
+    p.add_argument("--superposition_vocab_num_texts", type=int, default=1000,
+                   help="Number of texts sampled to estimate token frequencies for superposition top-K ranking.")
+    p.add_argument("--superposition_entropy_temperature", type=float, default=1.0,
+                   help="Temperature for entropy softmax(score/T) in superposition analysis.")
 
     p.add_argument("--wandb_project", type=str, default="prompt-optimization-top-p-sweep")
     p.add_argument("--wandb_entity", type=str, default=None)

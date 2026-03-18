@@ -5,11 +5,13 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --model_name="Qwen/Qwen3-0.6B" \
 --dataset_path="../../../data/qwen3-600m-base_diverse_targets_k1-5-25_x5_seed42_TL20_NF1" \
 --output_dir="results/qwen3-600m-base_STGS+Soft+LearnTau+SoftBPTT+LearnBTau+BS=16+LR=1e-1+SEED=2_test_k1-5-25-run" \
---learning_rate=1.0e-1  \
---epochs 512 \
+--learning_rate=1.0e-2  \
+--lookahead_k=4,20 \
+--lookahead_alpha=0.5 \
+--epochs 2048 \
 --model_precision full \
 --gradient_checkpointing=False \
---losses="crossentropy" \
+--losses="hinge-margin=0" \
 --loss_pos_weight_schedule="uniform" \
 --loss_pos_weight_step=2.0 \
 --loss_pos_weight_base=2.0 \
@@ -35,7 +37,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 \
 --seq_len=80 \
 \
---stgs_hard=False \
+--stgs_hard=True \
 --stgs_hard_method="embsim-l2" \
 --stgs_hard_embsim_probs="gumbel_soft" \
 --stgs_hard_embsim_strategy="topk_sample" \
@@ -44,7 +46,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --stgs_hard_embsim_sample_tau=1.0 \
 --stgs_hard_embsim_margin=0.0 \
 --stgs_hard_embsim_fallback="argmax" \
---logits_normalize="none" \
+--logits_normalize="zscore" \
 --logits_top_k=0 \
 --logits_top_p=1.0 \
 --logit_decay=0.0 \
@@ -54,6 +56,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --temperature=100.0 \
 \
 --logits_lora_rank=4 \
+--logits_lora_b_learning_rate=1.0e-2 \
 --stgs_input_dropout=0.0 \
 --stgs_output_dropout=0.0 \
 --gumbel_noise_scale=0.06125 \
@@ -108,7 +111,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --temperature_anneal_schedule="none" \
 --temperature_anneal_min=0.75 \
 --temperature_anneal_epochs=2000 \
---temperatureAnnealRegLambda=0.1 \
+--temperatureAnnealRegLambda=0.0 \
 --temperatureAnnealRegMode="mse" \
 \
 --eos_reg_lambda=0.0 \
@@ -117,6 +120,10 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 \
 --discrete_reinit_epoch=0 \
 --discrete_reinit_snap="embsim-l2" \
+--discrete_reinit_prob=1.0 \
+--discrete_reinit_topk=0 \
+--discrete_reinit_entropy_threshold=0.0 \
+--discrete_reinit_embsim_probs="gumbel_soft" \
 \
 --prompt_length_learnable=False \
 --prompt_length_alpha_init=0.0 \
@@ -134,7 +141,7 @@ python -m ipdb -c c ../../../batch_optimize_main.py  \
 --bertscore_model=distilbert-base-uncased \
 --sentencebert_model=all-MiniLM-L6-v2 \
 \
---superposition_metric_every=256 \
+--superposition_metric_every=0 \
 --superposition_metric_modes="cos,l2" \
 --superposition_vocab_top_k=512 \
 --superposition_vocab_source="dataset" \
