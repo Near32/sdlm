@@ -11,7 +11,7 @@ import logging
 import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import wandb
@@ -23,8 +23,14 @@ sys.path.insert(2, str(Path(__file__).parent.parent / "tinylora"))
 from batch_optimize_main import setup_model_and_tokenizer
 from sdlm import STGS
 from sdlm.stgs_diff_model import STGSDiffModel
-from pc_main import pc_optimize_inputs, evaluate_shared_prompt
+from sdlm.utils.tqdm_utils import tqdm
+from pc_main import (
+    ensure_pc_main_compatibility,
+    pc_optimize_inputs,
+    evaluate_shared_prompt,
+)
 from pc_weave_logging import init_weave
+from product_of_speaker import build_pc_product_of_speaker_transform
 
 from rewards import (
     extract_gsm8k_answer,
@@ -59,6 +65,49 @@ def subsample_split(split: List[Dict], size: int, seed: int) -> List[Dict]:
         return split
     rng = random.Random(seed)
     return rng.sample(split, size)
+
+
+def collect_explicit_arg_names(argv: List[str]) -> Set[str]:
+    explicit: Set[str] = set()
+    for token in argv:
+        if not token.startswith("--"):
+            continue
+        name = token[2:].split("=", 1)[0].replace("-", "_")
+        explicit.add(name)
+    return explicit
+
+
+def add_loss_component(losses: str, enabled: bool, component: str) -> str:
+    if enabled and component not in losses.split("+"):
+        return f"{losses}+{component}" if losses else component
+    return losses
+
+
+REASONING_GENERATE_ARG_MAP = {
+    "reasoning_generate_do_sample": "do_sample",
+    "reasoning_generate_temperature": "temperature",
+    "reasoning_generate_top_p": "top_p",
+    "reasoning_generate_top_k": "top_k",
+    "reasoning_generate_min_p": "min_p",
+    "reasoning_generate_typical_p": "typical_p",
+    "reasoning_generate_num_beams": "num_beams",
+    "reasoning_generate_num_return_sequences": "num_return_sequences",
+    "reasoning_generate_repetition_penalty": "repetition_penalty",
+    "reasoning_generate_length_penalty": "length_penalty",
+    "reasoning_generate_no_repeat_ngram_size": "no_repeat_ngram_size",
+    "reasoning_generate_early_stopping": "early_stopping",
+    "reasoning_generate_pad_token_id": "pad_token_id",
+    "reasoning_generate_eos_token_id": "eos_token_id",
+}
+
+
+def collect_reasoning_generate_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    for config_key, generate_key in REASONING_GENERATE_ARG_MAP.items():
+        value = config.get(config_key)
+        if value is not None:
+            kwargs[generate_key] = value
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +231,12 @@ def batch_pc_optimize(config: Dict) -> Dict:
     """
     Full pipeline: load dataset, build model, run pc_optimize_inputs, evaluate.
     """
+    pipeline_pbar = tqdm(
+        total=6,
+        desc="PC pipeline: model",
+        leave=True,
+    )
+
     # ---- model ----
     model, tokenizer = setup_model_and_tokenizer(
         config["model_name"],
@@ -198,15 +253,17 @@ def batch_pc_optimize(config: Dict) -> Dict:
         tokenizer=tokenizer,
         stgs_kwargs={
             "hard": config.get("diff_model_hard", True),
-            "temperature": config.get("diff_model_temperature", 1.0),
-            "learnable_temperature": False,
-            "hidden_state_conditioning": False,
+            "temperature": config.get("bptt_temperature", config.get("diff_model_temperature", 1.0)),
+            "learnable_temperature": config.get("bptt_learnable_temperature", False),
+            "hidden_state_conditioning": config.get("bptt_hidden_state_conditioning", False),
             "dropout": 0.0,
         },
         stgs_logits_generation=True,
     )
+    pipeline_pbar.update(1)
 
     # ---- dataset ----
+    pipeline_pbar.set_description("PC pipeline: dataset")
     if config.get("dataset_path"):
         dataset = load_pc_dataset(config["dataset_path"])
     else:
@@ -235,6 +292,13 @@ def batch_pc_optimize(config: Dict) -> Dict:
     test_pairs: List[Tuple[str, str]] = [
         (r["input"], r["answer"]) for r in test_records
     ]
+    pipeline_pbar.set_postfix(
+        train=len(train_triples),
+        val=len(val_pairs),
+        test=len(test_pairs),
+        refresh=False,
+    )
+    pipeline_pbar.update(1)
 
     # ---- extraction functions ----
     extraction_prompt = config.get("extraction_prompt", "Therefore, the final answer is $")
@@ -261,6 +325,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
     init_weave(
         project=config.get("weave_project") or config.get("wandb_project", "sdlm-pc-inversion"),
         entity=config.get("wandb_entity", None),
+        call_link_log_path=Path(config["output_dir"]) / "weave_call_links.log",
     )
 
     # ---- test eval callback (periodic during training) ----
@@ -270,6 +335,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
 
     embedding_layer = model.get_input_embeddings()
     embedding_weights = embedding_layer.weight.detach()
+    allowed_tokens = torch.arange(model.config.vocab_size, device=device)
     E_input_ids = tokenizer(
         extraction_prompt, add_special_tokens=False, return_tensors="pt"
     ).input_ids.to(device)
@@ -282,12 +348,38 @@ def batch_pc_optimize(config: Dict) -> Dict:
         stgs_hard=config.get("stgs_hard", True),
         stgs_hard_method=config.get("stgs_hard_method", "categorical"),
         init_temperature=config.get("temperature", 1.0),
+        stgs_hard_embsim_probs=config.get("stgs_hard_embsim_probs", "gumbel_soft"),
+        stgs_hard_embsim_strategy=config.get("stgs_hard_embsim_strategy", "nearest"),
+        stgs_hard_embsim_top_k=config.get("stgs_hard_embsim_top_k", 8),
+        stgs_hard_embsim_rerank_alpha=config.get("stgs_hard_embsim_rerank_alpha", 0.5),
+        stgs_hard_embsim_sample_tau=config.get("stgs_hard_embsim_sample_tau", 1.0),
+        stgs_hard_embsim_margin=config.get("stgs_hard_embsim_margin", 0.0),
+        stgs_hard_embsim_fallback=config.get("stgs_hard_embsim_fallback", "argmax"),
         logits_normalize=config.get("logits_normalize", "none"),
         eps=config.get("eps", 1e-10),
         device=device,
     )
 
     _accumulate_embeds = config.get("efficient_generate", False)
+    prompt_logits_transform = None
+    if config.get("assemble_strategy", "identity") == "product_of_speaker":
+        prompt_logits_transform = build_pc_product_of_speaker_transform(
+            model=model,
+            tokenizer=tokenizer,
+            allowed_tokens=allowed_tokens,
+            seq_len=config.get("seq_len", 20),
+            base_model_name=config.get("model_name"),
+            pos_lm_name=config.get("pos_lm_name"),
+            pos_prompt=config.get("pos_prompt"),
+            pos_prompt_template=config.get("pos_prompt_template"),
+            pos_pair_template=config.get("pos_pair_template"),
+            pos_pair_separator=config.get("pos_pair_separator", "\n\n"),
+            pos_use_chat_template=config.get("pos_use_chat_template", False),
+            pos_lm_temperature=config.get("pos_lm_temperature", 1.0),
+            pos_lm_top_p=config.get("pos_lm_top_p", 1.0),
+            pos_lm_top_k=config.get("pos_lm_top_k", 0),
+            logits_filter_penalty=config.get("logits_filter_penalty", 1e4),
+        )
 
     def _test_eval_callback(epoch: int, fl: torch.Tensor) -> Dict:
         if test_eval_every <= 0 or (epoch % test_eval_every != 0):
@@ -306,10 +398,14 @@ def batch_pc_optimize(config: Dict) -> Dict:
             extraction_fns=extraction_fns,
             max_new_tokens_reasoning=config.get("max_new_tokens_reasoning", 200),
             max_new_tokens_answer=config.get("max_new_tokens_answer", 20),
-            eval_mode=config.get("val_eval_mode", "discrete"),
+            eval_mode=config.get("test_prompt_eval_mode", "discrete"),
+            reasoning_generation_backend=config.get("reasoning_generation_backend", "diff"),
+            reasoning_generate_kwargs=config.get("reasoning_generate_kwargs", {}),
             use_chat_template=config.get("use_chat_template", False),
             epoch=epoch,
+            eval_split="test",
             accumulate_embeds=_accumulate_embeds,
+            prompt_logits_transform=prompt_logits_transform,
         )
         p_tokens = fl.argmax(dim=-1).squeeze(0).tolist()
         p_text = tokenizer.decode(p_tokens, skip_special_tokens=False)
@@ -337,6 +433,8 @@ def batch_pc_optimize(config: Dict) -> Dict:
         "commitment_pos_weight_step": config.get("commitment_pos_weight_step", 10.0),
         "commitment_pos_weight_base": config.get("commitment_pos_weight_base", 2.0),
     }
+    pipeline_pbar.set_description("PC pipeline: setup")
+    pipeline_pbar.update(1)
 
     # ---- set opt seed ----
     opt_seed = config.get("opt_seed", 0)
@@ -344,6 +442,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
     random.seed(opt_seed)
 
     # ---- run optimization ----
+    pipeline_pbar.set_description("PC pipeline: optimize")
     result = pc_optimize_inputs(
         model=model,
         diff_model=diff_model,
@@ -358,18 +457,46 @@ def batch_pc_optimize(config: Dict) -> Dict:
         max_new_tokens_answer=config.get("max_new_tokens_answer", 20),
         teacher_forcing_r=config.get("teacher_forcing_r", True),
         bptt=config.get("bptt", False),
+        reasoning_generation_backend=config.get("reasoning_generation_backend", "diff"),
+        reasoning_generate_kwargs=config.get("reasoning_generate_kwargs", {}),
         losses=config.get("losses", "crossentropy"),
         seq_len=config.get("seq_len", 20),
         epochs=config.get("epochs", 2000),
         learning_rate=config.get("learning_rate", 0.01),
+        logits_lora_b_learning_rate=config.get("logits_lora_b_learning_rate"),
         inner_batch_size=config.get("inner_batch_size", 4),
+        batch_size=config.get("batch_size"),
         temperature=config.get("temperature", 1.0),
+        learnable_temperature=config.get("learnable_temperature", False),
+        decouple_learnable_temperature=config.get("decouple_learnable_temperature", False),
         stgs_hard=config.get("stgs_hard", True),
         stgs_hard_method=config.get("stgs_hard_method", "categorical"),
+        stgs_hard_embsim_probs=config.get("stgs_hard_embsim_probs", "gumbel_soft"),
+        stgs_hard_embsim_strategy=config.get("stgs_hard_embsim_strategy", "nearest"),
+        stgs_hard_embsim_top_k=config.get("stgs_hard_embsim_top_k", 8),
+        stgs_hard_embsim_rerank_alpha=config.get("stgs_hard_embsim_rerank_alpha", 0.5),
+        stgs_hard_embsim_sample_tau=config.get("stgs_hard_embsim_sample_tau", 1.0),
+        stgs_hard_embsim_margin=config.get("stgs_hard_embsim_margin", 0.0),
+        stgs_hard_embsim_fallback=config.get("stgs_hard_embsim_fallback", "argmax"),
+        bptt_temperature=config.get("bptt_temperature", config.get("diff_model_temperature", 1.0)),
+        bptt_learnable_temperature=config.get("bptt_learnable_temperature", False),
+        bptt_decouple_learnable_temperature=config.get("bptt_decouple_learnable_temperature", False),
+        bptt_stgs_hard=config.get("bptt_stgs_hard", True),
+        bptt_stgs_hard_method=config.get("bptt_stgs_hard_method", "categorical"),
+        bptt_stgs_hard_embsim_probs=config.get("bptt_stgs_hard_embsim_probs", "gumbel_soft"),
+        bptt_stgs_hard_embsim_strategy=config.get("bptt_stgs_hard_embsim_strategy", "nearest"),
+        bptt_stgs_hard_embsim_top_k=config.get("bptt_stgs_hard_embsim_top_k", 8),
+        bptt_stgs_hard_embsim_rerank_alpha=config.get("bptt_stgs_hard_embsim_rerank_alpha", 0.5),
+        bptt_stgs_hard_embsim_sample_tau=config.get("bptt_stgs_hard_embsim_sample_tau", 1.0),
+        bptt_stgs_hard_embsim_margin=config.get("bptt_stgs_hard_embsim_margin", 0.0),
+        bptt_stgs_hard_embsim_fallback=config.get("bptt_stgs_hard_embsim_fallback", "argmax"),
+        bptt_hidden_state_conditioning=config.get("bptt_hidden_state_conditioning", False),
         logits_normalize=config.get("logits_normalize", "none"),
+        bptt_logits_normalize=config.get("bptt_logits_normalize", "none"),
         stgs_input_dropout=config.get("stgs_input_dropout", 0.0),
         stgs_output_dropout=config.get("stgs_output_dropout", 0.0),
         eps=config.get("eps", 1e-10),
+        bptt_eps=config.get("bptt_eps", 1e-10),
         gumbel_noise_scale=config.get("gumbel_noise_scale", 1.0),
         adaptive_gumbel_noise=config.get("adaptive_gumbel_noise", False),
         adaptive_gumbel_noise_beta=config.get("adaptive_gumbel_noise_beta", 0.9),
@@ -379,27 +506,66 @@ def batch_pc_optimize(config: Dict) -> Dict:
         logits_filter_penalty=config.get("logits_filter_penalty", 1e4),
         init_strategy=config.get("init_strategy", "randn"),
         init_std=config.get("init_std", 0.0),
+        init_mlm_model=config.get("init_mlm_model", "distilbert-base-uncased"),
+        init_mlm_top_k=config.get("init_mlm_top_k", 50),
         logits_lora_rank=config.get("logits_lora_rank", 0),
         max_gradient_norm=config.get("max_gradient_norm", 0.0),
         temperature_anneal_schedule=config.get("temperature_anneal_schedule", "none"),
         temperature_anneal_min=config.get("temperature_anneal_min", 0.1),
         temperature_anneal_epochs=config.get("temperature_anneal_epochs", 0),
+        temperature_anneal_reg_lambda=config.get(
+            "temperature_anneal_reg_lambda",
+            config.get("temperatureAnnealRegLambda", 0.0),
+        ),
+        temperature_anneal_reg_mode=config.get(
+            "temperature_anneal_reg_mode",
+            config.get("temperatureAnnealRegMode", "mse"),
+        ),
+        temperature_loss_coupling_lambda=config.get(
+            "temperature_loss_coupling_lambda",
+            config.get("temperatureLossCouplingLambda", 0.0),
+        ),
         discrete_reinit_epoch=config.get("discrete_reinit_epoch", 0),
         discrete_reinit_snap=config.get("discrete_reinit_snap", "argmax"),
+        discrete_reinit_prob=config.get("discrete_reinit_prob", 1.0),
+        discrete_reinit_topk=config.get("discrete_reinit_topk", 0),
+        discrete_reinit_entropy_threshold=config.get("discrete_reinit_entropy_threshold", 0.0),
+        discrete_reinit_embsim_probs=config.get("discrete_reinit_embsim_probs", "input_logits"),
         logit_decay=config.get("logit_decay", 0.0),
+        prompt_length_learnable=config.get("prompt_length_learnable", False),
+        prompt_length_alpha_init=config.get("prompt_length_alpha_init", 0.0),
+        prompt_length_beta=config.get("prompt_length_beta", 5.0),
+        prompt_length_reg_lambda=config.get("prompt_length_reg_lambda", 0.0),
+        prompt_length_eos_spike=config.get("prompt_length_eos_spike", 10.0),
+        prompt_length_mask_eos_attention=config.get("prompt_length_mask_eos_attention", False),
+        ppo_kl_lambda=config.get("ppo_kl_lambda", 0.0),
+        ppo_kl_mode=config.get("ppo_kl_mode", "soft"),
+        ppo_kl_epsilon=config.get("ppo_kl_epsilon", 0.0),
+        ppo_ref_update_period=config.get("ppo_ref_update_period", 10),
+        fixed_gt_prefix_n=config.get("fixed_gt_prefix_n", 0),
+        fixed_gt_suffix_n=config.get("fixed_gt_suffix_n", 0),
+        fixed_gt_prefix_rank2_n=config.get("fixed_gt_prefix_rank2_n", 0),
+        fixed_gt_suffix_rank2_n=config.get("fixed_gt_suffix_rank2_n", 0),
+        fixed_prefix_text=config.get("fixed_prefix_text"),
+        fixed_suffix_text=config.get("fixed_suffix_text"),
+        early_stop_loss_threshold=config.get("early_stop_loss_threshold", 0.0),
         val_eval_every=config.get("val_eval_every", 100),
-        val_eval_mode=config.get("val_eval_mode", "discrete"),
+        val_prompt_eval_mode=config.get("val_prompt_eval_mode", "discrete"),
         per_epoch_callback=_test_eval_callback if test_eval_every > 0 else None,
         use_chat_template=config.get("use_chat_template", False),
         accumulate_embeds=config.get("efficient_generate", False),
+        prompt_logits_transform=prompt_logits_transform,
         kwargs=lc_kwargs,
     )
+    pipeline_pbar.update(1)
 
     # ---- final test evaluation ----
     final_fl = result["final_p_logits"]
+    test_prompt_eval_mode = config.get("test_prompt_eval_mode", "discrete")
 
-    logger.info("Running final discrete test evaluation...")
-    test_metrics_discrete = evaluate_shared_prompt(
+    pipeline_pbar.set_description(f"PC pipeline: test eval ({test_prompt_eval_mode})")
+    logger.info("Running final test evaluation with prompt eval mode=%s...", test_prompt_eval_mode)
+    test_metrics = evaluate_shared_prompt(
         free_logits=final_fl,
         eval_pairs=test_pairs_eval,
         model=model,
@@ -413,37 +579,22 @@ def batch_pc_optimize(config: Dict) -> Dict:
         extraction_fns=extraction_fns,
         max_new_tokens_reasoning=config.get("max_new_tokens_reasoning", 200),
         max_new_tokens_answer=config.get("max_new_tokens_answer", 20),
-        eval_mode="discrete",
+        eval_mode=test_prompt_eval_mode,
+        reasoning_generation_backend=config.get("reasoning_generation_backend", "diff"),
+        reasoning_generate_kwargs=config.get("reasoning_generate_kwargs", {}),
         use_chat_template=config.get("use_chat_template", False),
+        eval_split="test",
         accumulate_embeds=_accumulate_embeds,
+        prompt_logits_transform=prompt_logits_transform,
     )
-
-    test_metrics_soft = {}
-    if config.get("val_eval_mode", "discrete") == "soft" or config.get("run_soft_test_eval", False):
-        logger.info("Running final soft test evaluation...")
-        test_metrics_soft = evaluate_shared_prompt(
-            free_logits=final_fl,
-            eval_pairs=test_pairs_eval,
-            model=model,
-            diff_model=diff_model,
-            stgs_module=stgs_for_eval,
-            embedding_weights=embedding_weights,
-            tokenizer=tokenizer,
-            device=device,
-            E_input_ids=E_input_ids,
-            E_embeds=E_embeds,
-            extraction_fns=extraction_fns,
-            max_new_tokens_reasoning=config.get("max_new_tokens_reasoning", 200),
-            max_new_tokens_answer=config.get("max_new_tokens_answer", 20),
-            eval_mode="soft",
-            use_chat_template=config.get("use_chat_template", False),
-            accumulate_embeds=_accumulate_embeds,
-        )
+    pipeline_pbar.update(1)
 
     # Summarize to W&B
+    pipeline_pbar.set_description("PC pipeline: save")
     final_p_text = result["final_p_text"]
     final_p_tokens = result["final_p_tokens"]
     val_acc_history = result["val_accuracy_history"]
+    train_acc_history = result.get("train_accuracy_history", [])
     best_val_any = 0.0
     best_val_epoch = 0
     for entry in val_acc_history:
@@ -451,18 +602,21 @@ def batch_pc_optimize(config: Dict) -> Dict:
             best_val_any = entry["any_correct"]
             best_val_epoch = entry.get("epoch", 0)
 
-    final_test_any = test_metrics_discrete.get("any_correct", 0.0)
+    final_test_any = test_metrics.get("any_correct", 0.0)
     learnable_logits = result.get("learnable_logits", final_fl)
+    learnable_temperatures = result.get("learnable_temperatures", {})
     output_dir = Path(config.get("output_dir", "pc_optimization_results"))
     output_dir.mkdir(parents=True, exist_ok=True)
     learnable_logits_path = output_dir / f"{run_name}_learnable_logits.pt"
+    learnable_temperatures_path = output_dir / f"{run_name}_learnable_temperatures.pt"
     torch.save(learnable_logits, learnable_logits_path)
+    torch.save(learnable_temperatures, learnable_temperatures_path)
 
     wandb.log({
         "test/p_text": final_p_text,
         "test/p_token_ids": final_p_tokens,
-        **{f"test/discrete/{k}": v for k, v in test_metrics_discrete.items()},
-        **{f"test/soft/{k}": v for k, v in test_metrics_soft.items()},
+        "test/prompt_eval_mode": test_prompt_eval_mode,
+        **{f"test/{k}": v for k, v in test_metrics.items()},
     })
     artifact = wandb.Artifact(
         name=f"learnable-logits-{run_name}",
@@ -471,6 +625,14 @@ def batch_pc_optimize(config: Dict) -> Dict:
     )
     artifact.add_file(str(learnable_logits_path))
     wandb.run.log_artifact(artifact)
+    if learnable_temperatures:
+        temps_artifact = wandb.Artifact(
+            name=f"learnable-temperatures-{run_name}",
+            type="tensor",
+            description="Final learnable temperatures at the end of PC optimization",
+        )
+        temps_artifact.add_file(str(learnable_temperatures_path))
+        wandb.run.log_artifact(temps_artifact)
     wandb.run.summary.update({
         "final_val_accuracy": val_acc_history[-1].get("any_correct", 0.0) if val_acc_history else 0.0,
         "final_test_accuracy": final_test_any,
@@ -489,14 +651,18 @@ def batch_pc_optimize(config: Dict) -> Dict:
         "final_p_text": final_p_text,
         "final_p_token_ids": final_p_tokens,
         "loss_history": result["loss_history"],
+        "train_accuracy_history": train_acc_history,
         "val_accuracy_history": val_acc_history,
-        "test_accuracy_discrete": test_metrics_discrete,
-        "test_accuracy_soft": test_metrics_soft,
+        "test_prompt_eval_mode": test_prompt_eval_mode,
+        "test_accuracy": test_metrics,
         "learnable_logits_path": str(learnable_logits_path),
+        "learnable_temperatures_path": str(learnable_temperatures_path),
     }
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     logger.info(f"Results saved to {out_path}")
+    pipeline_pbar.update(1)
+    pipeline_pbar.close()
 
     return summary
 
@@ -526,6 +692,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_seed", type=int, default=43)
     p.add_argument("--test_seed", type=int, default=44)
     p.add_argument("--opt_seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=None,
+                   help="Alias for --opt_seed for single-target main.py compatibility.")
 
     # Extraction / evaluation
     p.add_argument("--extraction_prompt", type=str,
@@ -534,7 +702,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_new_tokens_answer", type=int, default=20)
     p.add_argument("--few_shot_n", type=int, default=0)
     p.add_argument("--few_shot_seed", type=int, default=0)
-    p.add_argument("--val_eval_mode", type=str, default="discrete",
+    p.add_argument("--val_prompt_eval_mode", type=str, default="discrete",
+                   choices=["discrete", "soft"])
+    p.add_argument("--test_prompt_eval_mode", type=str, default="discrete",
                    choices=["discrete", "soft"])
 
     # Optimization
@@ -542,40 +712,152 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seq_len", type=int, default=20)
     p.add_argument("--epochs", type=int, default=2000)
     p.add_argument("--learning_rate", type=float, default=0.01)
+    p.add_argument(
+        "--logits_lora_b_learning_rate",
+        type=float,
+        default=None,
+        help="Optional learning rate override for LoRA prompt-logit matrix B. "
+             "Ignored when logits_lora_rank <= 0.",
+    )
     p.add_argument("--inner_batch_size", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=None,
+                   help="Alias for the shared-prompt inner batch size.")
     p.add_argument("--teacher_forcing_r", type=str2bool, default=True)
     p.add_argument("--bptt", type=str2bool, default=False)
+    p.add_argument(
+        "--reasoning_generation_backend",
+        type=str,
+        default="diff",
+        choices=["diff", "hf_generate"],
+        help="Reasoning generation backend when --teacher_forcing_r=False. "
+             "'diff' uses the existing wrapper rollout; 'hf_generate' delegates to model.generate(...).",
+    )
+    p.add_argument("--reasoning_generate_do_sample", type=str2bool, default=None)
+    p.add_argument("--reasoning_generate_temperature", type=float, default=None)
+    p.add_argument("--reasoning_generate_top_p", type=float, default=None)
+    p.add_argument("--reasoning_generate_top_k", type=int, default=None)
+    p.add_argument("--reasoning_generate_min_p", type=float, default=None)
+    p.add_argument("--reasoning_generate_typical_p", type=float, default=None)
+    p.add_argument("--reasoning_generate_num_beams", type=int, default=None)
+    p.add_argument("--reasoning_generate_num_return_sequences", type=int, default=None)
+    p.add_argument("--reasoning_generate_repetition_penalty", type=float, default=None)
+    p.add_argument("--reasoning_generate_length_penalty", type=float, default=None)
+    p.add_argument("--reasoning_generate_no_repeat_ngram_size", type=int, default=None)
+    p.add_argument("--reasoning_generate_early_stopping", type=str2bool, default=None)
+    p.add_argument("--reasoning_generate_pad_token_id", type=int, default=None)
+    p.add_argument("--reasoning_generate_eos_token_id", type=int, default=None)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--learnable_temperature", type=str2bool, default=False)
+    p.add_argument("--decouple_learnable_temperature", type=str2bool, default=False)
     p.add_argument("--stgs_hard", type=str2bool, default=True)
-    p.add_argument("--stgs_hard_method", type=str, default="categorical")
+    p.add_argument("--stgs_hard_method", type=str, default="categorical",
+                   choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"])
+    p.add_argument("--stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                   choices=["gumbel_soft", "input_logits"])
+    p.add_argument("--stgs_hard_embsim_strategy", type=str, default="nearest",
+                   choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"])
+    p.add_argument("--stgs_hard_embsim_top_k", type=int, default=8)
+    p.add_argument("--stgs_hard_embsim_rerank_alpha", type=float, default=0.5)
+    p.add_argument("--stgs_hard_embsim_sample_tau", type=float, default=1.0)
+    p.add_argument("--stgs_hard_embsim_margin", type=float, default=0.0)
+    p.add_argument("--stgs_hard_embsim_fallback", type=str, default="argmax",
+                   choices=["argmax", "categorical"])
     p.add_argument("--logits_normalize", type=str, default="none",
+                   choices=["none", "center", "zscore"])
+    p.add_argument("--bptt_logits_normalize", type=str, default="none",
                    choices=["none", "center", "zscore"])
     p.add_argument("--stgs_input_dropout", type=float, default=0.0)
     p.add_argument("--stgs_output_dropout", type=float, default=0.0)
     p.add_argument("--eps", type=float, default=1e-10)
+    p.add_argument("--bptt_eps", type=float, default=1e-10)
     p.add_argument("--logits_top_k", type=int, default=0)
     p.add_argument("--logits_top_p", type=float, default=1.0)
     p.add_argument("--logits_filter_penalty", type=float, default=1e4)
+    p.add_argument("--assemble_strategy", type=str, default="identity",
+                   choices=["identity", "product_of_speaker"])
+    p.add_argument("--pos_lm_name", type=str, default=None,
+                   help="Auxiliary LM used for product-of-speaker prompt assembly.")
+    p.add_argument("--pos_prompt", type=str, default=None,
+                   help="Literal PoS prompt text. Ignored when --pos_prompt_template is set.")
+    p.add_argument("--pos_prompt_template", type=str, default=None,
+                   help="PoS prompt template. PC mode supports the outer placeholder {pairs}.")
+    p.add_argument("--pos_pair_template", type=str, default=None,
+                   help="Per-pair PoS template. Supports {partial_conditioning_text} and {target}.")
+    p.add_argument("--pos_pair_separator", type=str, default="\n\n",
+                   help="Separator used when joining rendered PoS pairs for {pairs}.")
+    p.add_argument("--pos_use_chat_template", type=str2bool, default=False,
+                   help="Apply the auxiliary tokenizer chat template to the rendered PoS prompt.")
+    p.add_argument("--pos_lm_temperature", type=float, default=1.0)
+    p.add_argument("--pos_lm_top_p", type=float, default=1.0)
+    p.add_argument("--pos_lm_top_k", type=int, default=0)
     p.add_argument("--init_strategy", type=str, default="randn")
     p.add_argument("--init_std", type=float, default=0.0)
+    p.add_argument("--init_mlm_model", type=str, default="distilbert-base-uncased")
+    p.add_argument("--init_mlm_top_k", type=int, default=50)
     p.add_argument("--logits_lora_rank", type=int, default=0)
     p.add_argument("--max_gradient_norm", type=float, default=0.0)
     p.add_argument("--temperature_anneal_schedule", type=str, default="none",
                    choices=["none", "linear", "cosine"])
     p.add_argument("--temperature_anneal_min", type=float, default=0.1)
     p.add_argument("--temperature_anneal_epochs", type=int, default=0)
+    p.add_argument("--temperature_anneal_reg_lambda", "--temperatureAnnealRegLambda",
+                   dest="temperature_anneal_reg_lambda", type=float, default=0.0)
+    p.add_argument("--temperature_anneal_reg_mode", "--temperatureAnnealRegMode",
+                   dest="temperature_anneal_reg_mode", type=str, default="mse",
+                   choices=["mse", "one_sided"])
+    p.add_argument("--temperature_loss_coupling_lambda", "--temperatureLossCouplingLambda",
+                   dest="temperature_loss_coupling_lambda", type=float, default=0.0)
     p.add_argument("--discrete_reinit_epoch", type=int, default=0)
     p.add_argument("--discrete_reinit_snap", type=str, default="argmax")
+    p.add_argument("--discrete_reinit_prob", type=float, default=1.0)
+    p.add_argument("--discrete_reinit_topk", type=int, default=0)
+    p.add_argument("--discrete_reinit_entropy_threshold", type=float, default=0.0)
+    p.add_argument("--discrete_reinit_embsim_probs", type=str, default="input_logits",
+                   choices=["input_logits", "gumbel_soft"])
     p.add_argument("--gumbel_noise_scale", type=float, default=1.0)
     p.add_argument("--adaptive_gumbel_noise", type=str2bool, default=False)
     p.add_argument("--adaptive_gumbel_noise_beta", type=float, default=0.9)
     p.add_argument("--adaptive_gumbel_noise_min_scale", type=float, default=0.0)
     p.add_argument("--logit_decay", type=float, default=0.0)
+    p.add_argument("--prompt_length_learnable", type=str2bool, default=False)
+    p.add_argument("--prompt_length_alpha_init", type=float, default=0.0)
+    p.add_argument("--prompt_length_beta", type=float, default=5.0)
+    p.add_argument("--prompt_length_reg_lambda", type=float, default=0.0)
+    p.add_argument("--prompt_length_eos_spike", type=float, default=10.0)
+    p.add_argument("--prompt_length_mask_eos_attention", type=str2bool, default=False)
+    p.add_argument("--ppo_kl_lambda", type=float, default=0.0)
+    p.add_argument("--ppo_kl_mode", type=str, default="soft", choices=["soft", "hinge"])
+    p.add_argument("--ppo_kl_epsilon", type=float, default=0.0)
+    p.add_argument("--ppo_ref_update_period", type=int, default=10)
+    p.add_argument("--fixed_gt_prefix_n", type=int, default=0)
+    p.add_argument("--fixed_gt_suffix_n", type=int, default=0)
+    p.add_argument("--fixed_gt_prefix_rank2_n", type=int, default=0)
+    p.add_argument("--fixed_gt_suffix_rank2_n", type=int, default=0)
+    p.add_argument("--fixed_prefix_text", type=str, default=None)
+    p.add_argument("--fixed_suffix_text", type=str, default=None)
+    p.add_argument("--early_stop_loss_threshold", type=float, default=0.0)
 
     # STGSDiffModel config (for R/Y generation)
     p.add_argument("--diff_model_temperature", type=float, default=1.0)
     p.add_argument("--diff_model_hard", type=str2bool, default=True)
     p.add_argument("--diff_model_use_soft_embeds", type=str2bool, default=True)
+    p.add_argument("--bptt_temperature", type=float, default=1.0)
+    p.add_argument("--bptt_learnable_temperature", type=str2bool, default=False)
+    p.add_argument("--bptt_decouple_learnable_temperature", type=str2bool, default=False)
+    p.add_argument("--bptt_stgs_hard", type=str2bool, default=True)
+    p.add_argument("--bptt_stgs_hard_method", type=str, default="categorical",
+                   choices=["categorical", "embsim-dot", "embsim-cos", "embsim-l2", "argmax"])
+    p.add_argument("--bptt_stgs_hard_embsim_probs", type=str, default="gumbel_soft",
+                   choices=["gumbel_soft", "input_logits"])
+    p.add_argument("--bptt_stgs_hard_embsim_strategy", type=str, default="nearest",
+                   choices=["nearest", "topk_rerank", "topk_sample", "margin_fallback", "lm_topk_restrict"])
+    p.add_argument("--bptt_stgs_hard_embsim_top_k", type=int, default=8)
+    p.add_argument("--bptt_stgs_hard_embsim_rerank_alpha", type=float, default=0.5)
+    p.add_argument("--bptt_stgs_hard_embsim_sample_tau", type=float, default=1.0)
+    p.add_argument("--bptt_stgs_hard_embsim_margin", type=float, default=0.0)
+    p.add_argument("--bptt_stgs_hard_embsim_fallback", type=str, default="argmax",
+                   choices=["argmax", "categorical"])
+    p.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
 
     # Validation / test eval
     p.add_argument("--val_eval_every", type=int, default=100)
@@ -599,6 +881,70 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--commitment_pos_weight_schedule", type=str, default="uniform")
     p.add_argument("--commitment_pos_weight_step", type=float, default=10.0)
     p.add_argument("--commitment_pos_weight_base", type=float, default=2.0)
+
+    # Parsed for main.py compatibility; rejected later when explicitly enabled.
+    p.add_argument("--gradient_estimator", type=str, default="stgs", choices=["stgs", "reinforce"])
+    p.add_argument("--reinforce_reward_scale", type=float, default=1.0)
+    p.add_argument("--reinforce_use_baseline", type=str2bool, default=True)
+    p.add_argument("--reinforce_baseline_beta", type=float, default=0.9)
+    p.add_argument("--teacher_forcing", type=str2bool, default=False)
+    p.add_argument("--bptt_teacher_forcing_via_diff_model", type=str2bool, default=False)
+    p.add_argument("--plot_every", type=int, default=100000)
+    p.add_argument("--stgs_grad_variance_samples", type=int, default=0)
+    p.add_argument("--stgs_grad_variance_period", type=int, default=1)
+    p.add_argument("--stgs_grad_bias_samples", type=int, default=0)
+    p.add_argument("--stgs_grad_bias_period", type=int, default=1)
+    p.add_argument("--stgs_grad_bias_reference_samples", type=int, default=0)
+    p.add_argument("--stgs_grad_bias_reference_batch_size", type=int, default=0)
+    p.add_argument("--stgs_grad_bias_reference_use_baseline", type=str2bool, default=True)
+    p.add_argument("--stgs_grad_bias_reference_reward_scale", type=float, default=1.0)
+    p.add_argument("--stgs_grad_bias_reference_baseline_beta", type=float, default=0.9)
+    p.add_argument("--reinforce_grad_variance_samples", type=int, default=0)
+    p.add_argument("--reinforce_grad_variance_period", type=int, default=1)
+    p.add_argument("--filter_vocab", type=str2bool, default=False)
+    p.add_argument("--vocab_threshold", type=float, default=-1.0)
+    p.add_argument("--method", type=str, default="stgs",
+                   choices=["stgs", "reinforce", "soda", "gcg", "o2p"])
+    p.add_argument("--baseline_backend", type=str, default="hf", choices=["hf", "tl"])
+    p.add_argument("--baseline_model_name", type=str, default=None)
+    p.add_argument("--soda_decay_rate", type=float, default=0.9)
+    p.add_argument("--soda_beta1", type=float, default=0.9)
+    p.add_argument("--soda_beta2", type=float, default=0.995)
+    p.add_argument("--soda_reset_epoch", type=int, default=50)
+    p.add_argument("--soda_reinit_epoch", type=int, default=1500)
+    p.add_argument("--soda_reg_weight", type=float, default=None)
+    p.add_argument("--soda_bias_correction", type=str2bool, default=False)
+    p.add_argument("--soda_init_strategy", type=str, default="zeros")
+    p.add_argument("--soda_init_std", type=float, default=0.05)
+    p.add_argument("--gcg_num_candidates", type=int, default=704)
+    p.add_argument("--gcg_top_k", type=int, default=128)
+    p.add_argument("--gcg_num_mutations", type=int, default=1)
+    p.add_argument("--gcg_pos_choice", type=str, default="uniform")
+    p.add_argument("--gcg_token_choice", type=str, default="uniform")
+    p.add_argument("--gcg_init_strategy", type=str, default="zeros")
+    p.add_argument("--gcg_candidate_batch_size", type=int, default=8)
+    p.add_argument("--o2p_model_path", type=str, default=None)
+    p.add_argument("--o2p_num_beams", type=int, default=4)
+    p.add_argument("--o2p_max_length", type=int, default=32)
+    p.add_argument("--early_stop_on_exact_match", type=str2bool, default=False)
+    p.add_argument("--early_stop_embsim_lcs_ratio_threshold", type=float, default=1.0)
+    p.add_argument("--run_discrete_validation", type=str2bool, default=False)
+    p.add_argument("--run_discrete_embsim_validation", type=str2bool, default=False)
+    p.add_argument("--embsim_similarity", type=str, default="cossim",
+                   choices=["cossim", "dotproduct", "l2"])
+    p.add_argument("--embsim_use_input_logits", type=str2bool, default=True)
+    p.add_argument("--embsim_teacher_forcing", type=str2bool, default=False)
+    p.add_argument("--embsim_temperature", type=float, default=1.0)
+    p.add_argument("--superposition_metric_every", type=int, default=0)
+    p.add_argument("--superposition_metric_modes", type=str, default="dot,cos,l2")
+    p.add_argument("--superposition_vocab_top_k", type=int, default=256)
+    p.add_argument("--superposition_vocab_source", type=str, default="wikipedia")
+    p.add_argument("--superposition_vocab_dataset_path", type=str, default=None)
+    p.add_argument("--superposition_vocab_hf_name", type=str, default="lucadiliello/english_wikipedia")
+    p.add_argument("--superposition_vocab_hf_split", type=str, default="train")
+    p.add_argument("--superposition_vocab_num_texts", type=int, default=1000)
+    p.add_argument("--superposition_entropy_temperature", type=float, default=1.0)
+    p.add_argument("--superposition_output_dir", type=str, default=".")
 
     # Input formatting
     p.add_argument("--use_chat_template", type=str2bool, default=False,
@@ -633,15 +979,55 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     config = vars(args)
+    config["reasoning_generate_kwargs"] = collect_reasoning_generate_kwargs(config)
+    explicit_args = collect_explicit_arg_names(sys.argv[1:])
+
+    if config.get("seed") is not None and "opt_seed" not in explicit_args:
+        config["opt_seed"] = config["seed"]
+
+    config["losses"] = add_loss_component(
+        config.get("losses", ""),
+        config.get("promptLambda", 0.0) > 0.0,
+        "promptPerplexity",
+    )
+    config["losses"] = add_loss_component(
+        config["losses"],
+        config.get("complLambda", 0.0) > 0.0,
+        "completionPerplexity",
+    )
+    config["losses"] = add_loss_component(
+        config["losses"],
+        config.get("promptTfComplLambda", 0.0) > 0.0,
+        "promptTfComplPerplexity",
+    )
+    config["losses"] = add_loss_component(
+        config["losses"],
+        config.get("promptDistEntropyLambda", 0.0) > 0.0,
+        "promptDistEntropy",
+    )
+    config["losses"] = add_loss_component(
+        config["losses"],
+        config.get("commitmentLambda", 0.0) > 0.0,
+        "commitmentLoss",
+    )
+    config["losses"] = add_loss_component(
+        config["losses"],
+        config.get("eos_reg_lambda", 0.0) > 0.0,
+        "eosPositionReg",
+    )
 
     # Resolve dataset source
     if config["dataset_path"] is None and config["hf_dataset"] is None:
         # Default to HF GSM8K
         config["hf_dataset"] = "openai/gsm8k"
+    elif config.get("hf_dataset") not in (None, "openai/gsm8k"):
+        raise ValueError("PC batch optimization currently only supports --hf_dataset openai/gsm8k.")
 
     # test_eval_size defaults to test_size
     if config.get("test_eval_size", 0) <= 0:
         config["test_eval_size"] = config.get("test_size", 100)
+
+    ensure_pc_main_compatibility(config, explicit_args=explicit_args)
 
     logger.info(f"Config: {config}")
     batch_pc_optimize(config)
