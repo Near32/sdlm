@@ -288,6 +288,13 @@ def parse_args():
         help="Adam learning rate (default: 0.1)",
     )
     parser.add_argument(
+        "--logits_lora_b_learning_rate",
+        type=float,
+        default=None,
+        help="Optional learning rate override for LoRA prompt-logit matrix B. "
+             "Ignored when logits_lora_rank <= 0.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=100.0,
@@ -687,6 +694,11 @@ def parse_args():
     parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
                         choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
                         help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_entropy_threshold", type=float, default=0.0,
+                        help="Per-position entropy threshold for discrete reinit. 0 disables it.")
+    parser.add_argument("--discrete_reinit_embsim_probs", type=str, default="input_logits",
+                        choices=["input_logits", "gumbel_soft"],
+                        help="Distribution source used for embsim-based discrete reinit and entropy gating.")
 
     # Exponential logit weight decay (opt-in)
     parser.add_argument("--logit_decay", type=float, default=0.0,

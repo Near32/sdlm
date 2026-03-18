@@ -257,6 +257,9 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         seq_len=config["seq_len"],
         epochs=config["epochs"],
         learning_rate=config["learning_rate"],
+        lookahead_k=config.get("lookahead_k", 0),
+        lookahead_alpha=config.get("lookahead_alpha", 0.5),
+        logits_lora_b_learning_rate=config.get("logits_lora_b_learning_rate"),
         temperature=config.get("temperature", 1.0),
         bptt_temperature=config.get("bptt_temperature", 1.0),
         learnable_temperature=config.get("learnable_temperature", False),
@@ -348,6 +351,14 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         fixed_gt_suffix_rank2_n=config.get("fixed_gt_suffix_rank2_n", 0),
         fixed_prefix_text=config.get("fixed_prefix_text"),
         fixed_suffix_text=config.get("fixed_suffix_text"),
+        assemble_strategy=config.get("assemble_strategy", "identity"),
+        pos_lm_name=config.get("pos_lm_name"),
+        pos_prompt=config.get("pos_prompt"),
+        pos_prompt_template=config.get("pos_prompt_template"),
+        pos_use_chat_template=config.get("pos_use_chat_template", False),
+        pos_lm_temperature=config.get("pos_lm_temperature", 1.0),
+        pos_lm_top_p=config.get("pos_lm_top_p", 1.0),
+        pos_lm_top_k=config.get("pos_lm_top_k", 0),
         # STGS initialization strategy
         init_strategy=config.get("init_strategy", "randn"),
         init_std=config.get("init_std", 0.0),
@@ -370,6 +381,10 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         temperature_loss_coupling_lambda=config.get("temperatureLossCouplingLambda", 0.0),
         discrete_reinit_epoch=config.get("discrete_reinit_epoch", 0),
         discrete_reinit_snap=config.get("discrete_reinit_snap", "argmax"),
+        discrete_reinit_prob=config.get("discrete_reinit_prob", 1.0),
+        discrete_reinit_topk=config.get("discrete_reinit_topk", 0),
+        discrete_reinit_entropy_threshold=config.get("discrete_reinit_entropy_threshold", 0.0),
+        discrete_reinit_embsim_probs=config.get("discrete_reinit_embsim_probs", "input_logits"),
         gumbel_noise_scale=config.get("gumbel_noise_scale", 1.0),
         adaptive_gumbel_noise=config.get("adaptive_gumbel_noise", False),
         adaptive_gumbel_noise_beta=config.get("adaptive_gumbel_noise_beta", 0.9),
@@ -911,9 +926,9 @@ def str2list(v):
         return None
     return [item.strip() for item in v.split(',')]
 
-def parse_args():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Batch optimize prompts for multiple target sentences")
+def build_parser(description: str = "Batch optimize prompts for multiple target sentences"):
+    """Build the command-line parser."""
+    parser = argparse.ArgumentParser(description=description)
     
     # Dataset parameters
     parser.add_argument("--dataset_path", type=str, required=True,
@@ -940,6 +955,15 @@ def parse_args():
                         help="Number of optimization epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-2,
                         help="Learning rate for optimization")
+    parser.add_argument("--lookahead_k", type=str, default="0",
+                        help="Lookahead sync period(s) in optimizer steps. "
+                             "Use 0 to disable, a single integer for one level, "
+                             "or a comma-separated list such as '8,80,800' for nested levels.")
+    parser.add_argument("--lookahead_alpha", type=float, default=0.5,
+                        help="Lookahead interpolation factor between slow and fast weights.")
+    parser.add_argument("--logits_lora_b_learning_rate", type=float, default=None,
+                        help="Optional learning rate override for LoRA prompt-logit matrix B. "
+                             "Ignored when logits_lora_rank <= 0.")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Batch size for optimization")
     
@@ -1371,6 +1395,20 @@ def parse_args():
     parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
                         choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
                         help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_prob", type=float, default=1.0,
+                        help="In top-k discrete reinit mode, probability mass assigned to the snapped token "
+                             "(1.0 keeps legacy spike behavior when discrete_reinit_topk=0).")
+    parser.add_argument("--discrete_reinit_topk", type=int, default=0,
+                        help="Preserve this many top-k tokens from the pre-reinit distribution with the "
+                             "residual probability mass; 0 disables the softer top-k reinit.")
+    parser.add_argument("--discrete_reinit_entropy_threshold", type=float, default=0.0,
+                        help="Per-position entropy threshold for discrete reinit. 0 disables it. "
+                             "If set with discrete_reinit_epoch > 0, only positions below the threshold "
+                             "are reinitialized at each reinit event; if discrete_reinit_epoch=0, the "
+                             "threshold is checked every epoch.")
+    parser.add_argument("--discrete_reinit_embsim_probs", type=str, default="input_logits",
+                        choices=["input_logits", "gumbel_soft"],
+                        help="Distribution source used for embsim-based discrete reinit and entropy gating.")
 
     # Exponential logit weight decay (opt-in)
     parser.add_argument("--logit_decay", type=float, default=0.0,
@@ -1407,7 +1445,48 @@ def parse_args():
                              "When ON: no LM-attention gradient flows back through EoS positions. "
                              "Gradient still flows through the gate (length_alpha) and STGS.")
 
-    return parser.parse_args()
+    parser.add_argument("--assemble_strategy", type=str, default="identity",
+                        choices=["identity", "product_of_speaker"],
+                        help="Transform applied to assembled prompt logits before optimization.")
+    parser.add_argument("--pos_lm_name", type=str, default=None,
+                        help="Auxiliary LM used by product_of_speaker. Defaults to --model_name.")
+    parser.add_argument("--pos_prompt", type=str, default=None,
+                        help="Fixed task prompt used to seed the product_of_speaker LM.")
+    parser.add_argument("--pos_prompt_template", type=str, default=None,
+                        help="PoS prompt template for batch single-target runs. Supports {target}.")
+    parser.add_argument("--pos_use_chat_template", type=str2bool, default=False,
+                        help="Wrap the product_of_speaker prompt with tokenizer.apply_chat_template "
+                             "when the auxiliary tokenizer provides one.")
+    parser.add_argument("--pos_lm_temperature", type=float, default=1.0,
+                        help="Temperature applied to the auxiliary LM logits in product_of_speaker.")
+    parser.add_argument("--pos_lm_top_p", type=float, default=1.0,
+                        help="Top-p filter applied to the auxiliary LM logits in product_of_speaker.")
+    parser.add_argument("--pos_lm_top_k", type=int, default=0,
+                        help="Top-k filter applied to the auxiliary LM logits in product_of_speaker.")
+
+    return parser
+
+
+def parse_args(argv=None):
+    """Parse command-line arguments."""
+    return build_parser().parse_args(argv)
+
+
+def apply_loss_arg_expansions(args):
+    """Expand opt-in loss flags into the composite losses string."""
+    if args.promptLambda > 0.0:
+        args.losses += '+promptPerplexity'
+    if args.complLambda > 0.0:
+        args.losses += '+completionPerplexity'
+    if args.promptTfComplLambda > 0.0:
+        args.losses += '+promptTfComplPerplexity'
+    if args.eos_reg_lambda > 0.0:
+        args.losses += '+eosPositionReg'
+    if args.promptDistEntropyLambda > 0.0:
+        args.losses += '+promptDistEntropy'
+    if args.commitmentLambda > 0.0:
+        args.losses += '+commitmentLoss'
+    return args
 
 def main():
     """Main entry point."""
@@ -1425,19 +1504,7 @@ def main():
     metric_groups = str2list(args.metric_groups)
     skip_metric_groups = str2list(args.skip_metric_groups)
     
-    # Update losses with perplexity components if needed
-    if args.promptLambda > 0.0:
-        args.losses += '+promptPerplexity'
-    if args.complLambda > 0.0:
-        args.losses += '+completionPerplexity'
-    if args.promptTfComplLambda > 0.0:
-        args.losses += '+promptTfComplPerplexity'
-    if args.eos_reg_lambda > 0.0:
-        args.losses += '+eosPositionReg'
-    if args.promptDistEntropyLambda > 0.0:
-        args.losses += '+promptDistEntropy'
-    if args.commitmentLambda > 0.0:
-        args.losses += '+commitmentLoss'
+    apply_loss_arg_expansions(args)
 
     # Prepare configuration dictionary
     config = vars(args)
