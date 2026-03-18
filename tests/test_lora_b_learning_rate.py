@@ -94,6 +94,7 @@ def _stub_batch_optimize_pc_dependencies() -> dict[str, types.ModuleType]:
     pc_main.ensure_pc_main_compatibility = lambda *args, **kwargs: None
     pc_main.pc_optimize_inputs = lambda *args, **kwargs: {}
     pc_main.evaluate_shared_prompt = lambda *args, **kwargs: {}
+    pc_main.evaluate_shared_prompt_batched = lambda *args, **kwargs: {}
 
     pc_weave_logging = types.ModuleType("pc_weave_logging")
     pc_weave_logging.init_weave = lambda *args, **kwargs: None

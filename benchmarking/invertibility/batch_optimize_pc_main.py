@@ -28,6 +28,7 @@ from pc_main import (
     ensure_pc_main_compatibility,
     pc_optimize_inputs,
     evaluate_shared_prompt,
+    evaluate_shared_prompt_batched,
 )
 from pc_weave_logging import init_weave
 from product_of_speaker import build_pc_product_of_speaker_transform
@@ -108,6 +109,78 @@ def collect_reasoning_generate_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         if value is not None:
             kwargs[generate_key] = value
     return kwargs
+
+
+def _split_metric_columns(extraction_fns: Dict[str, Any]) -> List[str]:
+    return [
+        "split",
+        "eval_mode",
+        "n_examples",
+        "any_correct",
+        "all_correct",
+        *[f"accuracy_{method_name}" for method_name in extraction_fns],
+    ]
+
+
+def _build_split_metrics_table(
+    split_metrics: Dict[str, Tuple[str, int, Dict[str, Any]]],
+    extraction_fns: Dict[str, Any],
+):
+    table = wandb.Table(columns=_split_metric_columns(extraction_fns))
+    for split_name, (eval_mode, n_examples, metrics) in split_metrics.items():
+        row = [
+            split_name,
+            eval_mode,
+            n_examples,
+            metrics.get("any_correct"),
+            metrics.get("all_correct"),
+        ]
+        for method_name in extraction_fns:
+            row.append(metrics.get(f"accuracy_{method_name}"))
+        table.add_data(*row)
+    return table
+
+
+def _build_prediction_table(
+    split_name: str,
+    examples: List[Dict[str, Any]],
+    extraction_fns: Dict[str, Any],
+):
+    columns = [
+        "split",
+        "sample_index",
+        "epoch",
+        "eval_mode",
+        "reasoning_generation_backend",
+        "input_text",
+        "target_answer",
+        "prompt_text",
+        "generated_reasoning",
+        "generated_answer",
+        "any_correct",
+        "all_correct",
+    ]
+    columns.extend(f"correct_{method_name}" for method_name in extraction_fns)
+    table = wandb.Table(columns=columns)
+    for example in examples:
+        row = [
+            split_name,
+            example.get("sample_index"),
+            example.get("epoch"),
+            example.get("eval_mode"),
+            example.get("reasoning_generation_backend"),
+            example.get("input_text"),
+            example.get("target_answer"),
+            example.get("prompt_text"),
+            example.get("generated_reasoning"),
+            example.get("generated_answer"),
+            example.get("any_correct"),
+            example.get("all_correct"),
+        ]
+        for method_name in extraction_fns:
+            row.append(example.get(f"correct_{method_name}"))
+        table.add_data(*row)
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +305,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
     Full pipeline: load dataset, build model, run pc_optimize_inputs, evaluate.
     """
     pipeline_pbar = tqdm(
-        total=6,
+        total=8,
         desc="PC pipeline: model",
         leave=True,
     )
@@ -292,6 +365,9 @@ def batch_pc_optimize(config: Dict) -> Dict:
     test_pairs: List[Tuple[str, str]] = [
         (r["input"], r["answer"]) for r in test_records
     ]
+    if not val_pairs:
+        pipeline_pbar.total = max(pipeline_pbar.total - 1, 1)
+        pipeline_pbar.refresh()
     pipeline_pbar.set_postfix(
         train=len(train_triples),
         val=len(val_pairs),
@@ -321,6 +397,24 @@ def batch_pc_optimize(config: Dict) -> Dict:
         name=run_name,
         config=config,
         tags=wandb_tags,
+    )
+    wandb.config.update(
+        {
+            "dataset_metadata": dataset.get("metadata", {}),
+            "train_examples": len(train_triples),
+            "val_examples": len(val_pairs),
+            "test_examples": len(test_pairs),
+            "extraction_prompt": extraction_prompt,
+            "reasoning_generate_kwargs": config.get("reasoning_generate_kwargs", {}),
+        },
+        allow_val_change=True,
+    )
+    wandb.log(
+        {
+            "dataset/train_examples": len(train_triples),
+            "dataset/val_examples": len(val_pairs),
+            "dataset/test_examples": len(test_pairs),
+        }
     )
     init_weave(
         project=config.get("weave_project") or config.get("wandb_project", "sdlm-pc-inversion"),
@@ -384,7 +478,8 @@ def batch_pc_optimize(config: Dict) -> Dict:
     def _test_eval_callback(epoch: int, fl: torch.Tensor) -> Dict:
         if test_eval_every <= 0 or ((epoch + 1) % test_eval_every != 0):
             return {}
-        metrics = evaluate_shared_prompt(
+        _eval_fn = evaluate_shared_prompt_batched if config.get("use_batched_eval", False) else evaluate_shared_prompt
+        metrics = _eval_fn(
             free_logits=fl,
             eval_pairs=test_pairs_eval,
             model=model,
@@ -542,6 +637,22 @@ def batch_pc_optimize(config: Dict) -> Dict:
         ppo_kl_mode=config.get("ppo_kl_mode", "soft"),
         ppo_kl_epsilon=config.get("ppo_kl_epsilon", 0.0),
         ppo_ref_update_period=config.get("ppo_ref_update_period", 10),
+        superposition_metric_every=config.get("superposition_metric_every", 0),
+        superposition_metric_modes=config.get("superposition_metric_modes", "dot,cos,l2"),
+        superposition_vocab_top_k=config.get("superposition_vocab_top_k", 256),
+        superposition_vocab_source=config.get("superposition_vocab_source", "wikipedia"),
+        superposition_vocab_dataset_path=(
+            config.get("superposition_vocab_dataset_path")
+            or config.get("dataset_path")
+        ),
+        superposition_vocab_hf_name=config.get("superposition_vocab_hf_name", "lucadiliello/english_wikipedia"),
+        superposition_vocab_hf_split=config.get("superposition_vocab_hf_split", "train"),
+        superposition_vocab_num_texts=config.get("superposition_vocab_num_texts", 1000),
+        superposition_entropy_temperature=config.get("superposition_entropy_temperature", 1.0),
+        superposition_output_dir=config.get(
+            "superposition_output_dir",
+            str(Path(config.get("output_dir", "pc_optimization_results")) / "superposition"),
+        ),
         fixed_gt_prefix_n=config.get("fixed_gt_prefix_n", 0),
         fixed_gt_suffix_n=config.get("fixed_gt_suffix_n", 0),
         fixed_gt_prefix_rank2_n=config.get("fixed_gt_prefix_rank2_n", 0),
@@ -552,6 +663,10 @@ def batch_pc_optimize(config: Dict) -> Dict:
         val_eval_every=config.get("val_eval_every", 100),
         val_prompt_eval_mode=config.get("val_prompt_eval_mode", "discrete"),
         per_epoch_callback=_test_eval_callback if test_eval_every > 0 else None,
+        use_batched_forward_pass=config.get("use_batched_forward_pass", False),
+        batched_stgs_noise_mode=config.get("batched_stgs_noise_mode", "shared"),
+        use_batched_eval=config.get("use_batched_eval", False),
+        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
         use_chat_template=config.get("use_chat_template", False),
         accumulate_embeds=config.get("efficient_generate", False),
         prompt_logits_transform=prompt_logits_transform,
@@ -559,13 +674,45 @@ def batch_pc_optimize(config: Dict) -> Dict:
     )
     pipeline_pbar.update(1)
 
-    # ---- final test evaluation ----
+    # ---- final validation evaluation ----
     final_fl = result["final_p_logits"]
+    final_val_metrics = None
+    final_val_examples: List[Dict[str, Any]] = []
+    if val_pairs:
+        val_prompt_eval_mode = config.get("val_prompt_eval_mode", "discrete")
+        pipeline_pbar.set_description(f"PC pipeline: val eval ({val_prompt_eval_mode})")
+        logger.info("Running final validation evaluation with prompt eval mode=%s...", val_prompt_eval_mode)
+        final_val_metrics, final_val_examples = evaluate_shared_prompt(
+            free_logits=final_fl,
+            eval_pairs=val_pairs,
+            model=model,
+            diff_model=diff_model,
+            stgs_module=stgs_for_eval,
+            embedding_weights=embedding_weights,
+            tokenizer=tokenizer,
+            device=device,
+            E_input_ids=E_input_ids,
+            E_embeds=E_embeds,
+            extraction_fns=extraction_fns,
+            max_new_tokens_reasoning=config.get("max_new_tokens_reasoning", 200),
+            max_new_tokens_answer=config.get("max_new_tokens_answer", 20),
+            eval_mode=val_prompt_eval_mode,
+            reasoning_generation_backend=config.get("reasoning_generation_backend", "diff"),
+            reasoning_generate_kwargs=config.get("reasoning_generate_kwargs", {}),
+            use_chat_template=config.get("use_chat_template", False),
+            eval_split="val",
+            accumulate_embeds=_accumulate_embeds,
+            prompt_logits_transform=prompt_logits_transform,
+            return_examples=True,
+        )
+        pipeline_pbar.update(1)
+
+    # ---- final test evaluation ----
     test_prompt_eval_mode = config.get("test_prompt_eval_mode", "discrete")
 
     pipeline_pbar.set_description(f"PC pipeline: test eval ({test_prompt_eval_mode})")
     logger.info("Running final test evaluation with prompt eval mode=%s...", test_prompt_eval_mode)
-    test_metrics = evaluate_shared_prompt(
+    test_metrics, test_examples = evaluate_shared_prompt(
         free_logits=final_fl,
         eval_pairs=test_pairs_eval,
         model=model,
@@ -586,6 +733,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         eval_split="test",
         accumulate_embeds=_accumulate_embeds,
         prompt_logits_transform=prompt_logits_transform,
+        return_examples=True,
     )
     pipeline_pbar.update(1)
 
@@ -602,6 +750,11 @@ def batch_pc_optimize(config: Dict) -> Dict:
             best_val_any = entry["any_correct"]
             best_val_epoch = entry.get("epoch", 0)
 
+    final_loss = result["loss_history"][-1] if result.get("loss_history") else None
+    last_train_metrics = train_acc_history[-1] if train_acc_history else {}
+    final_train_any = last_train_metrics.get("any_correct", 0.0)
+    final_train_all = last_train_metrics.get("all_correct", 0.0)
+    final_val_any = final_val_metrics.get("any_correct", 0.0) if final_val_metrics else 0.0
     final_test_any = test_metrics.get("any_correct", 0.0)
     learnable_logits = result.get("learnable_logits", final_fl)
     learnable_temperatures = result.get("learnable_temperatures", {})
@@ -612,12 +765,51 @@ def batch_pc_optimize(config: Dict) -> Dict:
     torch.save(learnable_logits, learnable_logits_path)
     torch.save(learnable_temperatures, learnable_temperatures_path)
 
-    wandb.log({
+    final_log_dict = {
+        "final/p_text": final_p_text,
+        "final/p_token_ids": final_p_tokens,
+        "final/loss": final_loss,
+        "train_final/prompt_eval_mode": "teacher_forcing_r" if config.get("teacher_forcing_r", True) else "generated_reasoning",
+        "train_final/p_text": final_p_text,
+        "train_final/p_token_ids": final_p_tokens,
+        "train_final/any_correct": final_train_any,
+        "train_final/all_correct": final_train_all,
         "test/p_text": final_p_text,
         "test/p_token_ids": final_p_tokens,
         "test/prompt_eval_mode": test_prompt_eval_mode,
         **{f"test/{k}": v for k, v in test_metrics.items()},
-    })
+    }
+    if final_val_metrics is not None:
+        final_log_dict.update({
+            "val/p_text": final_p_text,
+            "val/p_token_ids": final_p_tokens,
+            "val/prompt_eval_mode": config.get("val_prompt_eval_mode", "discrete"),
+            **{f"val/{k}": v for k, v in final_val_metrics.items()},
+        })
+    wandb.log(final_log_dict)
+
+    split_metrics = {
+        "train_final": ("teacher_forcing_r" if config.get("teacher_forcing_r", True) else "generated_reasoning", len(train_triples), {
+            "any_correct": final_train_any,
+            "all_correct": final_train_all,
+            **{
+                f"accuracy_{method_name}": last_train_metrics.get(f"accuracy_{method_name}")
+                for method_name in extraction_fns
+            },
+        }),
+        "test": (test_prompt_eval_mode, len(test_pairs_eval), test_metrics),
+    }
+    if final_val_metrics is not None:
+        split_metrics["val"] = (
+            config.get("val_prompt_eval_mode", "discrete"),
+            len(val_pairs),
+            final_val_metrics,
+        )
+    wandb.log({"split_metrics": _build_split_metrics_table(split_metrics, extraction_fns)})
+    if final_val_examples:
+        wandb.log({"val_predictions": _build_prediction_table("val", final_val_examples, extraction_fns)})
+    if test_examples:
+        wandb.log({"test_predictions": _build_prediction_table("test", test_examples, extraction_fns)})
     artifact = wandb.Artifact(
         name=f"learnable-logits-{run_name}",
         type="tensor",
@@ -634,13 +826,17 @@ def batch_pc_optimize(config: Dict) -> Dict:
         temps_artifact.add_file(str(learnable_temperatures_path))
         wandb.run.log_artifact(temps_artifact)
     wandb.run.summary.update({
-        "final_val_accuracy": val_acc_history[-1].get("any_correct", 0.0) if val_acc_history else 0.0,
+        "epochs_completed": len(result.get("loss_history", [])),
+        "final_loss": final_loss,
+        "final_train_accuracy": final_train_any,
+        "final_train_all_correct": final_train_all,
+        "final_val_accuracy": final_val_any,
         "final_test_accuracy": final_test_any,
         "best_val_accuracy": best_val_any,
         "best_val_epoch": best_val_epoch,
         "final_p_text": final_p_text,
+        "final_p_token_ids": final_p_tokens,
     })
-    wandb.finish()
 
     # ---- save JSON result ----
     out_path = output_dir / f"{run_name}.json"
@@ -653,14 +849,25 @@ def batch_pc_optimize(config: Dict) -> Dict:
         "loss_history": result["loss_history"],
         "train_accuracy_history": train_acc_history,
         "val_accuracy_history": val_acc_history,
+        "final_val_metrics": final_val_metrics,
+        "final_val_examples": final_val_examples,
         "test_prompt_eval_mode": test_prompt_eval_mode,
         "test_accuracy": test_metrics,
+        "test_examples": test_examples,
         "learnable_logits_path": str(learnable_logits_path),
         "learnable_temperatures_path": str(learnable_temperatures_path),
     }
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     logger.info(f"Results saved to {out_path}")
+    results_artifact = wandb.Artifact(
+        name=f"{run_name}-summary",
+        type="results",
+        description="PC batch optimization summary JSON",
+    )
+    results_artifact.add_file(str(out_path))
+    wandb.run.log_artifact(results_artifact)
+    wandb.finish()
     pipeline_pbar.update(1)
     pipeline_pbar.close()
 
@@ -863,6 +1070,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bptt_stgs_hard_embsim_fallback", type=str, default="argmax",
                    choices=["argmax", "categorical"])
     p.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
+
+    # Batched forward pass + gradient accumulation
+    p.add_argument("--use_batched_forward_pass", type=str2bool, default=False,
+                   help="Use batched GPU forward pass for training mini-batches.")
+    p.add_argument("--batched_stgs_noise_mode", type=str, default="shared",
+                   choices=["shared", "independent"],
+                   help="Gumbel noise sharing within a batch: 'shared' (one draw) "
+                        "or 'independent' (one draw per sample).")
+    p.add_argument("--use_batched_eval", type=str2bool, default=False,
+                   help="Use batched evaluate_shared_prompt for validation/test.")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                   help="Accumulate gradients over N mini-batches before optimizer.step(). "
+                        "Effective batch size = inner_batch_size × gradient_accumulation_steps.")
 
     # Validation / test eval
     p.add_argument(
