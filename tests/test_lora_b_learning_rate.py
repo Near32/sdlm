@@ -664,9 +664,22 @@ def test_batch_pc_optimize_propagates_reasoning_backend_to_all_eval_calls(tmp_pa
         def log_artifact(self, *args, **kwargs):
             return None
 
+    class FakeConfig:
+        def update(self, *args, **kwargs):
+            return None
+
+    class FakeTable:
+        def __init__(self, columns=None):
+            self.columns = columns or []
+            self.data = []
+
+        def add_data(self, *args):
+            self.data.append(args)
+
     class FakeWandb:
         def __init__(self):
             self.run = FakeRun()
+            self.config = FakeConfig()
 
         def init(self, *args, **kwargs):
             del args, kwargs
@@ -679,13 +692,17 @@ def test_batch_pc_optimize_propagates_reasoning_backend_to_all_eval_calls(tmp_pa
             return None
 
         Artifact = FakeArtifact
+        Table = FakeTable
 
     evaluate_calls = []
     optimize_kwargs = {}
 
     def fake_evaluate_shared_prompt(**kwargs):
         evaluate_calls.append(kwargs)
-        return {"any_correct": 0.5, "n_eval": 1.0}
+        metrics = {"any_correct": 0.5, "n_eval": 1.0}
+        if kwargs.get("return_examples"):
+            return metrics, []
+        return metrics
 
     def fake_pc_optimize_inputs(**kwargs):
         optimize_kwargs.update(kwargs)
@@ -747,8 +764,8 @@ def test_batch_pc_optimize_propagates_reasoning_backend_to_all_eval_calls(tmp_pa
     assert optimize_kwargs["reasoning_generation_backend"] == "hf_generate"
     assert optimize_kwargs["reasoning_generate_kwargs"] == {"do_sample": True, "top_p": 0.8}
     assert optimize_kwargs["val_prompt_eval_mode"] == "soft"
-    assert len(evaluate_calls) == 2
-    assert [call["eval_mode"] for call in evaluate_calls] == ["soft", "soft"]
+    assert len(evaluate_calls) == 3
+    assert [call["eval_mode"] for call in evaluate_calls] == ["soft", "soft", "soft"]
     for call in evaluate_calls:
         assert call["reasoning_generation_backend"] == "hf_generate"
         assert call["reasoning_generate_kwargs"] == {"do_sample": True, "top_p": 0.8}

@@ -1861,6 +1861,13 @@ def pc_optimize_inputs(
     val_eval_every: int = 100,
     val_prompt_eval_mode: str = "discrete",
     per_epoch_callback: Optional[Callable] = None,
+    # Batched forward pass
+    use_batched_forward_pass: bool = False,
+    batched_stgs_noise_mode: str = "shared",       # "shared" | "independent"
+    # Batched evaluation
+    use_batched_eval: bool = False,
+    # Gradient accumulation
+    gradient_accumulation_steps: int = 1,
     # Chat template
     use_chat_template: bool = False,
     # Memory / speed optimizations
@@ -2254,6 +2261,7 @@ def pc_optimize_inputs(
         desc="train epochs",
         leave=True,
     )
+    optimizer.zero_grad()
     try:
         for epoch in range(epochs):
             # Temperature annealing
@@ -2364,7 +2372,6 @@ def pc_optimize_inputs(
             )
             try:
                 for iteration, mini_batch in enumerate(train_batches):
-                    optimizer.zero_grad()
                     batch_loss = 0.0
                     reg_log: Dict[str, float] = {}
                     n_batch = len(mini_batch)
@@ -2381,92 +2388,147 @@ def pc_optimize_inputs(
                         skip_special_tokens=False,
                     )
 
-                    for sample_idx, (x_str, R_gt_str, y_raw_str) in enumerate(mini_batch):
-                        x_ids = x_ids_cache[x_str]
-                        x_embeds = x_embeds_cache[x_str]
-                        R_gt_ids = R_gt_ids_cache[(x_str, R_gt_str)]
-                        R_gt_embeds = R_gt_embeds_cache[(x_str, R_gt_str)]
-                        Y_tokens = Y_tokens_cache[y_raw_str]
-                        Y_len = Y_tokens.shape[1]
-                        loss_instance = loss_cache[(y_raw_str, Y_len)]
+                    loss_scale = n_batch * max(gradient_accumulation_steps, 1)
+                    if use_batched_forward_pass:
+                        _x_emb   = [x_embeds_cache[x]         for x, _, _ in mini_batch]
+                        _R_emb   = [R_gt_embeds_cache[(x, R)]  for x, R, _ in mini_batch]
+                        _Y_tok   = [Y_tokens_cache[y]          for _, _, y in mini_batch]
+                        _losses_ = [
+                            loss_cache[(y, Y_tokens_cache[y].shape[1])]
+                            for _, _, y in mini_batch
+                        ]
 
-                        weave_extras: Dict = {}
-                        loss = pc_forward_pass(
-                            diff_model=diff_model,
-                            stgs_module=stgs_module,
-                            loss_instance=loss_instance,
-                            free_logits=fl_batch,
-                            embedding_weights=embedding_weights,
-                            x_ids=x_ids,
-                            x_embeds=x_embeds,
-                            x_text_raw=x_str,
-                            R_gt_ids=R_gt_ids,
-                            R_gt_embeds=R_gt_embeds,
-                            R_gt_text_raw=R_gt_str,
+                        per_losses, y_logits_list = pc_forward_pass_batched(
+                            diff_model=diff_model, stgs_module=stgs_module,
+                            loss_instances=_losses_,
+                            free_logits=fl_batch, embedding_weights=embedding_weights,
+                            x_embeds_list=_x_emb, R_gt_embeds_list=_R_emb,
+                            E_embeds=E_embeds, Y_tokens_list=_Y_tok,
                             E_input_ids=E_input_ids,
-                            E_embeds=E_embeds,
-                            Y_tokens=Y_tokens,
-                            y_target_text_raw=y_raw_str,
-                            use_chat_template=use_chat_template,
-                            teacher_forcing_r=teacher_forcing_r,
-                            bptt=bptt,
+                            teacher_forcing_r=teacher_forcing_r, bptt=bptt,
                             reasoning_generation_backend=reasoning_generation_backend,
                             reasoning_generate_kwargs=reasoning_generate_kwargs,
                             max_new_tokens_reasoning=max_new_tokens_reasoning,
                             max_new_tokens_answer=max_new_tokens_answer,
                             gumbel_noise_scale=current_gumbel_scale,
                             accumulate_embeds=accumulate_embeds,
-                            tokenizer=tokenizer,
-                            weave_extras=weave_extras,
+                            stgs_noise_mode=batched_stgs_noise_mode,
                         )
-                        (loss / n_batch).backward(retain_graph=sample_idx < (n_batch - 1))
-                        batch_loss += loss.item()
+                        for si, (loss, y_lg, (x_str, R_gt_str, y_raw_str)) in enumerate(
+                            zip(per_losses, y_logits_list, mini_batch)
+                        ):
+                            (loss / loss_scale).backward(retain_graph=si < n_batch - 1)
+                            batch_loss += loss.item()
+                            train_Y_text = (
+                                tokenizer.decode(
+                                    y_lg.argmax(-1).squeeze(0).tolist(),
+                                    skip_special_tokens=True,
+                                ) if y_lg is not None else ""
+                            )
+                            train_R_text = R_gt_str if teacher_forcing_r else ""
+                            train_method_results = _compute_method_results(
+                                R_text=train_R_text, Y_text=train_Y_text,
+                                y_raw_str=y_raw_str, extraction_fns=extraction_fns,
+                            )
+                            for method, ok in train_method_results.items():
+                                if ok: train_method_correct[method] += 1
+                            train_any_correct_count += int(any(train_method_results.values()))
+                            train_all_correct_count += int(all(train_method_results.values()))
+                            epoch_train_examples += 1
+                            train_metrics_running = _metrics_from_accuracy_counts(
+                                per_method_correct=train_method_correct,
+                                any_correct_count=train_any_correct_count,
+                                all_correct_count=train_all_correct_count,
+                                n_examples=epoch_train_examples,
+                                extraction_fns=extraction_fns,
+                            )
+                    else:
+                        for sample_idx, (x_str, R_gt_str, y_raw_str) in enumerate(mini_batch):
+                            x_ids = x_ids_cache[x_str]
+                            x_embeds = x_embeds_cache[x_str]
+                            R_gt_ids = R_gt_ids_cache[(x_str, R_gt_str)]
+                            R_gt_embeds = R_gt_embeds_cache[(x_str, R_gt_str)]
+                            Y_tokens = Y_tokens_cache[y_raw_str]
+                            Y_len = Y_tokens.shape[1]
+                            loss_instance = loss_cache[(y_raw_str, Y_len)]
 
-                        # Teacher forcing does not generate reasoning, so training accuracy
-                        # falls back to the provided reasoning text in that mode.
-                        train_R_text = R_gt_str if teacher_forcing_r else weave_extras.get("R_gen_text", "")
-                        train_Y_text = weave_extras.get("y_pred_text", "")
-                        train_method_results = _compute_method_results(
-                            R_text=train_R_text,
-                            Y_text=train_Y_text,
-                            y_raw_str=y_raw_str,
-                            extraction_fns=extraction_fns,
-                        )
-                        for method, is_correct in train_method_results.items():
-                            if is_correct:
-                                train_method_correct[method] += 1
-                        train_any_correct_count += int(any(train_method_results.values()))
-                        train_all_correct_count += int(all(train_method_results.values()))
-                        epoch_train_examples += 1
-                        train_metrics_running = _metrics_from_accuracy_counts(
-                            per_method_correct=train_method_correct,
-                            any_correct_count=train_any_correct_count,
-                            all_correct_count=train_all_correct_count,
-                            n_examples=epoch_train_examples,
-                            extraction_fns=extraction_fns,
-                        )
+                            weave_extras: Dict = {}
+                            loss = pc_forward_pass(
+                                diff_model=diff_model,
+                                stgs_module=stgs_module,
+                                loss_instance=loss_instance,
+                                free_logits=fl_batch,
+                                embedding_weights=embedding_weights,
+                                x_ids=x_ids,
+                                x_embeds=x_embeds,
+                                x_text_raw=x_str,
+                                R_gt_ids=R_gt_ids,
+                                R_gt_embeds=R_gt_embeds,
+                                R_gt_text_raw=R_gt_str,
+                                E_input_ids=E_input_ids,
+                                E_embeds=E_embeds,
+                                Y_tokens=Y_tokens,
+                                y_target_text_raw=y_raw_str,
+                                use_chat_template=use_chat_template,
+                                teacher_forcing_r=teacher_forcing_r,
+                                bptt=bptt,
+                                reasoning_generation_backend=reasoning_generation_backend,
+                                reasoning_generate_kwargs=reasoning_generate_kwargs,
+                                max_new_tokens_reasoning=max_new_tokens_reasoning,
+                                max_new_tokens_answer=max_new_tokens_answer,
+                                gumbel_noise_scale=current_gumbel_scale,
+                                accumulate_embeds=accumulate_embeds,
+                                tokenizer=tokenizer,
+                                weave_extras=weave_extras,
+                            )
+                            (loss / loss_scale).backward(retain_graph=sample_idx < (n_batch - 1))
+                            batch_loss += loss.item()
 
-                        trace_common = {
-                            "epoch": epoch,
-                            "iteration": iteration,
-                            "global_iteration": global_iteration,
-                            "loss": loss.item(),
-                            "teacher_forcing_r": teacher_forcing_r,
-                            "reasoning_generation_backend": reasoning_generation_backend,
-                            "x_text_raw": x_str,
-                            "p_text_batch_argmax": p_text_batch,
-                            "R_gt_text": R_gt_str,
-                            "R_text_clean": train_R_text,
-                            "Y_text_clean": train_Y_text,
-                            "y_target": y_raw_str,
-                            "correct_per_method": train_method_results,
-                            "any_correct": any(train_method_results.values()),
-                            "all_correct": all(train_method_results.values()),
-                        }
-                        for trace_payload in weave_extras.get("lm_traces", []):
-                            trace_payload.update(trace_common)
-                            trace_payload["epoch"] = epoch
-                            weave_lm_train_step(**trace_payload)
+                            # Teacher forcing does not generate reasoning, so training accuracy
+                            # falls back to the provided reasoning text in that mode.
+                            train_R_text = R_gt_str if teacher_forcing_r else weave_extras.get("R_gen_text", "")
+                            train_Y_text = weave_extras.get("y_pred_text", "")
+                            train_method_results = _compute_method_results(
+                                R_text=train_R_text,
+                                Y_text=train_Y_text,
+                                y_raw_str=y_raw_str,
+                                extraction_fns=extraction_fns,
+                            )
+                            for method, is_correct in train_method_results.items():
+                                if is_correct:
+                                    train_method_correct[method] += 1
+                            train_any_correct_count += int(any(train_method_results.values()))
+                            train_all_correct_count += int(all(train_method_results.values()))
+                            epoch_train_examples += 1
+                            train_metrics_running = _metrics_from_accuracy_counts(
+                                per_method_correct=train_method_correct,
+                                any_correct_count=train_any_correct_count,
+                                all_correct_count=train_all_correct_count,
+                                n_examples=epoch_train_examples,
+                                extraction_fns=extraction_fns,
+                            )
+
+                            trace_common = {
+                                "epoch": epoch,
+                                "iteration": iteration,
+                                "global_iteration": global_iteration,
+                                "loss": loss.item(),
+                                "teacher_forcing_r": teacher_forcing_r,
+                                "reasoning_generation_backend": reasoning_generation_backend,
+                                "x_text_raw": x_str,
+                                "p_text_batch_argmax": p_text_batch,
+                                "R_gt_text": R_gt_str,
+                                "R_text_clean": train_R_text,
+                                "Y_text_clean": train_Y_text,
+                                "y_target": y_raw_str,
+                                "correct_per_method": train_method_results,
+                                "any_correct": any(train_method_results.values()),
+                                "all_correct": all(train_method_results.values()),
+                            }
+                            for trace_payload in weave_extras.get("lm_traces", []):
+                                trace_payload.update(trace_common)
+                                trace_payload["epoch"] = epoch
+                                weave_lm_train_step(**trace_payload)
 
                     mean_batch_loss = batch_loss / max(n_batch, 1)
                     reg_loss = None
@@ -2597,16 +2659,21 @@ def pc_optimize_inputs(
                             iter_log["iter/gumbel_loss_ema"] = float(ema_loss)
                         wandb.log(iter_log)
 
-                    optimizer.step()
+                    # Gradient accumulation: only step every N iterations (or at end of epoch)
+                    accum_step = (global_iteration + 1) % max(gradient_accumulation_steps, 1)
+                    if accum_step == 0 or (iteration == len(train_batches) - 1):
+                        # Gradient clipping already done above; now step
+                        optimizer.step()
+                        optimizer.zero_grad()
 
-                    # Logit decay
-                    if logit_decay > 0:
-                        with torch.no_grad():
-                            if lora_A is not None:
-                                lora_A.data.mul_(1 - logit_decay)
-                                lora_B.data.mul_(1 - logit_decay)
-                            else:
-                                free_logits.data.mul_(1 - logit_decay)
+                        # Logit decay (only on actual update step)
+                        if logit_decay > 0:
+                            with torch.no_grad():
+                                if lora_A is not None:
+                                    lora_A.data.mul_(1 - logit_decay)
+                                    lora_B.data.mul_(1 - logit_decay)
+                                else:
+                                    free_logits.data.mul_(1 - logit_decay)
 
                     epoch_loss_total += batch_loss
                     for key, value in reg_log.items():
@@ -2729,7 +2796,8 @@ def pc_optimize_inputs(
             val_metrics = None
             # Validation
             if val_eval_every > 0 and (epoch + 1) % val_eval_every == 0 and val_pairs:
-                val_metrics = evaluate_shared_prompt(
+                _eval_fn = evaluate_shared_prompt_batched if use_batched_eval else evaluate_shared_prompt
+                val_metrics = _eval_fn(
                     free_logits=fl_epoch,
                     eval_pairs=val_pairs,
                     model=model,
