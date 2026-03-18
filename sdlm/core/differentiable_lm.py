@@ -1,8 +1,5 @@
 """
-sdlm/core/differentiable_lm.py
-
-Differentiable language model implementation using input_embeds for gradient flow.
-Integrates with DSPy while preserving gradients through transformer operations.
+Differentiable language model implementation using input embeddings for gradient flow.
 """
 
 import torch
@@ -10,9 +7,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import dspy
 from dspy.clients.lm import BaseLM
-from typing import List, Optional, Dict, Union
+from typing import Any, Dict, List, Optional, Union
 import warnings
 
+from .dspy_adapter import SDLMChatAdapter
+from .soft_str import SoftStr
 from .tensor_string import TensorString
 
 class DifferentiableLM(BaseLM):
@@ -92,13 +91,11 @@ class DifferentiableLM(BaseLM):
         Main DSPy interface
         """
         if messages is not None:
-            # Handle chat format
             prompt = self._messages_to_prompt(messages)
         elif prompt is None:
             raise ValueError("Prompt or messages must be provided.")
-        
-        if not isinstance(prompt, TensorString):
-            prompt = TensorString(str(prompt), model_name=self.model_name, device=self.device)
+
+        prompt = self._coerce_to_tensor_string(prompt)
         
         max_tokens = kwargs.pop('max_tokens', self.kwargs['max_tokens'])
         temperature = kwargs.pop('temperature', self.kwargs['temperature'])
@@ -131,7 +128,7 @@ class DifferentiableLM(BaseLM):
     
     def _messages_to_prompt(
         self,
-        messages: List[Dict[str, Union[str, TensorString]]]
+        messages: List[Dict[str, Any]]
     ) -> TensorString:
         """
         Convert chat messages format to prompt string.
@@ -142,24 +139,87 @@ class DifferentiableLM(BaseLM):
         Returns:
             str: Formatted prompt string
         """
-        prompt_parts = []
-        
+        prompt_parts: List[TensorString] = []
+        prompt_text_parts: List[str] = []
+
         for message in messages:
-            role = message.get('role', 'user')
-            content = message.get('content', '')
-            
-            if role == 'system':
-                #prompt_parts.append(f"System: {content}")
-                prompt_parts.append("System: "+content)
-            elif role == 'user':
-                prompt_parts.append("User: "+content)
-            elif role == 'assistant':
-                prompt_parts.append("Assistant: "+content)
+            role = message.get("role", "user")
+            raw_content = message.get("content", "")
+            content = self._coerce_to_tensor_string(raw_content)
+            role_prefix = TensorString(f"{role.capitalize()}: ", model_name=self.model_name, device=self.device)
+            prompt_parts.append(role_prefix + content)
+            prompt_text_parts.append(f"{role.capitalize()}: {self._render_content_as_text(raw_content)}")
+
+        prompt_parts.append(TensorString("Assistant:", model_name=self.model_name, device=self.device))
+        prompt_text_parts.append("Assistant:")
+        prompt = TensorString("\n", model_name=self.model_name, device=self.device).join(prompt_parts)
+        object.__setattr__(prompt, "_cached_str", "\n".join(prompt_text_parts))
+        return prompt
+
+    def _coerce_to_tensor_string(
+        self,
+        value: Any,
+    ) -> TensorString:
+        if isinstance(value, SoftStr):
+            return value.to_tensor_string(model_name=self.model_name, device=self.device)
+        if isinstance(value, TensorString):
+            if value._model_name != self.model_name:
+                if value.requires_grad:
+                    raise ValueError(
+                        "Gradient-carrying TensorString inputs must use the same tokenizer as the LM."
+                    )
+                return TensorString(str(value), model_name=self.model_name, device=self.device)
+            return value.to(self.device)
+        if isinstance(value, list):
+            return self._content_blocks_to_tensor_string(value)
+        return TensorString(str(value), model_name=self.model_name, device=self.device)
+
+    def _content_blocks_to_tensor_string(self, content_blocks: List[Any]) -> TensorString:
+        parts: List[TensorString] = []
+        for block in content_blocks:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(
+                        TensorString(
+                            block.get("text", ""),
+                            model_name=self.model_name,
+                            device=self.device,
+                        )
+                    )
+                else:
+                    parts.append(
+                        TensorString(
+                            str(block),
+                            model_name=self.model_name,
+                            device=self.device,
+                        )
+                    )
             else:
-                prompt_parts.append(role+": "+content)
-        
-        prompt_parts.append("Assistant:")  # Prompt for response
-        return TensorString("\n").join(prompt_parts)
+                parts.append(self._coerce_to_tensor_string(block))
+        if not parts:
+            return TensorString("", model_name=self.model_name, device=self.device)
+        result = parts[0]
+        for part in parts[1:]:
+            result = result + part
+        return result
+
+    def _render_content_as_text(self, value: Any) -> str:
+        if isinstance(value, SoftStr):
+            return value.text
+        if isinstance(value, TensorString):
+            return str(value)
+        if isinstance(value, list):
+            text_parts = []
+            for block in value:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    else:
+                        text_parts.append(str(block))
+                else:
+                    text_parts.append(self._render_content_as_text(block))
+            return "".join(text_parts)
+        return str(value)
     
     def _generate_with_gradients(
         self,
@@ -196,7 +256,7 @@ class DifferentiableLM(BaseLM):
             with torch.set_grad_enabled(True):
                 generated_embeds = self._generate_embeddings_autoregressive(
                     input_embeds=input_embeds,
-                    max_tokens=max_tokens,
+                    max_new_tokens=max_tokens,
                     temperature=temperature,
                     **kwargs,
                 )
@@ -357,7 +417,12 @@ class DifferentiableLM(BaseLM):
         start_embed = torch.randn(1, 1, embed_dim, device=self.device) * 0.1
         
         # Generate
-        generated_embeds = self._generate_embeddings(start_embed, max_tokens, temperature, **kwargs)
+        generated_embeds = self._generate_embeddings_autoregressive(
+            input_embeds=start_embed,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            **kwargs,
+        )
         
         return self._embeddings_to_tensor_string(generated_embeds, self.model_name)
     
@@ -451,7 +516,7 @@ class DifferentiableLM(BaseLM):
     
     def chat(
         self,
-        messages: List[Dict[str, Union[str, TensorString]]],
+        messages: List[Dict[str, Any]],
         **kwargs
     ) -> TensorString:
         """
@@ -564,7 +629,6 @@ def setup_dspy_with_differentiable_lm(
         Configured DifferentiableLM instance
     """
     lm = create_differentiable_lm(model_name, **kwargs)
-    dspy.configure(lm=lm)
-    print(f"✅ DSPy configured with DifferentiableLM({model_name})")
+    dspy.configure(lm=lm, adapter=SDLMChatAdapter())
+    print(f"✅ DSPy configured with DifferentiableLM({model_name}) and SDLMChatAdapter")
     return lm
-

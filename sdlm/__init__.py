@@ -1,5 +1,5 @@
 """
-SDLM (Straight-Through Gumbel-Softmax Differentiable Language Modelling)
+SDLM (Soft Differentiable Language Models)
 
 A library for differentiable text generation using Straight-Through Gumbel-Softmax.
 This module provides tensor-centric enhanced strings where PyTorch tensors are the 
@@ -11,20 +11,17 @@ from .stgs import STGS
 from .stgs_diff_model import STGSDiffModel
 from .stgs_diff_string import STGSDiffString
 
-import sys
-import builtins
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import Optional, Union, Dict, Any, Tuple, List
-import weakref
-
-# Store original string class
-_original_str = builtins.str   
+from typing import Optional, Union, List
+import warnings
 
 from .core.tensor_string import TensorString
 from .core.patching import DSPyPatcher, TensorStringContext
-from .core.differentiable_lm import DifferentiableLM
+from .core.soft_str import SoftStr
+from .core.dspy_adapter import SDLMChatAdapter
+from .core.differentiable_lm import DifferentiableLM, setup_dspy_with_differentiable_lm
 from .utils.factory_functions import (
     TensorStr,
     from_string,
@@ -39,7 +36,7 @@ from .utils.factory_functions import (
 
 class SDLMManager:
     """
-    Main SDLM system manager with selective patching capabilities.
+    Main SDLM system manager with DSPy compatibility helpers.
     
     This class manages the activation/deactivation of TensorString behavior
     and provides fine-grained control over which packages are affected.
@@ -59,7 +56,7 @@ class SDLMManager:
         """
         Configure default settings.
         """
-        TensorString.configure_model(self.default_model)
+        TensorString._default_model_name = self.default_model
         TensorString.set_global_device(self.default_device)
     
     def configure_default_model(
@@ -93,11 +90,13 @@ class SDLMManager:
         return TensorString.fluency_tokenizer()
     
     def get_default_model(self) -> AutoModelForCausalLM:
-        assert self.default_model in TensorString._model_cache, f"Default model {self.default_model} not found in cache"
+        if self.default_model not in TensorString._model_cache:
+            TensorString.configure_model(self.default_model)
         return TensorString._model_cache[self.default_model]
     
     def get_default_tokenizer(self) -> AutoTokenizer:
-        assert self.default_model in TensorString._tokenizer_cache, f"Default model {self.default_model} not found in cache"
+        if self.default_model not in TensorString._tokenizer_cache:
+            TensorString.configure_model(self.default_model)
         return TensorString._tokenizer_cache[self.default_model]
     
     def set_device(
@@ -113,38 +112,39 @@ class SDLMManager:
     
     def activate_for_dspy(self):
         """
-        Activate TensorString behavior specifically for DSPy modules.
-        Other packages (HuggingFace, etc.) remain unaffected.
+        Configure DSPy to use SDLM's adapter path instead of monkey-patching.
         """
         if self.is_dspy_patched:
-            print("SDLM: DSPy patching already active")
+            print("SDLM: DSPy integration already active")
             return
-        
-        try:
-            self.dspy_patcher.activate()
-            self.is_dspy_patched = True
-            print("✅ SDLM: Activated for DSPy - other packages preserved")
-            
-        except Exception as e:
-            print(f"❌ SDLM: Failed to activate DSPy patching: {e}")
-            raise
+
+        import dspy
+
+        warnings.warn(
+            "sdlm.activate_for_dspy() now configures the SDLMChatAdapter. "
+            "The old monkey-patching path is deprecated.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        dspy.configure(adapter=SDLMChatAdapter())
+        self.is_dspy_patched = True
+        print("✅ SDLM: Activated DSPy integration with SDLMChatAdapter")
     
     def deactivate_dspy(self):
         """
-        Deactivate DSPy-specific TensorString behavior.
+        Disable the SDLM DSPy adapter and restore unpatched DSPy settings.
         """
         if not self.is_dspy_patched:
-            print("SDLM: DSPy patching not active")
+            print("SDLM: DSPy integration not active")
             return
-        
-        try:
+
+        import dspy
+
+        dspy.configure(adapter=None)
+        if self.dspy_patcher.is_active:
             self.dspy_patcher.deactivate()
-            self.is_dspy_patched = False
-            print("✅ SDLM: DSPy patching deactivated")
-            
-        except Exception as e:
-            print(f"❌ SDLM: Failed to deactivate DSPy patching: {e}")
-            raise
+        self.is_dspy_patched = False
+        print("✅ SDLM: DSPy integration deactivated")
     
     def with_tensor_strings(self):
         """
@@ -188,7 +188,7 @@ _manager = SDLMManager()
 
 def activate_for_dspy():
     """
-    Activate TensorString behavior for DSPy only.
+    Activate SDLM's DSPy adapter path.
     
     This is the recommended way to enable gradient-based prompt optimization
     while preserving compatibility with other packages.
@@ -197,7 +197,7 @@ def activate_for_dspy():
 
 def deactivate():
     """
-    Deactivate all TensorString patching.
+    Deactivate SDLM's DSPy integration helpers.
     """
     _manager.deactivate_dspy()
 
@@ -237,6 +237,19 @@ def get_status():
 # ==========================================
 # Factory Functions
 # ==========================================
+
+def soft_str(
+    text: str,
+    model_name: Optional[str] = None,
+    requires_grad: bool = False,
+) -> SoftStr:
+    """
+    Create a `SoftStr` value for DSPy signatures.
+    """
+    value = SoftStr.from_string(text, model_name=model_name)
+    if requires_grad:
+        value.requires_grad_(True)
+    return value
 
 def from_string(
     text: str, 
@@ -523,13 +536,13 @@ def learnable_string_interpolation(
 # Shorter aliases for common functions
 String = from_string  # Alias for backwards compatibility
 TensorStr = from_string  # Alternative name
+SoftText = SoftStr  # Backwards-compatible alias while SoftStr is adopted.
 
 # ==========================================
 # Module Configuration
 # ==========================================
 
-# Set default configuration
-configure_default_model("distilbert/distilgpt2")
+TensorString._default_model_name = _manager.default_model
 
 # Auto-detect and configure device
 if torch.cuda.is_available():
@@ -546,6 +559,8 @@ else:
 __all__ = [
     # Core classes
     'TensorString',
+    'SoftStr',
+    'SDLMChatAdapter',
     'SDLMManager',
     'DifferentiableLM',
     
@@ -560,18 +575,21 @@ __all__ = [
     'get_status',
     
     # Factory functions
+    'soft_str',
     'from_string',
     'from_tensor', 
     'from_token_ids',
     'empty_tensor_string',
     'String',
     'TensorStr',
+    'SoftText',
     
     # Batch operations
     'batch_from_strings',
     
     # Language models
     'create_differentiable_lm',
+    'setup_dspy_with_differentiable_lm',
     
     # Optimization
     'create_prompt_optimizer',
@@ -585,7 +603,7 @@ __all__ = [
 __version__ = "2.1.0"
 __author__ = "SDLM Development Team"
 __email__ = "sdlm@example.com"
-__description__ = "String Deep Learning Module with Selective DSPy Integration"
+__description__ = "Soft Differentiable Language Models with DSPy integration"
 __url__ = "https://github.com/sdlm/sdlm"
 
 # ==========================================

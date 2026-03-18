@@ -1,6 +1,8 @@
-# SDLM: Straight-Through Gumbel-Softmax Differentiable Language Modelling
+# SDLM: Soft Differentiable Language Models
 
 SDLM is a Python library that provides differentiable text generation capabilities using the Straight-Through Gumbel-Softmax trick. It allows for gradient-based optimization through discrete token generation, making it useful for tasks that require end-to-end training with discrete text outputs.
+
+DSPy integration is implemented locally in this repository through `SoftStr`, `SDLMChatAdapter`, and `DifferentiableLM`. DSPy is expected to be installed as a pinned Python dependency rather than vendored as a submodule.
 
 ## Features
 
@@ -122,7 +124,7 @@ If you use SDLM in your research, please cite:
 ```
 @misc{sdlm,
   author = {Kevin Denamganaï},
-  title = {SDLM: Straight-Through Gumbel-Softmax Differentiable Language Modelling},
+  title = {SDLM: Soft Differentiable Language Models},
   year = {2025},
   publisher = {GitHub},
   journal = {GitHub repository},
