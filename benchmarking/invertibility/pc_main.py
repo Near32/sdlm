@@ -822,6 +822,140 @@ def pc_forward_pass_batched_tf(
     return losses, y_logits_list
 
 
+def pc_forward_pass_batched_free(
+    diff_model,
+    stgs_module,
+    loss_instances: List,
+    free_logits: Tensor,                         # (1, seq_len, vocab)
+    embedding_weights: Tensor,                   # (vocab, d)
+    x_embeds_list: List[Tensor],                 # [(1, x_len_i, d), ...]
+    E_embeds: Tensor,                            # (1, E_len, d)
+    Y_tokens_list: List[Tensor],                 # [(1, Y_len_i), ...]
+    max_new_tokens_reasoning: int,
+    max_new_tokens_answer: int,
+    bptt: bool = False,
+    gumbel_noise_scale: float = 1.0,
+    accumulate_embeds: bool = False,
+    stgs_noise_mode: str = "shared",
+) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+    """Batched free-generation forward pass (teacher_forcing_r=False).
+
+    Stage 1 — batched reasoning generate from [x_i | p_i].
+    Stage 2 — batched answer generate from [x_i | p_i | R_i | E].
+
+    bptt=False: R_embeds detached before stage 2 (no gradient through reasoning).
+    bptt=True:  R_embeds NOT detached — gradients flow stage-2 loss → R generation
+                → p_embeds → STGS → free_logits (same pattern as sdlm_optimizer.py).
+
+    Returns:
+        losses:        list of B scalar loss tensors (grad-connected)
+        y_logits_list: list of B (1, Y_len_i, vocab) detached tensors
+    """
+    B = len(x_embeds_list)
+    device = x_embeds_list[0].device
+    dtype  = x_embeds_list[0].dtype
+
+    # --- p_embeds ---
+    if stgs_noise_mode == "independent":
+        p_rows = []
+        for _ in range(B):
+            _, oh, _, _ = stgs_module(
+                free_logits, gumbel_noise_scale=gumbel_noise_scale,
+                embedding_weights=embedding_weights,
+            )
+            p_rows.append((oh @ embedding_weights.detach()).squeeze(0))
+        p_embeds_batch = torch.stack(p_rows, dim=0)
+    else:
+        _, oh, _, _ = stgs_module(
+            free_logits, gumbel_noise_scale=gumbel_noise_scale,
+            embedding_weights=embedding_weights,
+        )
+        p_embeds_batch = (oh @ embedding_weights.detach()).expand(B, -1, -1)
+
+    # --- Stage 1: reasoning generate from [x_i | p_i] ---
+    xp_seqs = [
+        torch.cat([x_embeds_list[i], p_embeds_batch[i:i+1]], dim=1)
+        for i in range(B)
+    ]
+    xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, dtype)
+    r_out = diff_model.generate(
+        inputs_embeds=xp_padded,
+        attention_mask=xp_mask,
+        max_new_tokens=max_new_tokens_reasoning,
+        output_normal_logits=False,
+        return_dict=True,
+        accumulate_embeds=accumulate_embeds,
+    )
+
+    with torch.no_grad():
+        R_tokens = r_out.sampled_diff_tokens          # (B, R_gen_len)
+        pad_id   = getattr(diff_model, "pad_token_id", 0) or 0
+        pad_mask = (R_tokens.long() == pad_id).long()
+        R_gen_len = R_tokens.shape[1]
+        raw_starts = pad_mask.argmax(dim=1)
+        padding_starts = torch.where(
+            raw_starts == 0,
+            torch.full_like(raw_starts, R_gen_len),
+            raw_starts,
+        )
+
+    # R soft embeddings.
+    # bptt=False: detach so gradients stop here (reasoning is treated as fixed).
+    # bptt=True:  keep grad — gradient flows from answer loss back through
+    #             reasoning generation to p_embeds → STGS → free_logits.
+    if r_out.sampled_diff_embeds is not None:
+        R_embeds = r_out.sampled_diff_embeds
+    else:
+        R_embeds = r_out.sampled_diff_one_hot @ embedding_weights.detach()
+    if not bptt:
+        R_embeds = R_embeds.detach()
+    # R_embeds: (B, R_gen_len, d)
+
+    # --- Stage 2: answer generate from [x_i | p_i | R_i[:trim] | E] ---
+    xpRE_seqs = []
+    for i in range(B):
+        trim = int(padding_starts[i].item())
+        xpRE_seqs.append(torch.cat([
+            x_embeds_list[i],
+            p_embeds_batch[i:i+1],
+            R_embeds[i:i+1, :trim, :],
+            E_embeds,
+        ], dim=1))
+    xpRE_padded, xpRE_mask = _left_pad_embed_sequences(xpRE_seqs, device, dtype)
+    y_out = diff_model.generate(
+        inputs_embeds=xpRE_padded,
+        attention_mask=xpRE_mask,
+        max_new_tokens=max_new_tokens_answer,
+        output_normal_logits=True,
+        return_dict=True,
+    )
+    # y_out.logits: (B, max_new_tokens_answer, vocab)
+
+    losses, y_logits_list = [], []
+    for i in range(B):
+        Y_len_i = Y_tokens_list[i].shape[1]
+        actual  = y_out.logits.shape[1]
+        if actual < Y_len_i:
+            pad = torch.zeros(
+                1, Y_len_i - actual, y_out.logits.shape[-1],
+                device=device, dtype=y_out.logits.dtype,
+            )
+            y_logits_i = torch.cat([y_out.logits[i:i+1], pad], dim=1)
+        else:
+            y_logits_i = y_out.logits[i:i+1, :Y_len_i, :]
+        d = loss_instances[i].compute_loss({
+            "generated_logits":    y_logits_i,
+            "prompt_logits":       free_logits,
+            "prompt_argmax_ids":   free_logits.argmax(dim=-1),
+            "completion_ids":      Y_tokens_list[i],
+            "tf_generated_logits": None,
+            "prompt_input_logits": free_logits,
+        })
+        losses.append(d["sumloss"])
+        y_logits_list.append(y_logits_i.detach())
+    return losses, y_logits_list
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
