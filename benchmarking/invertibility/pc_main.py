@@ -956,6 +956,61 @@ def pc_forward_pass_batched_free(
     return losses, y_logits_list
 
 
+def pc_forward_pass_batched(
+    diff_model,
+    stgs_module,
+    loss_instances: List,
+    free_logits: Tensor,
+    embedding_weights: Tensor,
+    x_embeds_list: List[Tensor],
+    R_gt_embeds_list: List[Optional[Tensor]],
+    E_embeds: Tensor,
+    Y_tokens_list: List[Tensor],
+    E_input_ids: Tensor,
+    teacher_forcing_r: bool,
+    bptt: bool,
+    reasoning_generation_backend: str,
+    reasoning_generate_kwargs: Optional[Dict[str, Any]],
+    max_new_tokens_reasoning: int,
+    max_new_tokens_answer: int,
+    gumbel_noise_scale: float = 1.0,
+    accumulate_embeds: bool = False,
+    stgs_noise_mode: str = "shared",
+) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+    """Dispatcher: routes to the appropriate batched implementation.
+
+    teacher_forcing_r=True  → pc_forward_pass_batched_tf (bptt irrelevant: no generation)
+    teacher_forcing_r=False → pc_forward_pass_batched_free (bptt controls R_embeds detach)
+
+    There is no serial fallback. bptt=True is handled inside pc_forward_pass_batched_free
+    by keeping R_embeds grad-connected, mirroring sdlm_optimizer.py.
+    """
+    if teacher_forcing_r:
+        return pc_forward_pass_batched_tf(
+            diff_model=diff_model, stgs_module=stgs_module,
+            loss_instances=loss_instances,
+            free_logits=free_logits, embedding_weights=embedding_weights,
+            x_embeds_list=x_embeds_list, R_gt_embeds_list=R_gt_embeds_list,
+            E_embeds=E_embeds, Y_tokens_list=Y_tokens_list,
+            gumbel_noise_scale=gumbel_noise_scale,
+            stgs_noise_mode=stgs_noise_mode,
+        )
+    else:
+        return pc_forward_pass_batched_free(
+            diff_model=diff_model, stgs_module=stgs_module,
+            loss_instances=loss_instances,
+            free_logits=free_logits, embedding_weights=embedding_weights,
+            x_embeds_list=x_embeds_list,
+            E_embeds=E_embeds, Y_tokens_list=Y_tokens_list,
+            max_new_tokens_reasoning=max_new_tokens_reasoning,
+            max_new_tokens_answer=max_new_tokens_answer,
+            bptt=bptt,
+            gumbel_noise_scale=gumbel_noise_scale,
+            accumulate_embeds=accumulate_embeds,
+            stgs_noise_mode=stgs_noise_mode,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
