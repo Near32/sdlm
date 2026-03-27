@@ -349,3 +349,61 @@ def build_prompt_optimizer(
             level_index=level_index,
         )
     return base_optimizer
+
+
+def build_lr_scheduler(
+    optimizer,
+    schedule: str,
+    total_epochs: int,
+    warmup_epochs: int = 0,
+    lr_min: float = 0.0,
+    step_size: int = 10,
+    gamma: float = 0.1,
+):
+    """Build an epoch-based LR scheduler. Returns None when schedule='none'.
+
+    Args:
+        optimizer: The prompt optimizer returned by build_prompt_optimizer().
+        schedule: One of 'none', 'cosine', 'linear', 'step', 'exponential'.
+        total_epochs: Total number of training epochs.
+        warmup_epochs: Epochs of linear warmup from ~0 to base LR before main schedule.
+        lr_min: Minimum LR for cosine/linear schedules (eta_min / end LR).
+        step_size: Period in epochs for StepLR (ignored by other schedules).
+        gamma: Multiplicative decay factor for step/exponential schedules.
+    """
+    if schedule == "none":
+        return None
+
+    warmup_epochs = max(0, min(warmup_epochs, total_epochs - 1))
+    main_epochs = max(1, total_epochs - warmup_epochs)
+
+    if schedule == "cosine":
+        main_sched = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=main_epochs, eta_min=lr_min
+        )
+    elif schedule == "linear":
+        base_lr = optimizer.param_groups[0]["lr"]
+        end_factor = max(lr_min / base_lr, 1e-8) if base_lr > 0 else 1e-8
+        main_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=end_factor, total_iters=main_epochs
+        )
+    elif schedule == "step":
+        main_sched = optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=gamma
+        )
+    elif schedule == "exponential":
+        main_sched = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+    else:
+        raise ValueError(
+            f"Unknown lr_schedule: {schedule!r}. "
+            "Choose from: none, cosine, linear, step, exponential"
+        )
+
+    if warmup_epochs > 0:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_epochs
+        )
+        return optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, main_sched], milestones=[warmup_epochs]
+        )
+    return main_sched
