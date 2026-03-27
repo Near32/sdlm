@@ -627,6 +627,22 @@ def parse_args():
     parser.add_argument("--temperatureLossCouplingLambda", type=float, default=0.0,
                         help="Weight for loss-coupled temperature regularization: "
                              "reg = λ * L_main.detach() / τ pushes τ up when loss is high (0=disabled)")
+    parser.add_argument("--temperature_reset_epoch", type=int, default=0,
+                        help="Reset learnable temperature_param every N epochs to un-saturate the "
+                             "softmax Jacobian (0 = disabled)")
+    parser.add_argument("--temperature_reset_value", type=float, default=0.0,
+                        help="Effective temperature to reset to (0.0 = use init_temperature)")
+    parser.add_argument("--snr_homeostasis_lambda", type=float, default=0.0,
+                        help="Weight for SNR-homeostatic temperature regularization (0 = disabled). "
+                             "Provides unbiased upward gradient for temperature_param, correcting "
+                             "the collapse induced by the straight-through estimator bias.")
+    parser.add_argument("--snr_homeostasis_target_temperature", type=float, default=10.0,
+                        help="Target effective temperature at average-SNR positions")
+    parser.add_argument("--snr_homeostasis_alpha", type=float, default=0.5,
+                        help="SNR sensitivity exponent: T_target_i = target_T * (SNR_i/mean_SNR)^alpha")
+    parser.add_argument("--snr_homeostasis_mode", type=str, default="one_sided",
+                        choices=["one_sided", "mse"],
+                        help="'one_sided': push T up only when T < target; 'mse': symmetric")
 
     # Prompt distribution entropy regularization (opt-in)
     parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
@@ -672,6 +688,9 @@ def parse_args():
     parser.add_argument("--stgs_output_dropout", type=float, default=0.0,
                         help="Dropout applied to y_soft (after softmax, before hard sampling) "
                              "(0 = disabled). F.dropout zeros ~p of prob entries and rescales by 1/(1-p).")
+    parser.add_argument("--stgs_output_top_k", type=int, default=0,
+                        help="Top-k filter on y_soft after Gumbel-Softmax, before hard sampling "
+                             "(0 = disabled). Zeros non-top-k probs and renormalises to sum=1.")
 
     # LoRA-factored prompt logits (opt-in)
     parser.add_argument("--logits_lora_rank", type=int, default=0,
@@ -694,6 +713,8 @@ def parse_args():
     parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
                         choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
                         help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_spike", type=float, default=10.0,
+                        help="Logit value placed at the snapped token position in legacy (non-top-k) reinit mode")
     parser.add_argument("--discrete_reinit_entropy_threshold", type=float, default=0.0,
                         help="Per-position entropy threshold for discrete reinit. 0 disables it.")
     parser.add_argument("--discrete_reinit_embsim_probs", type=str, default="input_logits",
@@ -734,6 +755,12 @@ def parse_args():
                         help="Mask LM attention to EoS-sampled positions. "
                              "When ON: no LM-attention gradient flows back through EoS positions. "
                              "Gradient still flows through the gate (length_alpha) and STGS.")
+    parser.add_argument("--prompt_length_expand_every", type=int, default=0,
+                        help="Curriculum mode: expand active positions every N epochs (0=learned mode)")
+    parser.add_argument("--prompt_length_init_n", type=int, default=1,
+                        help="Curriculum mode: initial number of active positions from the right")
+    parser.add_argument("--prompt_length_expand_by", type=int, default=1,
+                        help="Curriculum mode: positions added per expansion step")
 
     return parser.parse_args()
 

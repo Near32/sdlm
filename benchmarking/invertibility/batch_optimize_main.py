@@ -19,6 +19,11 @@ from metrics_aggregator import MetricsAggregator
 from metrics_logging import MetricsLogger
 from evaluation_utils import evaluate_generated_output, evaluate_prompt_reconstruction
 from main import optimize_inputs
+from generate_gt_prompt_output_dataset import (
+    load_wikipedia_dataset,
+    extract_wikipedia_prompt,
+    generate_random_prompt_tokens,
+)
 
 logger = logging.getLogger("batch_optimize")
 logging.basicConfig(level=logging.INFO, 
@@ -107,6 +112,104 @@ def load_dataset(dataset_path: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
         raise
+
+
+def build_dataset_from_source(
+    dataset_source: str,
+    tokenizer,
+    target_length: int,
+    num_samples: int,
+    dataset_seed: int,
+    random_sentence: bool = False,
+    random_start: bool = False,
+    wikipedia_split: str = "train",
+    cache_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build an in-memory dataset from a named source (wikipedia or random).
+
+    Targets are raw text slices — no LM generation is performed.
+    The returned dict has the same schema as load_dataset().
+
+    Args:
+        dataset_source: "wikipedia" or "random"
+        tokenizer: HuggingFace tokenizer (for encode/decode)
+        target_length: Number of tokens per target text
+        num_samples: Number of samples to draw
+        dataset_seed: Seed for reproducible random selection
+        random_sentence: (Wikipedia) Pick a random sentence from the article
+        random_start: (Wikipedia) Use a random start position within the text
+        wikipedia_split: HuggingFace dataset split (default "train")
+        cache_dir: Optional cache directory for HuggingFace datasets
+
+    Returns:
+        Dataset dict with "metadata" and "samples" keys
+    """
+    import random as _random
+    from datetime import datetime
+
+    _random.seed(dataset_seed)
+
+    metadata = {
+        "evaluation_type": "output_match",
+        "dataset_source": dataset_source,
+        "target_length": target_length,
+        "num_samples": num_samples,
+        "dataset_seed": dataset_seed,
+        "created_at": datetime.now().isoformat(),
+    }
+    if dataset_source == "wikipedia":
+        metadata["wikipedia_split"] = wikipedia_split
+        metadata["random_sentence"] = random_sentence
+        metadata["random_start"] = random_start
+
+    samples = []
+
+    if dataset_source == "wikipedia":
+        wiki_data = load_wikipedia_dataset(wikipedia_split, cache_dir)
+        indices = list(range(len(wiki_data)))
+        _random.shuffle(indices)
+        ptr = 0
+        sample_idx = 0
+        while sample_idx < num_samples:
+            if ptr >= len(indices):
+                logger.warning("Exhausted Wikipedia dataset, recycling indices")
+                _random.shuffle(indices)
+                ptr = 0
+            article = wiki_data[indices[ptr]]
+            ptr += 1
+            text = article.get("maintext", "") or article.get("text", "")
+            tokens = extract_wikipedia_prompt(
+                text, tokenizer, target_length,
+                random_sentence=random_sentence,
+                random_start=random_start,
+            )
+            if tokens is None:
+                continue
+            samples.append({
+                "id": f"wikipedia_{sample_idx}",
+                "text": tokenizer.decode(tokens, skip_special_tokens=False),
+                "target_output_tokens": tokens,
+                "output_length": target_length,
+                "k_target": 1,
+            })
+            sample_idx += 1
+
+    elif dataset_source == "random":
+        for i in range(num_samples):
+            tokens = generate_random_prompt_tokens(tokenizer, target_length)
+            samples.append({
+                "id": f"random_{i}",
+                "text": tokenizer.decode(tokens, skip_special_tokens=False),
+                "target_output_tokens": tokens,
+                "output_length": target_length,
+                "k_target": 1,
+            })
+    else:
+        raise ValueError(f"Unknown dataset_source: {dataset_source!r}. Use 'wikipedia' or 'random'.")
+
+    logger.info(f"Built {len(samples)} samples from source '{dataset_source}'")
+    return {"metadata": metadata, "samples": samples}
 
 
 def is_prompt_reconstruction_dataset(dataset: Dict[str, Any]) -> bool:
@@ -246,6 +349,8 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
             log_every=int(config.get("diversity_log_every", 10)),
         )
 
+    _mas_metric_every = int(config.get("mas_metric_every", 0))
+
     # Optimize inputs for this target
     opt_result = optimize_inputs(
         model=model,
@@ -379,8 +484,15 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         temperature_anneal_reg_lambda=config.get("temperatureAnnealRegLambda", 0.0),
         temperature_anneal_reg_mode=config.get("temperatureAnnealRegMode", "mse"),
         temperature_loss_coupling_lambda=config.get("temperatureLossCouplingLambda", 0.0),
+        snr_homeostasis_lambda=config.get("snr_homeostasis_lambda", 0.0),
+        snr_homeostasis_target_temperature=config.get("snr_homeostasis_target_temperature", 10.0),
+        snr_homeostasis_alpha=config.get("snr_homeostasis_alpha", 0.5),
+        snr_homeostasis_mode=config.get("snr_homeostasis_mode", "one_sided"),
+        temperature_reset_epoch=config.get("temperature_reset_epoch", 0),
+        temperature_reset_value=config.get("temperature_reset_value", 0.0),
         discrete_reinit_epoch=config.get("discrete_reinit_epoch", 0),
         discrete_reinit_snap=config.get("discrete_reinit_snap", "argmax"),
+        discrete_reinit_spike=config.get("discrete_reinit_spike", 10.0),
         discrete_reinit_prob=config.get("discrete_reinit_prob", 1.0),
         discrete_reinit_topk=config.get("discrete_reinit_topk", 0),
         discrete_reinit_entropy_threshold=config.get("discrete_reinit_entropy_threshold", 0.0),
@@ -391,6 +503,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         adaptive_gumbel_noise_min_scale=config.get("adaptive_gumbel_noise_min_scale", 0.0),
         stgs_input_dropout=config.get("stgs_input_dropout", 0.0),
         stgs_output_dropout=config.get("stgs_output_dropout", 0.0),
+        stgs_output_top_k=config.get("stgs_output_top_k", 0),
         logits_lora_rank=config.get("logits_lora_rank", 0),
         # Learnable prompt length
         prompt_length_learnable=config.get("prompt_length_learnable", False),
@@ -399,6 +512,9 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         prompt_length_reg_lambda=config.get("prompt_length_reg_lambda", 0.0),
         prompt_length_eos_spike=config.get("prompt_length_eos_spike", 10.0),
         prompt_length_mask_eos_attention=config.get("prompt_length_mask_eos_attention", False),
+        prompt_length_expand_every=config.get("prompt_length_expand_every", 0),
+        prompt_length_init_n=config.get("prompt_length_init_n", 1),
+        prompt_length_expand_by=config.get("prompt_length_expand_by", 1),
         logit_decay=config.get("logit_decay", 0.0),
         ppo_kl_lambda=config.get("ppo_kl_lambda", 0.0),
         ppo_kl_mode=config.get("ppo_kl_mode", "soft"),
@@ -418,6 +534,7 @@ def optimize_for_target(target_info: Dict[str, Any], model, tokenizer, device: s
         superposition_vocab_num_texts=config.get("superposition_vocab_num_texts", 1000),
         superposition_entropy_temperature=config.get("superposition_entropy_temperature", 1.0),
         superposition_output_dir=str(target_output_dir / "superposition"),
+        mas_metric_every=_mas_metric_every,
         kwargs=config,
     )
 
@@ -727,53 +844,94 @@ def process_targets_parallel(targets: List[Dict[str, Any]], model, tokenizer, co
 
     return results
 
-def batch_optimize(dataset_path: str, model_name: str, output_dir: str, 
-                  config: Dict[str, Any], num_workers: int = 1, 
+def batch_optimize(dataset_path: Optional[str], model_name: str, output_dir: str,
+                  config: Dict[str, Any], num_workers: int = 1,
                   target_indices: Optional[List[int]] = None,
                   metric_groups: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Optimize prompts for multiple target sentences.
-    
+
     Args:
-        dataset_path: Path to the dataset file
+        dataset_path: Path to the dataset file (None when using dataset_source)
         model_name: Name of the language model to use
         output_dir: Directory to save results
         config: Dictionary of optimization parameters
         num_workers: Number of parallel workers (if 1, runs sequentially)
         target_indices: Optional list of indices to select specific targets
         metric_groups: List of metric groups to compute
-        
+
     Returns:
         summary: Dictionary with optimization summary
     """
+    import json
+
     # Create run ID for grouping
     run_id = wandb.util.generate_id()
     logger.info(f"Starting batch optimization with run ID: {run_id}")
-    
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-    
+
     # Set random seeds
     seed = config.get("seed", 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
-    # Load dataset and prepare targets
-    dataset = load_dataset(dataset_path)
+
+    # Resolve dataset: inline source or file path
+    use_dataset_source = config.get("use_dataset_source", False)
+    sampled_dataset_path: Optional[Path] = None
+
+    if use_dataset_source:
+        dataset_source = config.get("dataset_source")
+        if not dataset_source:
+            raise ValueError("--dataset_source must be provided when --use_dataset_source is set")
+
+        # Model/tokenizer needed to encode text; load early here
+        model, tokenizer = setup_model_and_tokenizer(
+            model_name,
+            device,
+            model_precision=config.get("model_precision", "full")
+        )
+
+        dataset = build_dataset_from_source(
+            dataset_source=dataset_source,
+            tokenizer=tokenizer,
+            target_length=config.get("target_length", 20),
+            num_samples=config.get("num_samples", 100),
+            dataset_seed=config.get("dataset_seed", 42),
+            random_sentence=config.get("random_sentence", False),
+            random_start=config.get("random_start", False),
+            wikipedia_split=config.get("wikipedia_split", "train"),
+            cache_dir=config.get("dataset_cache_dir"),
+        )
+
+        # Persist the sampled dataset to output_dir
+        output_path_root = Path(output_dir)
+        output_path_root.mkdir(parents=True, exist_ok=True)
+        tl = config.get("target_length", 20)
+        ns = config.get("num_samples", 100)
+        ds = config.get("dataset_seed", 42)
+        sampled_dataset_path = output_path_root / f"dataset_{dataset_source}_TL{tl}_N{ns}_seed{ds}.json"
+        with open(sampled_dataset_path, "w") as f:
+            json.dump(dataset, f, indent=2)
+        logger.info(f"Sampled dataset saved to {sampled_dataset_path}")
+    else:
+        if not dataset_path:
+            raise ValueError("Either --dataset_path or --use_dataset_source must be provided")
+        dataset = load_dataset(dataset_path)
+        model, tokenizer = setup_model_and_tokenizer(
+            model_name,
+            device,
+            model_precision=config.get("model_precision", "full")
+        )
+
     targets = prepare_targets(dataset, target_indices)
 
     # Detect if this is a SODA-style prompt reconstruction dataset
     prompt_reconstruction_mode = is_prompt_reconstruction_dataset(dataset)
     if prompt_reconstruction_mode:
         logger.info("Running in SODA-style prompt reconstruction evaluation mode")
-
-    # Initialize model and tokenizer
-    model, tokenizer = setup_model_and_tokenizer(
-        model_name,
-        device,
-        model_precision=config.get("model_precision", "full")
-    )
 
     # Create output directory
     full_output_dir = f"{output_dir}/{run_id}"
@@ -833,7 +991,24 @@ def batch_optimize(dataset_path: str, model_name: str, output_dir: str,
         name=f"batch_optimization_{run_id}",
         job_type="batch_coordination"
     )
-    
+
+    # Log sampled dataset as a W&B artifact when built from source
+    if sampled_dataset_path is not None and config.get("wandb_project"):
+        try:
+            tl = config.get("target_length", 20)
+            ns = config.get("num_samples", 100)
+            ds = config.get("dataset_seed", 42)
+            artifact = wandb.Artifact(
+                name=f"dataset_{dataset_source}_TL{tl}_N{ns}_seed{ds}",
+                type="dataset",
+                metadata=dataset.get("metadata", {}),
+            )
+            artifact.add_file(str(sampled_dataset_path))
+            wandb.log_artifact(artifact)
+            logger.info("Sampled dataset logged to W&B as artifact")
+        except Exception as e:
+            logger.warning(f"Failed to log sampled dataset to W&B: {e}")
+
     # Populate summary table with individual target results
     for target in targets:
         target_id = target["id"]
@@ -931,8 +1106,27 @@ def build_parser(description: str = "Batch optimize prompts for multiple target 
     parser = argparse.ArgumentParser(description=description)
     
     # Dataset parameters
-    parser.add_argument("--dataset_path", type=str, required=True,
+    parser.add_argument("--dataset_path", type=str, default=None,
                         help="Path to the dataset file containing target sentences")
+    parser.add_argument("--use_dataset_source", type=str2bool, default=False,
+                        help="Build dataset inline from --dataset_source instead of loading --dataset_path")
+    parser.add_argument("--dataset_source", type=str, default=None,
+                        choices=["wikipedia", "random"],
+                        help="Dataset source to use when --use_dataset_source is set")
+    parser.add_argument("--dataset_seed", type=int, default=42,
+                        help="Random seed for reproducible sample selection from dataset source")
+    parser.add_argument("--target_length", type=int, default=20,
+                        help="Number of tokens per target text when building from dataset source")
+    parser.add_argument("--num_samples", type=int, default=100,
+                        help="Number of samples to draw when building from dataset source")
+    parser.add_argument("--random_sentence", type=str2bool, default=False,
+                        help="(Wikipedia) Sample a random sentence from each article")
+    parser.add_argument("--random_start", type=str2bool, default=False,
+                        help="(Wikipedia) Use a random start position within the sentence/text")
+    parser.add_argument("--wikipedia_split", type=str, default="train",
+                        help="HuggingFace Wikipedia dataset split (default: train)")
+    parser.add_argument("--dataset_cache_dir", type=str, default=None,
+                        help="Cache directory for HuggingFace datasets")
     
     # Model parameters
     parser.add_argument("--model_name", type=str, default="HuggingFaceTB/SmolLM-135M",
@@ -1289,6 +1483,22 @@ def build_parser(description: str = "Batch optimize prompts for multiple target 
     parser.add_argument("--temperatureLossCouplingLambda", type=float, default=0.0,
                         help="Weight for loss-coupled temperature regularization: "
                              "reg = λ * L_main.detach() / τ pushes τ up when loss is high (0=disabled)")
+    parser.add_argument("--snr_homeostasis_lambda", type=float, default=0.0,
+                        help="Weight for SNR-homeostatic temperature regularization (0 = disabled). "
+                             "Provides unbiased upward gradient for temperature_param, correcting "
+                             "the collapse induced by the straight-through estimator bias.")
+    parser.add_argument("--snr_homeostasis_target_temperature", type=float, default=10.0,
+                        help="Target effective temperature at average-SNR positions")
+    parser.add_argument("--snr_homeostasis_alpha", type=float, default=0.5,
+                        help="SNR sensitivity exponent: T_target_i = target_T * (SNR_i/mean_SNR)^alpha")
+    parser.add_argument("--snr_homeostasis_mode", type=str, default="one_sided",
+                        choices=["one_sided", "mse"],
+                        help="'one_sided': push T up only when T < target; 'mse': symmetric")
+    parser.add_argument("--temperature_reset_epoch", type=int, default=0,
+                        help="Reset learnable temperature_param every N epochs to un-saturate the "
+                             "softmax Jacobian (0 = disabled)")
+    parser.add_argument("--temperature_reset_value", type=float, default=0.0,
+                        help="Effective temperature to reset to (0.0 = use init_temperature)")
 
     # Prompt distribution entropy regularization (opt-in)
     parser.add_argument("--promptDistEntropyLambda", type=float, default=0.0,
@@ -1350,6 +1560,9 @@ def build_parser(description: str = "Batch optimize prompts for multiple target 
     parser.add_argument("--stgs_output_dropout", type=float, default=0.0,
                         help="Dropout applied to y_soft (after softmax, before hard sampling) "
                              "(0 = disabled). F.dropout zeros ~p of prob entries and rescales by 1/(1-p).")
+    parser.add_argument("--stgs_output_top_k", type=int, default=0,
+                        help="Top-k filter on y_soft after Gumbel-Softmax, before hard sampling "
+                             "(0 = disabled). Zeros non-top-k probs and renormalises to sum=1.")
 
     # LoRA-factored prompt logits (opt-in)
     parser.add_argument("--logits_lora_rank", type=int, default=0,
@@ -1389,12 +1602,19 @@ def build_parser(description: str = "Batch optimize prompts for multiple target 
     parser.add_argument("--superposition_entropy_temperature", type=float, default=1.0,
                         help="Temperature used in softmax(score/T) for entropy over (i,j) pairs.")
 
+    # MAS rotational metric (opt-in; requires logits_lora_rank > 0)
+    parser.add_argument("--mas_metric_every", type=int, default=0,
+                        help="Compute MAS rotational metric every N epochs (0 = disabled; "
+                             "requires logits_lora_rank > 0).")
+
     # Periodic discrete reinitialization (opt-in)
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
                         help="Snap free_logits to discrete projection every N epochs (0 = disabled)")
     parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
                         choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
                         help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_spike", type=float, default=10.0,
+                        help="Logit value placed at the snapped token position in legacy (non-top-k) reinit mode")
     parser.add_argument("--discrete_reinit_prob", type=float, default=1.0,
                         help="In top-k discrete reinit mode, probability mass assigned to the snapped token "
                              "(1.0 keeps legacy spike behavior when discrete_reinit_topk=0).")
@@ -1444,6 +1664,12 @@ def build_parser(description: str = "Batch optimize prompts for multiple target 
                         help="Mask LM attention to EoS-sampled positions. "
                              "When ON: no LM-attention gradient flows back through EoS positions. "
                              "Gradient still flows through the gate (length_alpha) and STGS.")
+    parser.add_argument("--prompt_length_expand_every", type=int, default=0,
+                        help="Curriculum mode: expand active positions every N epochs (0=learned mode)")
+    parser.add_argument("--prompt_length_init_n", type=int, default=1,
+                        help="Curriculum mode: initial number of active positions from the right")
+    parser.add_argument("--prompt_length_expand_by", type=int, default=1,
+                        help="Curriculum mode: positions added per expansion step")
 
     parser.add_argument("--assemble_strategy", type=str, default="identity",
                         choices=["identity", "product_of_speaker"],
@@ -1491,24 +1717,27 @@ def apply_loss_arg_expansions(args):
 def main():
     """Main entry point."""
     args = parse_args()
-    #if args.decouple_learnable_temperature \
-    #and not args.learnable_temperature:
-    #    raise ValueError("decouple_learnable_temperature requires learnable_temperature")
+
+    # Validate: must have either --dataset_path or --use_dataset_source
+    if not args.use_dataset_source and not args.dataset_path:
+        raise ValueError("Provide either --dataset_path or --use_dataset_source with --dataset_source")
+    if args.use_dataset_source and not args.dataset_source:
+        raise ValueError("--use_dataset_source requires --dataset_source (wikipedia or random)")
 
     # Parse target indices if provided
     target_indices = None
     if args.target_indices:
         target_indices = [int(idx) for idx in args.target_indices.split(",")]
-    
+
     # Parse metric groups if provided
     metric_groups = str2list(args.metric_groups)
     skip_metric_groups = str2list(args.skip_metric_groups)
-    
+
     apply_loss_arg_expansions(args)
 
     # Prepare configuration dictionary
     config = vars(args)
-    
+
     # Run batch optimization
     batch_optimize(
         dataset_path=args.dataset_path,

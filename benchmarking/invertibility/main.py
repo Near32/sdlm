@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import argparse
 import copy
+import math
 import wandb
 import matplotlib.pyplot as plt
 from functools import partial
@@ -1436,9 +1437,18 @@ def optimize_inputs(
     temperature_anneal_reg_lambda: float = 0.0,   # 0 = disabled
     temperature_anneal_reg_mode: str = "mse",      # "mse" or "one_sided"
     temperature_loss_coupling_lambda: float = 0.0, # 0 = disabled; reg = λ*L/τ → pushes τ up when loss is high
+    # SNR-homeostatic temperature regularization
+    snr_homeostasis_lambda: float = 0.0,              # 0 = disabled
+    snr_homeostasis_target_temperature: float = 10.0, # target T at average-SNR positions
+    snr_homeostasis_alpha: float = 0.5,               # SNR sensitivity exponent
+    snr_homeostasis_mode: str = "one_sided",           # "one_sided" (push up only) or "mse"
+    # Periodic temperature reset
+    temperature_reset_epoch: int = 0,    # 0 = disabled; N = reset temperature_param every N epochs
+    temperature_reset_value: float = 0.0, # effective temp to reset to; 0.0 = use init_temperature
     # Periodic discrete reinitialization
     discrete_reinit_epoch: int = 0,       # 0 = disabled; N = reinitialize every N epochs
     discrete_reinit_snap: str = "argmax", # "argmax" | "embsim-dot" | "embsim-cos"
+    discrete_reinit_spike: float = 10.0,  # logit value placed at snapped token in legacy mode
     discrete_reinit_prob: float = 1.0,    # snapped-token probability in top-k reinit mode
     discrete_reinit_topk: int = 0,        # preserve top-k pre-reinit tokens with residual mass
     discrete_reinit_entropy_threshold: float = 0.0,  # 0 = disabled; >0 reinit low-entropy positions
@@ -1451,6 +1461,7 @@ def optimize_inputs(
     # Input- and output-distribution dropout for STGS
     stgs_input_dropout: float = 0.0,
     stgs_output_dropout: float = 0.0,
+    stgs_output_top_k: int = 0,
     # Learnable prompt length via soft EoS masking
     prompt_length_learnable: bool = False,
     prompt_length_alpha_init: float = 0.0,
@@ -1458,6 +1469,10 @@ def optimize_inputs(
     prompt_length_reg_lambda: float = 0.0,
     prompt_length_eos_spike: float = 10.0,
     prompt_length_mask_eos_attention: bool = False,
+    # Curriculum mode: hard epoch-driven right-to-left activation (expand_every > 0 enables)
+    prompt_length_expand_every: int = 0,   # 0 = learned mode; >0 = curriculum mode
+    prompt_length_init_n: int = 1,         # initial active positions from the right
+    prompt_length_expand_by: int = 1,      # positions added per expansion step
     # Exponential logit weight decay (multiplicative, applied after each optimizer step)
     logit_decay: float = 0.0,  # 0 = disabled; e.g. 0.999 for mild decay
     # PPO-KL distributional trust-region regularizer
@@ -1481,6 +1496,8 @@ def optimize_inputs(
     superposition_output_dir: Optional[str] = ".",
     # Diversity analysis callback (opt-in)
     diversity_callback: Optional[Callable[[int, torch.Tensor], dict]] = None,
+    # MAS rotational metric (opt-in; requires logits_lora_rank > 0)
+    mas_metric_every: int = 0,
     # Logit assembly callback / strategy
     assemble_strategy: str = "identity",
     assemble_callback: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
@@ -2003,15 +2020,13 @@ def optimize_inputs(
             )
         parameters.append(free_logits)
 
-    # --- Learnable prompt length via soft EoS masking ---
+    # --- Learnable prompt length via soft EoS masking (learned) or hard curriculum ---
     length_alpha = None
     eos_logit_template = None
     eos_allowed_idx = -1  # index of EoS in allowed_tokens space (-1 if absent)
+    _n_active = None      # mutable [int] for curriculum mode; None = learned mode
 
     if prompt_length_learnable and n_free > 1:
-        length_alpha = torch.tensor(float(prompt_length_alpha_init), requires_grad=True, device=device)
-        parameters.append(length_alpha)
-
         eos_token_id = tokenizer.eos_token_id or tokenizer.pad_token_id or 0
         eos_matches = (allowed_tokens == eos_token_id).nonzero(as_tuple=True)[0]
         eos_logit_template = torch.zeros(1, 1, allowed_vocab_size, device=device)
@@ -2024,12 +2039,26 @@ def optimize_inputs(
                 "uniform distributions. Consider setting --filter_vocab false."
             )
 
-        logging.info(
-            f"Learnable prompt length: alpha_init={prompt_length_alpha_init}, "
-            f"beta={prompt_length_beta}, reg_lambda={prompt_length_reg_lambda}, "
-            f"eos_token_id={eos_token_id} (allowed_idx={eos_allowed_idx}), "
-            f"mask_eos_attention={prompt_length_mask_eos_attention}"
-        )
+        if prompt_length_expand_every > 0:
+            # --- Curriculum mode: hard epoch-driven right-to-left activation ---
+            _n_active = [max(1, min(prompt_length_init_n, n_free))]
+            logging.info(
+                f"Prompt length curriculum: init_n={_n_active[0]}, "
+                f"expand_every={prompt_length_expand_every}, "
+                f"expand_by={prompt_length_expand_by}, "
+                f"eos_token_id={eos_token_id} (allowed_idx={eos_allowed_idx}), "
+                f"mask_eos_attention={prompt_length_mask_eos_attention}"
+            )
+        else:
+            # --- Learned mode (original): soft differentiable gate ---
+            length_alpha = torch.tensor(float(prompt_length_alpha_init), requires_grad=True, device=device)
+            parameters.append(length_alpha)
+            logging.info(
+                f"Learnable prompt length: alpha_init={prompt_length_alpha_init}, "
+                f"beta={prompt_length_beta}, reg_lambda={prompt_length_reg_lambda}, "
+                f"eos_token_id={eos_token_id} (allowed_idx={eos_allowed_idx}), "
+                f"mask_eos_attention={prompt_length_mask_eos_attention}"
+            )
     elif prompt_length_learnable and n_free <= 1:
         logging.warning(
             "prompt_length_learnable=True requires n_free > 1; feature disabled for this run."
@@ -2071,8 +2100,22 @@ def optimize_inputs(
         """Return the raw free logits tensor (LoRA product or bare free_logits)."""
         return lora_A @ lora_B if lora_A is not None else free_logits
 
+    def _free_active():
+        """Apply curriculum hard mask (right-to-left) when in curriculum mode; else return _free()."""
+        base = _free()
+        if _n_active is None or _n_active[0] >= n_free:
+            return base
+        n_act = _n_active[0]
+        # Rightmost n_act positions are active; leftmost (n_free - n_act) get EoS-spike (detached).
+        return torch.cat([
+            eos_logit_template.expand(1, n_free - n_act, -1).detach(),
+            base[:, n_free - n_act:, :],
+        ], dim=1)
+
     if fixed_prefix is None and fixed_suffix is None:
         def _assemble_base_logits():
+            if _n_active is not None:
+                return _free_active()
             if length_alpha is None:
                 return _free()
             lambda_t = n_free * torch.sigmoid(length_alpha)
@@ -2082,7 +2125,9 @@ def optimize_inputs(
             return gates_3d * _free() + (1.0 - gates_3d) * eos_logit_template
     else:
         def _assemble_base_logits():
-            if length_alpha is None:
+            if _n_active is not None:
+                active_free = _free_active()
+            elif length_alpha is None:
                 active_free = _free()
             else:
                 lambda_t = n_free * torch.sigmoid(length_alpha)
@@ -2154,6 +2199,7 @@ def optimize_inputs(
             logits_normalize=logits_normalize,
             input_dropout=stgs_input_dropout,
             output_dropout=stgs_output_dropout,
+            output_top_k=stgs_output_top_k,
             eps=eps,
             device=device,
         )
@@ -2445,8 +2491,15 @@ def optimize_inputs(
         "prompt_exact_match": [],
         "prompt_lcs_ratio": [],
         "prompt_cosine_similarity": [],
-        "prompt_gt_token_rank_mean": [],         # mean rank (scalar per epoch)
-        "prompt_gt_token_rank_per_position": [],  # list of per-pos ranks (list per epoch)
+        "prompt_gt_token_rank_mean": [],               # mean rank (scalar per epoch)
+        "prompt_gt_token_rank_min": [],                # min rank across positions
+        "prompt_gt_token_rank_max": [],                # max rank across positions
+        "prompt_gt_token_rank_mrr": [],                # mean reciprocal rank across positions
+        "prompt_gt_token_rank_per_position": [],       # list of per-pos ranks (list per epoch)
+        "prompt_gt_token_logit_entropy_mean": [],      # mean H(softmax(logits)) across positions
+        "prompt_gt_token_logit_entropy_min": [],       # min entropy across positions
+        "prompt_gt_token_logit_entropy_max": [],       # max entropy across positions
+        "prompt_gt_token_logit_entropy_per_position": [],  # list of per-pos entropies (list per epoch)
     }
     track_prompt_metrics = ground_truth_prompt_tokens is not None
 
@@ -2496,6 +2549,29 @@ def optimize_inputs(
     for epoch in pbar:
         optimizer.zero_grad()
 
+        # Curriculum mode: force inactive temperature positions to eff_temp=1.0 before every
+        # forward pass. Without this, a high init_temperature (e.g. 100) washes out the EoS
+        # spike (e.g. softmax(100/100) ≈ uniform), causing non-EoS tokens to be sampled at
+        # inactive positions. eff_temp=1.0 ensures the spike reliably produces EoS.
+        if _n_active is not None and learnable_temperature:
+            _n_inactive = n_free - _n_active[0]
+            if _n_inactive > 0:
+                _fp_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
+                _t_start, _t_end = _fp_len, _fp_len + _n_inactive
+                for _mod in [stgs_module, bptt_stgs_module]:
+                    if _mod is None:
+                        continue
+                    _tp = getattr(_mod, 'temperature_param', None)
+                    if _tp is None:
+                        continue
+                    _init_T = getattr(_mod, 'init_temperature', temperature)
+                    _eps_t = float(getattr(_mod, 'eps', 1e-12))
+                    # Invert eff_temp = eps + init_T*(1+tanh(param)) for eff_temp=1.0
+                    _ratio = (1.0 - _eps_t) / max(float(_init_T), 1e-12) - 1.0
+                    _target_param = math.atanh(max(-0.999999, min(0.999999, _ratio)))
+                    with torch.no_grad():
+                        _tp[_t_start:_t_end].fill_(_target_param)
+
         step_result = forward_pass_callable()
         loss = step_result.loss
         backward_loss = step_result.backward_loss
@@ -2539,6 +2615,31 @@ def optimize_inputs(
                 backward_loss = backward_loss + coupling_reg
                 losses_dict["temperature_loss_coupling_reg"] = coupling_reg.detach()
 
+        # SNR-homeostatic temperature regularization.
+        # Provides an unbiased corrective gradient for temperature_param (immune to the
+        # straight-through bias that causes temperature collapse with stgs_hard=True).
+        # Target: T_i = target_T * (SNR_i / mean_SNR)^alpha — positions with above-average
+        # SNR (overconfident, near-zero Jacobian) are pushed toward higher temperature.
+        # SNR is detached to avoid circular dependency. one_sided mode only corrects
+        # collapsed positions (T < target) without disturbing well-settled ones.
+        if learnable_temperature and snr_homeostasis_lambda > 0.0:
+            _eff_temp_h = estimator_state.get("eff_temperature")
+            _snr_h = estimator_state.get("stgs_snr")
+            if torch.is_tensor(_eff_temp_h) and _snr_h is not None:
+                _snr_det = _snr_h.float().detach().clamp(min=1e-6)        # (seq_len,)
+                _mean_snr = _snr_det.mean().clamp(min=1e-6)
+                _T_target = (snr_homeostasis_target_temperature *
+                             (_snr_det / _mean_snr) ** snr_homeostasis_alpha)
+                _T_target = _T_target.clamp(0.1, temperature)             # (seq_len,)
+                # Reshape to broadcast against eff_temp (shape: (1, seq_len) or similar)
+                _T_target = _T_target.view(*([1] * (_eff_temp_h.dim() - 1)), -1).detach()
+                if snr_homeostasis_mode == "one_sided":
+                    homeo_reg = F.relu(_T_target - _eff_temp_h).pow(2).mean()
+                else:  # "mse"
+                    homeo_reg = (_eff_temp_h - _T_target).pow(2).mean()
+                backward_loss = backward_loss + snr_homeostasis_lambda * homeo_reg
+                losses_dict["snr_homeostasis_reg"] = homeo_reg.detach()
+
         # Adaptive Gumbel noise scaling (similar to temperature annealing)
         if (not eval_only) and adaptive_gumbel_noise and stgs_module is not None:
             current_loss_val = loss.detach().item()
@@ -2574,8 +2675,23 @@ def optimize_inputs(
             backward_loss = backward_loss + ppo_kl_lambda * ppo_kl
 
         estimator_metrics: Dict[str, float] = {}
+        _is_mas_epoch = (
+            mas_metric_every > 0
+            and lora_A is not None
+            and estimator_is_stgs
+            and epoch % mas_metric_every == 0
+        )
         if not eval_only:
-            backward_loss.backward()
+            backward_loss.backward(retain_graph=_is_mas_epoch)
+
+        # MAS rotational metric — reuses the retained graph before optimizer modifies lora_A.data
+        if _is_mas_epoch and not eval_only:
+            try:
+                from mas_analysis import compute_rotational_metrics
+                _mas_raw = compute_rotational_metrics(backward_loss, lora_A)
+                wandb.log({f"mas/{k}": v for k, v in _mas_raw.items()})
+            except Exception as exc:
+                logging.warning("MAS rotational metric skipped at epoch %d: %s", epoch, exc)
         if (not eval_only) and estimator_is_stgs:
             # Save gradients for all parameters  in the context:
             saved_grads = {
@@ -2701,6 +2817,33 @@ def optimize_inputs(
         if (not eval_only) and max_gradient_norm != 0.0:
             torch.nn.utils.clip_grad_norm_(parameters, max_gradient_norm)
 
+        # Curriculum mode: zero gradients (and optimizer moments) for inactive temperature positions
+        # so they receive no update. Inactive positions: leftmost (n_free - n_act) free positions,
+        # which map to temperature_param indices [_fp_len : _fp_len + (n_free - n_act)].
+        if _n_active is not None and learnable_temperature and not eval_only:
+            _n_inactive = n_free - _n_active[0]
+            if _n_inactive > 0:
+                _fp_len = fixed_prefix.shape[1] if fixed_prefix is not None else 0
+                _t_start, _t_end = _fp_len, _fp_len + _n_inactive
+                for _mod in [stgs_module, bptt_stgs_module]:
+                    if _mod is None:
+                        continue
+                    _tp = getattr(_mod, 'temperature_param', None)
+                    if _tp is None:
+                        continue
+                    if _tp.grad is not None:
+                        _tp.grad[_t_start:_t_end].zero_()
+                    # Also zero Adam moments to prevent spurious updates from accumulated state.
+                    if optimizer is not None:
+                        for group in optimizer.param_groups:
+                            for p in group['params']:
+                                if p is _tp and p in optimizer.state:
+                                    _st = optimizer.state[p]
+                                    if 'exp_avg' in _st:
+                                        _st['exp_avg'][_t_start:_t_end].zero_()
+                                    if 'exp_avg_sq' in _st:
+                                        _st['exp_avg_sq'][_t_start:_t_end].zero_()
+
         if not eval_only:
             optimizer.step()
 
@@ -2778,6 +2921,7 @@ def optimize_inputs(
                         prefix_len=prefix_len,
                         snap_method=discrete_reinit_snap,
                         optimizer=optimizer,
+                        spike_value=discrete_reinit_spike,
                         discrete_reinit_prob=discrete_reinit_prob,
                         discrete_reinit_topk=discrete_reinit_topk,
                         position_mask=reinit_mask,
@@ -2791,12 +2935,46 @@ def optimize_inputs(
                         n_free=n_free,
                         prefix_len=prefix_len,
                         snap_method=discrete_reinit_snap,
+                        spike_value=discrete_reinit_spike,
                         discrete_reinit_prob=discrete_reinit_prob,
                         discrete_reinit_topk=discrete_reinit_topk,
                         position_mask=reinit_mask,
                         embsim_probs=reinit_probs,
                     )
                     reset_optimizer_state_for_positions(optimizer, free_logits, reinit_mask)
+
+        # Periodic temperature reset: un-saturates the softmax Jacobian by resetting
+        # temperature_param to the value corresponding to temperature_reset_value (or
+        # init_temperature when temperature_reset_value=0). Optimizer state for the
+        # temperature parameter is also cleared so accumulated momentum cannot immediately
+        # drive it back down.
+        if (not eval_only) and temperature_reset_epoch > 0 and (epoch + 1) % temperature_reset_epoch == 0:
+            for _mod in [stgs_module, bptt_stgs_module]:
+                if _mod is None:
+                    continue
+                _tp = getattr(_mod, 'temperature_param', None)
+                if _tp is None:
+                    continue
+                with torch.no_grad():
+                    if temperature_reset_value > 0.0:
+                        _ratio = (temperature_reset_value / max(_mod.init_temperature, 1e-12)) - 1.0
+                        _tp.fill_(math.atanh(max(-0.999999, min(0.999999, _ratio))))
+                    else:
+                        _tp.fill_(0.0)  # maps to eff_temperature = init_temperature
+                if optimizer is not None:
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p is _tp and p in optimizer.state:
+                                optimizer.state[p] = {}
+
+        # Progressive prompt length curriculum: expand active positions right-to-left.
+        if _n_active is not None and prompt_length_expand_every > 0 and not eval_only:
+            new_n_active = min(
+                prompt_length_init_n
+                + ((epoch + 1) // prompt_length_expand_every) * prompt_length_expand_by,
+                n_free,
+            )
+            _n_active[0] = new_n_active
 
         # Temperature annealing (only when not learnable_temperature)
         if (not eval_only) and temperature_anneal_schedule != "none" and stgs_module is not None and not learnable_temperature:
@@ -2866,6 +3044,10 @@ def optimize_inputs(
             if "temperature_loss_coupling_reg" in losses_dict:
                 wandb_log["temperature_loss_coupling_reg"] = losses_dict["temperature_loss_coupling_reg"].item()
 
+        if learnable_temperature and snr_homeostasis_lambda > 0.0:
+            if "snr_homeostasis_reg" in losses_dict:
+                wandb_log["snr_homeostasis_reg"] = losses_dict["snr_homeostasis_reg"].item()
+
         if stgs_module is not None:
             wandb_log["gumbel_noise_scale"] = getattr(stgs_module, 'gumbel_noise_scale', gumbel_noise_scale)
 
@@ -2878,7 +3060,9 @@ def optimize_inputs(
             wandb_log["discrete_reinit_entropy_mean"] = discrete_reinit_entropy_mean
             wandb_log["discrete_reinit_entropy_min"] = discrete_reinit_entropy_min
 
-        if length_alpha is not None:
+        if _n_active is not None:
+            wandb_log["prompt_length_n_active"] = _n_active[0]
+        elif length_alpha is not None:
             with torch.no_grad():
                 wandb_log["effective_prompt_length"] = (n_free * torch.sigmoid(length_alpha)).item()
                 wandb_log["length_alpha"] = length_alpha.item()
@@ -3159,6 +3343,8 @@ def optimize_inputs(
                 logits_per_pos = assemble_logits()[0]  # (seq_len, allowed_vocab_size)
                 prompt_seq_len = min(logits_per_pos.shape[0], gt_prompt_len)
                 per_position_ranks = []
+                per_position_entropy = []
+                _eps = 1e-10
                 for pos in range(prompt_seq_len):
                     gt_token_id = ground_truth_prompt_tokens[pos]
                     pos_logits = logits_per_pos[pos]
@@ -3169,14 +3355,43 @@ def optimize_inputs(
                     else:
                         rank = int(pos_logits.shape[0]) + 1  # Not in allowed vocab → worst rank
                     per_position_ranks.append(rank)
+                    p = torch.softmax(pos_logits, dim=-1)
+                    h = -(p * (p + _eps).log()).sum().item()
+                    per_position_entropy.append(h)
             gt_rank_mean = (
                 sum(per_position_ranks) / len(per_position_ranks) if per_position_ranks else float('nan')
             )
+            gt_rank_min = min(per_position_ranks) if per_position_ranks else float('nan')
+            gt_rank_max = max(per_position_ranks) if per_position_ranks else float('nan')
+            gt_rank_mrr = (
+                sum(1.0 / r for r in per_position_ranks) / len(per_position_ranks)
+                if per_position_ranks else float('nan')
+            )
+            entropy_mean = (
+                sum(per_position_entropy) / len(per_position_entropy) if per_position_entropy else float('nan')
+            )
+            entropy_min = min(per_position_entropy) if per_position_entropy else float('nan')
+            entropy_max = max(per_position_entropy) if per_position_entropy else float('nan')
             prompt_metrics_history["prompt_gt_token_rank_mean"].append(gt_rank_mean)
+            prompt_metrics_history["prompt_gt_token_rank_min"].append(gt_rank_min)
+            prompt_metrics_history["prompt_gt_token_rank_max"].append(gt_rank_max)
+            prompt_metrics_history["prompt_gt_token_rank_mrr"].append(gt_rank_mrr)
             prompt_metrics_history["prompt_gt_token_rank_per_position"].append(per_position_ranks)
+            prompt_metrics_history["prompt_gt_token_logit_entropy_mean"].append(entropy_mean)
+            prompt_metrics_history["prompt_gt_token_logit_entropy_min"].append(entropy_min)
+            prompt_metrics_history["prompt_gt_token_logit_entropy_max"].append(entropy_max)
+            prompt_metrics_history["prompt_gt_token_logit_entropy_per_position"].append(per_position_entropy)
             wandb_log['prompt_gt_token_rank_mean'] = gt_rank_mean
+            wandb_log['prompt_gt_token_rank_min'] = gt_rank_min
+            wandb_log['prompt_gt_token_rank_max'] = gt_rank_max
+            wandb_log['prompt_gt_token_rank_mrr'] = gt_rank_mrr
+            wandb_log['prompt_gt_token_logit_entropy_mean'] = entropy_mean
+            wandb_log['prompt_gt_token_logit_entropy_min'] = entropy_min
+            wandb_log['prompt_gt_token_logit_entropy_max'] = entropy_max
             for pos, rank in enumerate(per_position_ranks):
                 wandb_log[f'prompt_gt_token_rank_pos_{pos}'] = rank
+            for pos, h in enumerate(per_position_entropy):
+                wandb_log[f'prompt_gt_token_logit_entropy_pos_{pos}'] = h
 
         # Compute semantic metrics (BERT/SentenceBERT) at specified intervals
         if track_semantic_metrics and (epoch % semantic_metrics_every_n_epochs == 0 or epoch == epochs - 1):
@@ -3549,11 +3764,29 @@ def main():
     parser.add_argument("--temperature_anneal_reg_mode", type=str, default="mse",
                         choices=["mse", "one_sided"],
                         help="'mse': symmetric L2 to target; 'one_sided': L2 only when tau > target")
+    parser.add_argument("--snr_homeostasis_lambda", type=float, default=0.0,
+                        help="Weight for SNR-homeostatic temperature regularization (0 = disabled). "
+                             "Provides unbiased upward gradient for temperature_param, correcting "
+                             "the collapse induced by the straight-through estimator bias.")
+    parser.add_argument("--snr_homeostasis_target_temperature", type=float, default=10.0,
+                        help="Target effective temperature at average-SNR positions")
+    parser.add_argument("--snr_homeostasis_alpha", type=float, default=0.5,
+                        help="SNR sensitivity exponent: T_target_i = target_T * (SNR_i/mean_SNR)^alpha")
+    parser.add_argument("--snr_homeostasis_mode", type=str, default="one_sided",
+                        choices=["one_sided", "mse"],
+                        help="'one_sided': push T up only when T < target; 'mse': symmetric")
+    parser.add_argument("--temperature_reset_epoch", type=int, default=0,
+                        help="Reset learnable temperature_param every N epochs to un-saturate the "
+                             "softmax Jacobian (0 = disabled)")
+    parser.add_argument("--temperature_reset_value", type=float, default=0.0,
+                        help="Effective temperature to reset to (0.0 = use init_temperature)")
     parser.add_argument("--discrete_reinit_epoch", type=int, default=0,
                         help="Snap free_logits to discrete projection every N epochs (0 = disabled)")
     parser.add_argument("--discrete_reinit_snap", type=str, default="argmax",
                         choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2"],
                         help="Projection method for periodic discrete reinitialization")
+    parser.add_argument("--discrete_reinit_spike", type=float, default=10.0,
+                        help="Logit value placed at the snapped token position in legacy (non-top-k) reinit mode")
     parser.add_argument("--discrete_reinit_prob", type=float, default=1.0,
                         help="In top-k discrete reinit mode, probability mass assigned to the snapped token")
     parser.add_argument("--discrete_reinit_topk", type=int, default=0,
@@ -3738,6 +3971,7 @@ def main():
         early_stop_embsim_lcs_ratio_threshold=config.get('early_stop_embsim_lcs_ratio_threshold', 1.0),
         discrete_reinit_epoch=config.get('discrete_reinit_epoch', 0),
         discrete_reinit_snap=config.get('discrete_reinit_snap', 'argmax'),
+        discrete_reinit_spike=config.get('discrete_reinit_spike', 10.0),
         discrete_reinit_prob=config.get('discrete_reinit_prob', 1.0),
         discrete_reinit_topk=config.get('discrete_reinit_topk', 0),
         discrete_reinit_entropy_threshold=config.get('discrete_reinit_entropy_threshold', 0.0),
@@ -3753,6 +3987,13 @@ def main():
         temperature_anneal_epochs=config.get('temperature_anneal_epochs', 0),
         temperature_anneal_reg_lambda=config.get('temperature_anneal_reg_lambda', 0.0),
         temperature_anneal_reg_mode=config.get('temperature_anneal_reg_mode', 'mse'),
+        temperature_loss_coupling_lambda=config.get('temperatureLossCouplingLambda', 0.0),
+        snr_homeostasis_lambda=config.get('snr_homeostasis_lambda', 0.0),
+        snr_homeostasis_target_temperature=config.get('snr_homeostasis_target_temperature', 10.0),
+        snr_homeostasis_alpha=config.get('snr_homeostasis_alpha', 0.5),
+        snr_homeostasis_mode=config.get('snr_homeostasis_mode', 'one_sided'),
+        temperature_reset_epoch=config.get('temperature_reset_epoch', 0),
+        temperature_reset_value=config.get('temperature_reset_value', 0.0),
         superposition_metric_every=config.get('superposition_metric_every', 0),
         superposition_metric_modes=config.get('superposition_metric_modes', 'dot,cos,l2'),
         superposition_vocab_top_k=config.get('superposition_vocab_top_k', 256),
