@@ -278,17 +278,27 @@ def weave_prompt_init(
     reconstructed_text: str,
     reconstructed_token_ids: List[int],
     reconstruction_error: float,
+    reconstruction_method: str,
     lora_rank: int,
     seq_len: int,
     is_exact: bool,
+    embsim_l2_text: str,
+    embsim_l2_token_ids: List[int],
+    embsim_cos_text: str,
+    embsim_cos_token_ids: List[int],
 ) -> Dict[str, Any]:
     """
     Trace the initial prompt text vs its LoRA rank-r SVD approximation.
 
     Called once at optimization start when initial_prompt_text is set and
-    logits_lora_rank > 0.  Records both the intended text and the argmax of
-    the reconstructed logits (lora_A @ lora_B) so the user can verify how
-    well the rank-r factorisation preserves the desired starting point.
+    logits_lora_rank > 0.  Records the intended text, the primary reconstructed
+    text (selected by reconstruction_method), and all three decode methods
+    (argmax, embsim-l2, embsim-cos) for comparison.
+
+    Args:
+        reconstruction_method: The decode method used as the primary reconstruction
+            ('argmax', 'embsim-l2', or 'embsim-cos'); drives reconstructed_text /
+            reconstructed_token_ids and the is_exact flag.
     """
     return {
         "requested_text": requested_text,
@@ -296,9 +306,14 @@ def weave_prompt_init(
         "reconstructed_text": reconstructed_text,
         "reconstructed_token_ids": reconstructed_token_ids,
         "reconstruction_error": reconstruction_error,
+        "reconstruction_method": reconstruction_method,
         "lora_rank": lora_rank,
         "seq_len": seq_len,
         "is_exact": is_exact,
+        "embsim_l2_text": embsim_l2_text,
+        "embsim_l2_token_ids": embsim_l2_token_ids,
+        "embsim_cos_text": embsim_cos_text,
+        "embsim_cos_token_ids": embsim_cos_token_ids,
     }
 
 

@@ -424,6 +424,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
 
     # ---- test eval callback (full test epoch during training) ----
     test_eval_every = config.get("test_eval_every", 0)
+    test_eval_before_training = config.get("test_eval_before_training", False)
     test_eval_size = config.get("test_eval_size", len(test_pairs))
     test_pairs_eval = test_pairs[:test_eval_size] if test_eval_size < len(test_pairs) else test_pairs
 
@@ -436,12 +437,30 @@ def batch_pc_optimize(config: Dict) -> Dict:
     with torch.no_grad():
         E_embeds = embedding_layer(E_input_ids)
 
+    # Resolve effective seq_len: when initial_prompt_text is provided, pc_optimize_inputs
+    # overrides seq_len with the tokenized length.  The shared stgs_module must be built
+    # with the same nbr_learnable_temperatures so temperature params match the logits.
+    _initial_prompt_text = config.get("initial_prompt_text") or None
+    if _initial_prompt_text:
+        _ipt_ids = tokenizer(
+            _initial_prompt_text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+        _resolved_seq_len = int(_ipt_ids.shape[0])
+        if _resolved_seq_len != config.get("seq_len", 20):
+            logger.info(
+                "batch_pc_optimize: initial_prompt_text overrides config seq_len %d → %d",
+                config.get("seq_len", 20), _resolved_seq_len,
+            )
+            config["seq_len"] = _resolved_seq_len
+
     # Shared STGS module for evaluation callbacks (greedy, no noise)
-    stgs_for_eval = STGS(
+    stgs_module = STGS(
         vocab_size=model.config.vocab_size,
         stgs_hard=config.get("stgs_hard", True),
         stgs_hard_method=config.get("stgs_hard_method", "categorical"),
         init_temperature=config.get("temperature", 1.0),
+        learnable_temperature=config.get("learnable_temperature", False),
+        nbr_learnable_temperatures=config.get("seq_len",None) if config.get("decouple_learnable_temperature", False) else None,
         stgs_hard_embsim_probs=config.get("stgs_hard_embsim_probs", "gumbel_soft"),
         stgs_hard_embsim_strategy=config.get("stgs_hard_embsim_strategy", "nearest"),
         stgs_hard_embsim_top_k=config.get("stgs_hard_embsim_top_k", 8),
@@ -450,10 +469,12 @@ def batch_pc_optimize(config: Dict) -> Dict:
         stgs_hard_embsim_margin=config.get("stgs_hard_embsim_margin", 0.0),
         stgs_hard_embsim_fallback=config.get("stgs_hard_embsim_fallback", "argmax"),
         logits_normalize=config.get("logits_normalize", "none"),
+        input_dropout=config.get("stgs_input_dropout", 0),
+        output_dropout=config.get("stgs_output_dropout", 0),
         eps=config.get("eps", 1e-10),
         device=device,
     )
-
+    
     _accumulate_embeds = config.get("efficient_generate", False)
     prompt_logits_transform = None
     if config.get("assemble_strategy", "identity") == "product_of_speaker":
@@ -476,15 +497,18 @@ def batch_pc_optimize(config: Dict) -> Dict:
         )
 
     def _test_eval_callback(epoch: int, fl: torch.Tensor) -> Dict:
-        if test_eval_every <= 0 or ((epoch + 1) % test_eval_every != 0):
+        if epoch < 0:
+            if not test_eval_before_training:
+                return {}
+        elif test_eval_every <= 0 or ((epoch + 1) % test_eval_every != 0):
             return {}
-        _eval_fn = evaluate_shared_prompt_batched if config.get("use_batched_eval", False) else evaluate_shared_prompt
+        _eval_fn = evaluate_shared_prompt_batched if config.get("use_batched_test_eval", False) else evaluate_shared_prompt
         metrics = _eval_fn(
             free_logits=fl,
             eval_pairs=test_pairs_eval,
             model=model,
             diff_model=diff_model,
-            stgs_module=stgs_for_eval,
+            stgs_module=stgs_module,
             embedding_weights=embedding_weights,
             tokenizer=tokenizer,
             device=device,
@@ -501,6 +525,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
             eval_split="test",
             accumulate_embeds=_accumulate_embeds,
             prompt_logits_transform=prompt_logits_transform,
+            eval_inner_batch_size=config.get("eval_inner_batch_size", 0),
         )
         p_tokens = fl.argmax(dim=-1).squeeze(0).tolist()
         p_text = tokenizer.decode(p_tokens, skip_special_tokens=False)
@@ -536,6 +561,9 @@ def batch_pc_optimize(config: Dict) -> Dict:
     torch.manual_seed(opt_seed)
     random.seed(opt_seed)
 
+    _mas_metric_every = int(config.get("mas_metric_every", 0))
+    _mas_hvp_mode = config.get("mas_hvp_mode", "autograd")
+
     # ---- run optimization ----
     pipeline_pbar.set_description("PC pipeline: optimize")
     result = pc_optimize_inputs(
@@ -562,6 +590,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         inner_batch_size=config.get("inner_batch_size", 4),
         batch_size=config.get("batch_size"),
         temperature=config.get("temperature", 1.0),
+        stgs_module=stgs_module,
         learnable_temperature=config.get("learnable_temperature", False),
         decouple_learnable_temperature=config.get("decouple_learnable_temperature", False),
         stgs_hard=config.get("stgs_hard", True),
@@ -604,6 +633,11 @@ def batch_pc_optimize(config: Dict) -> Dict:
         init_mlm_model=config.get("init_mlm_model", "distilbert-base-uncased"),
         init_mlm_top_k=config.get("init_mlm_top_k", 50),
         logits_lora_rank=config.get("logits_lora_rank", 0),
+        lr_schedule=config.get("lr_schedule", "none"),
+        lr_warmup_epochs=config.get("lr_warmup_epochs", 0),
+        lr_schedule_min=config.get("lr_schedule_min", 0.0),
+        lr_schedule_step_size=config.get("lr_schedule_step_size", 10),
+        lr_schedule_gamma=config.get("lr_schedule_gamma", 0.1),
         max_gradient_norm=config.get("max_gradient_norm", 0.0),
         temperature_anneal_schedule=config.get("temperature_anneal_schedule", "none"),
         temperature_anneal_min=config.get("temperature_anneal_min", 0.1),
@@ -662,16 +696,32 @@ def batch_pc_optimize(config: Dict) -> Dict:
         early_stop_loss_threshold=config.get("early_stop_loss_threshold", 0.0),
         val_eval_every=config.get("val_eval_every", 100),
         val_prompt_eval_mode=config.get("val_prompt_eval_mode", "discrete"),
-        per_epoch_callback=_test_eval_callback if test_eval_every > 0 else None,
+        per_epoch_callback=_test_eval_callback if (test_eval_every > 0 or test_eval_before_training) else None,
         use_batched_forward_pass=config.get("use_batched_forward_pass", False),
         batched_stgs_noise_mode=config.get("batched_stgs_noise_mode", "shared"),
-        use_batched_eval=config.get("use_batched_eval", False),
+        use_batched_val_eval=config.get("use_batched_val_eval", False),
+        eval_inner_batch_size=config.get("eval_inner_batch_size", 0),
         gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
+        use_swa=config.get("use_swa", False),
+        swa_start_epoch=config.get("swa_start_epoch"),
+        swa_freq=config.get("swa_freq", 1),
+        gumbel_n_samples=config.get("gumbel_n_samples", 1),
         val_eval_before_training=config.get("val_eval_before_training", False),
+        test_eval_before_training=test_eval_before_training,
         initial_prompt_text=config.get("initial_prompt_text") or None,
+        initial_prompt_lora_reconstruction=config.get("initial_prompt_lora_reconstruction", "argmax"),
+        initial_prompt_lora_spike=config.get("initial_prompt_lora_spike", 10.0),
         use_chat_template=config.get("use_chat_template", False),
         accumulate_embeds=config.get("efficient_generate", False),
         prompt_logits_transform=prompt_logits_transform,
+        mas_metric_every=_mas_metric_every,
+        mas_hvp_mode=_mas_hvp_mode,
+        offline_em=config.get("offline_em", False),
+        offline_em_resample_every=config.get("offline_em_resample_every", 0),
+        offline_em_stgs_method=config.get("offline_em_stgs_method", "soft"),
+        offline_em_stgs_embsim_probs=config.get("offline_em_stgs_embsim_probs", "gumbel_soft"),
+        offline_em_temperature=config.get("offline_em_temperature", "learned"),
+        offline_em_cache_batch_size=config.get("offline_em_cache_batch_size", 0),
         kwargs=lc_kwargs,
     )
     pipeline_pbar.update(1)
@@ -689,7 +739,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
             eval_pairs=val_pairs,
             model=model,
             diff_model=diff_model,
-            stgs_module=stgs_for_eval,
+            stgs_module=stgs_module,
             embedding_weights=embedding_weights,
             tokenizer=tokenizer,
             device=device,
@@ -719,7 +769,7 @@ def batch_pc_optimize(config: Dict) -> Dict:
         eval_pairs=test_pairs_eval,
         model=model,
         diff_model=diff_model,
-        stgs_module=stgs_for_eval,
+        stgs_module=stgs_module,
         embedding_weights=embedding_weights,
         tokenizer=tokenizer,
         device=device,
@@ -924,6 +974,30 @@ def parse_args() -> argparse.Namespace:
                         "Overrides --seq_len with the number of tokens in the text, "
                         "and initializes free_logits as one-hot encodings of those tokens.")
     p.add_argument(
+        "--initial_prompt_lora_reconstruction",
+        type=str,
+        default="argmax",
+        choices=["argmax", "embsim-l2", "embsim-cos"],
+        help=(
+            "Decode method used to verify the rank-r SVD approximation when "
+            "--initial_prompt_text and --logits_lora_rank > 0 are both set. "
+            "'argmax': greedy argmax of lora_A @ lora_B (default). "
+            "'embsim-l2': nearest-embedding token by L2 distance. "
+            "'embsim-cos': nearest-embedding token by cosine similarity."
+        ),
+    )
+    p.add_argument(
+        "--initial_prompt_lora_spike",
+        type=float,
+        default=10.0,
+        help=(
+            "Logit value placed at each target token position in the one-hot matrix "
+            "when initializing LoRA logits from --initial_prompt_text (default: 10.0). "
+            "Higher values make the SVD starting point closer to a hard one-hot; "
+            "lower values produce a softer initial distribution."
+        ),
+    )
+    p.add_argument(
         "--epochs",
         type=int,
         default=2000,
@@ -936,6 +1010,37 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional learning rate override for LoRA prompt-logit matrix B. "
              "Ignored when logits_lora_rank <= 0.",
+    )
+    p.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="none",
+        choices=["none", "cosine", "linear", "step", "exponential"],
+        help="LR scheduler type applied once per epoch (default: none = fixed LR).",
+    )
+    p.add_argument(
+        "--lr_warmup_epochs",
+        type=int,
+        default=0,
+        help="Epochs of linear warmup from ~0 to base LR before the main schedule (default: 0).",
+    )
+    p.add_argument(
+        "--lr_schedule_min",
+        type=float,
+        default=0.0,
+        help="Minimum LR for cosine/linear schedulers (default: 0.0).",
+    )
+    p.add_argument(
+        "--lr_schedule_step_size",
+        type=int,
+        default=10,
+        help="Step size in epochs for StepLR scheduler (default: 10).",
+    )
+    p.add_argument(
+        "--lr_schedule_gamma",
+        type=float,
+        default=0.1,
+        help="Multiplicative decay factor for step/exponential schedulers (default: 0.1).",
     )
     p.add_argument("--inner_batch_size", type=int, default=4)
     p.add_argument("--batch_size", type=int, default=None,
@@ -1077,6 +1182,63 @@ def parse_args() -> argparse.Namespace:
                    choices=["argmax", "categorical"])
     p.add_argument("--bptt_hidden_state_conditioning", type=str2bool, default=False)
 
+    # Offline EM: cache reasoning at E-step, optimize prompt at M-step
+    p.add_argument(
+        "--offline_em", type=str2bool, default=False,
+        help=(
+            "Enable offline EM mode: reasoning is generated once (or every N epochs) "
+            "and cached as fixed tokens for the M-step. Requires --teacher_forcing_r=False "
+            "and --use_batched_forward_pass=True."
+        ),
+    )
+    p.add_argument(
+        "--offline_em_resample_every", type=int, default=0,
+        help=(
+            "Re-generate the reasoning cache every N epochs (E-step refresh). "
+            "0 = never resample (pure offline, fixed rollouts throughout). "
+            "N > 0 = EM alternation: M-step for N epochs, then E-step, repeat."
+        ),
+    )
+    p.add_argument(
+        "--offline_em_stgs_method", type=str, default="soft",
+        choices=["argmax", "embsim-dot", "embsim-cos", "embsim-l2", "soft"],
+        help=(
+            "How to build p_embeds from the current prompt logits during the E-step. "
+            "'soft' = use the soft distribution (Gumbel-softmax or input_logits depending "
+            "on --offline_em_stgs_embsim_probs) directly as p_embeds without hard "
+            "token selection. Other choices apply hard selection via the specified method."
+        ),
+    )
+    p.add_argument(
+        "--offline_em_stgs_embsim_probs", type=str, default="gumbel_soft",
+        choices=["gumbel_soft", "input_logits"],
+        help=(
+            "Source distribution for E-step p_embeds computation. "
+            "'gumbel_soft' = use Gumbel-softmax output (y_soft); "
+            "'input_logits' = use softmax(logits/temperature) directly (no Gumbel noise). "
+            "Mirrors --stgs_hard_embsim_probs for the training M-step."
+        ),
+    )
+    p.add_argument(
+        "--offline_em_temperature", type=str, default="learned",
+        help=(
+            "Temperature used when applying STGS for the E-step. "
+            "'learned' = use the current temperature(s) from the STGS module (fixed or "
+            "learnable, whatever is active during training). "
+            "A float string (e.g. '0.1') = override with this fixed temperature for the "
+            "E-step only, leaving the M-step temperature unchanged."
+        ),
+    )
+    p.add_argument(
+        "--offline_em_cache_batch_size", type=int, default=0,
+        help=(
+            "Mini-batch size for the E-step reasoning cache generation. "
+            "0 (default) = fall back to --inner_batch_size. "
+            "Set to a larger value than inner_batch_size when E-step generation "
+            "is memory-cheap (no gradient) and you want faster cache population."
+        ),
+    )
+
     # Batched forward pass + gradient accumulation
     p.add_argument("--use_batched_forward_pass", type=str2bool, default=False,
                    help="Use batched GPU forward pass for training mini-batches.")
@@ -1084,14 +1246,35 @@ def parse_args() -> argparse.Namespace:
                    choices=["shared", "independent"],
                    help="Gumbel noise sharing within a batch: 'shared' (one draw) "
                         "or 'independent' (one draw per sample).")
-    p.add_argument("--use_batched_eval", type=str2bool, default=False,
-                   help="Use batched evaluate_shared_prompt for validation/test.")
+    p.add_argument("--use_batched_val_eval", type=str2bool, default=False,
+                   help="Use batched evaluate_shared_prompt_batched for val epochs (default: False)")
+    p.add_argument("--use_batched_test_eval", type=str2bool, default=False,
+                   help="Use batched evaluate_shared_prompt_batched for test epochs (default: False)")
+    p.add_argument("--eval_inner_batch_size", type=int, default=0,
+                   help="Mini-batch size for batched validation/test evaluation (0 = all pairs in one pass). "
+                        "Since eval runs under torch.no_grad(), larger batches fit in GPU memory.")
     p.add_argument("--gradient_accumulation_steps", type=int, default=1,
                    help="Accumulate gradients over N mini-batches before optimizer.step(). "
                         "Effective batch size = inner_batch_size × gradient_accumulation_steps.")
+
+    # SWA (Stochastic Weight Averaging over prompt logits)
+    p.add_argument("--use_swa", type=str2bool, default=False,
+                   help="Enable Stochastic Weight Averaging over prompt logits.")
+    p.add_argument("--swa_start_epoch", type=int, default=None,
+                   help="Epoch to begin SWA snapshot collection (default: 75%% of total epochs).")
+    p.add_argument("--swa_freq", type=int, default=1,
+                   help="Collect an SWA snapshot every this many epochs (default: 1).")
+
+    # Multi-Gumbel sampling
+    p.add_argument("--gumbel_n_samples", type=int, default=1,
+                   help="Number of independent Gumbel draws per mini-batch; losses averaged before backprop.")
+
     p.add_argument("--val_eval_before_training", type=str2bool, default=False,
                    help="Run a validation epoch before the very first training epoch (epoch -1). "
                         "Useful to record baseline accuracy before any gradient updates.")
+    p.add_argument("--test_eval_before_training", type=str2bool, default=False,
+                   help="Run a test epoch before the very first training epoch (epoch -1). "
+                        "Useful to record baseline test accuracy before any gradient updates.")
 
     # Validation / test eval
     p.add_argument(
@@ -1189,6 +1372,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--superposition_vocab_num_texts", type=int, default=1000)
     p.add_argument("--superposition_entropy_temperature", type=float, default=1.0)
     p.add_argument("--superposition_output_dir", type=str, default=".")
+    p.add_argument("--mas_metric_every", type=int, default=0,
+                   help="Compute MAS rotational metric every N epochs (0 = disabled; "
+                        "requires logits_lora_rank > 0).")
+    p.add_argument("--mas_hvp_mode", type=str, default="autograd",
+                   choices=["autograd", "jvp"],
+                   help="HVP method for MAS rotational metric. 'autograd': create_graph=True on "
+                        "retained training loss (default). 'jvp': torch.func.jvp + vjp (no "
+                        "create_graph; 2 fresh forward passes; best for teacher-forcing mode).")
 
     # Input formatting
     p.add_argument("--use_chat_template", type=str2bool, default=False,

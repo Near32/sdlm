@@ -15,7 +15,7 @@ import sys
 import random
 import logging
 from pathlib import Path
-from typing import Any, List, Tuple, Dict, Optional, Callable, Sequence, Set
+from typing import Any, List, Tuple, Dict, Optional, Callable, Sequence, Set, Union
 
 import torch
 import torch.nn.functional as F
@@ -34,7 +34,7 @@ from sdlm import STGS
 from sdlm.stgs_diff_model import STGSDiffModel
 from sdlm.utils.tqdm_utils import tqdm
 from rewards import compare_answers
-from optimizer_utils import build_prompt_optimizer
+from optimizer_utils import build_lr_scheduler, build_prompt_optimizer
 
 from main import (
     LossClass,
@@ -98,6 +98,19 @@ def collect_pc_main_incompatibilities(
             issues.append("--reasoning_generation_backend='hf_generate' requires --teacher_forcing_r=False.")
         if config.get("bptt", False):
             issues.append("--reasoning_generation_backend='hf_generate' is not compatible with --bptt=True.")
+
+    if config.get("offline_em", False):
+        if config.get("teacher_forcing_r", True):
+            issues.append(
+                "--offline_em=True and --teacher_forcing_r=True are mutually exclusive: "
+                "offline EM generates its own reasoning cache, so teacher-forcing must be disabled "
+                "(pass --teacher_forcing_r=False)."
+            )
+        if not config.get("use_batched_forward_pass", False):
+            issues.append(
+                "--offline_em=True requires --use_batched_forward_pass=True "
+                "(serial forward pass does not support the offline reasoning cache)."
+            )
 
     if config.get("gradient_estimator", "stgs") != "stgs":
         issues.append("--gradient_estimator only supports 'stgs' in PC mode.")
@@ -767,16 +780,18 @@ def pc_forward_pass_batched_tf(
     Y_tokens_list: List[Tensor],                 # [(1, Y_len_i), ...]
     gumbel_noise_scale: float = 1.0,
     stgs_noise_mode: str = "shared",             # "shared" | "independent"
-) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+) -> Dict[str, Any]:
     """Batched teacher-forcing forward pass (teacher_forcing_r=True, bptt=False).
 
     Assembles [x_i | p_i | R_gt_i | E | Y_i[:-1]] for each sample,
     left-pads to a common length, and runs a single diff_model.forward call.
 
     Returns:
-        losses:        list of B scalar loss tensors (grad-connected)
-        y_logits_list: list of B (1, Y_len_i, vocab) detached tensors for
-                       training accuracy decoding
+        dict with keys:
+            "losses":        list of B scalar loss tensors (grad-connected)
+            "y_logits_list": list of B (1, Y_len_i, vocab) detached tensors for
+                             training accuracy decoding
+            "R_tokens":      None (teacher-forcing uses ground-truth R, no generation)
     """
     B = len(x_embeds_list)
     device = x_embeds_list[0].device
@@ -835,7 +850,7 @@ def pc_forward_pass_batched_tf(
         })
         losses.append(d["sumloss"])
         y_logits_list.append(y_logits_i.detach())
-    return losses, y_logits_list
+    return {"losses": losses, "y_logits_list": y_logits_list, "R_tokens": None}
 
 
 def pc_forward_pass_batched_free(
@@ -853,7 +868,12 @@ def pc_forward_pass_batched_free(
     gumbel_noise_scale: float = 1.0,
     accumulate_embeds: bool = False,
     stgs_noise_mode: str = "shared",
-) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+    reasoning_generation_backend: str = "diff",
+    reasoning_generate_kwargs: Optional[Dict[str, Any]] = None,
+    # Offline EM: if provided, skip Stage 1 generation and use cached tokens
+    offline_r_cache: Optional[Dict[str, Tensor]] = None,
+    x_strs_batch: Optional[List[str]] = None,   # required when offline_r_cache is not None
+) -> Dict[str, Any]:
     """Batched free-generation forward pass (teacher_forcing_r=False).
 
     Stage 1 — batched reasoning generate from [x_i | p_i].
@@ -864,8 +884,10 @@ def pc_forward_pass_batched_free(
                 → p_embeds → STGS → free_logits (same pattern as sdlm_optimizer.py).
 
     Returns:
-        losses:        list of B scalar loss tensors (grad-connected)
-        y_logits_list: list of B (1, Y_len_i, vocab) detached tensors
+        dict with keys:
+            "losses":        list of B scalar loss tensors (grad-connected)
+            "y_logits_list": list of B (1, Y_len_i, vocab) detached tensors
+            "R_tokens":      (B, R_gen_len) int64 tensor of generated reasoning token ids
     """
     B = len(x_embeds_list)
     device = x_embeds_list[0].device
@@ -888,43 +910,72 @@ def pc_forward_pass_batched_free(
         )
         p_embeds_batch = (oh @ embedding_weights.detach()).expand(B, -1, -1)
 
-    # --- Stage 1: reasoning generate from [x_i | p_i] ---
-    xp_seqs = [
-        torch.cat([x_embeds_list[i], p_embeds_batch[i:i+1]], dim=1)
-        for i in range(B)
-    ]
-    xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, dtype)
-    r_out = diff_model.generate(
-        inputs_embeds=xp_padded,
-        attention_mask=xp_mask,
-        max_new_tokens=max_new_tokens_reasoning,
-        output_normal_logits=False,
-        return_dict=True,
-        accumulate_embeds=accumulate_embeds,
-    )
-
-    with torch.no_grad():
-        R_tokens = r_out.sampled_diff_tokens          # (B, R_gen_len)
-        pad_id   = getattr(diff_model, "pad_token_id", 0) or 0
-        pad_mask = (R_tokens.long() == pad_id).long()
-        R_gen_len = R_tokens.shape[1]
-        raw_starts = pad_mask.argmax(dim=1)
-        padding_starts = torch.where(
-            raw_starts == 0,
-            torch.full_like(raw_starts, R_gen_len),
-            raw_starts,
+    # --- Stage 1: reasoning tokens ---
+    if offline_r_cache is not None:
+        # Offline EM M-step: use cached reasoning tokens (no gradient through R).
+        assert x_strs_batch is not None, (
+            "x_strs_batch must be provided when offline_r_cache is not None"
+        )
+        R_tokens = torch.cat(
+            [offline_r_cache[x_str].to(device) for x_str in x_strs_batch], dim=0
+        )  # (B, R_gen_len)
+        R_embeds = diff_model.model.get_input_embeddings()(R_tokens.long()).detach()
+        with torch.no_grad():
+            pad_id   = getattr(diff_model, "pad_token_id", 0) or 0
+            pad_mask = (R_tokens.long() == pad_id).long()
+            R_gen_len = R_tokens.shape[1]
+            raw_starts = pad_mask.argmax(dim=1)
+            padding_starts = torch.where(
+                raw_starts == 0,
+                torch.full_like(raw_starts, R_gen_len),
+                raw_starts,
+            )
+    else:
+        # Online: generate reasoning fresh from [x_i | p_i].
+        xp_seqs = [
+            torch.cat([x_embeds_list[i], p_embeds_batch[i:i+1]], dim=1)
+            for i in range(B)
+        ]
+        xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, dtype)
+        _use_hf_backend = reasoning_generation_backend == "hf_generate"
+        _r_gen_extra = {
+            "generation_backend": "hf_generate", "output_diff_one_hots": False,
+            **(reasoning_generate_kwargs or {}),
+        } if _use_hf_backend else {}
+        r_out = diff_model.generate(
+            inputs_embeds=xp_padded,
+            attention_mask=xp_mask,
+            max_new_tokens=max_new_tokens_reasoning,
+            output_normal_logits=False,
+            return_dict=True,
+            accumulate_embeds=accumulate_embeds and not _use_hf_backend,
+            **_r_gen_extra,
         )
 
-    # R soft embeddings.
-    # bptt=False: detach so gradients stop here (reasoning is treated as fixed).
-    # bptt=True:  keep grad — gradient flows from answer loss back through
-    #             reasoning generation to p_embeds → STGS → free_logits.
-    if r_out.sampled_diff_embeds is not None:
-        R_embeds = r_out.sampled_diff_embeds
-    else:
-        R_embeds = r_out.sampled_diff_one_hot @ embedding_weights.detach()
-    if not bptt:
-        R_embeds = R_embeds.detach()
+        with torch.no_grad():
+            R_tokens = r_out.sampled_diff_tokens          # (B, R_gen_len)
+            pad_id   = getattr(diff_model, "pad_token_id", 0) or 0
+            pad_mask = (R_tokens.long() == pad_id).long()
+            R_gen_len = R_tokens.shape[1]
+            raw_starts = pad_mask.argmax(dim=1)
+            padding_starts = torch.where(
+                raw_starts == 0,
+                torch.full_like(raw_starts, R_gen_len),
+                raw_starts,
+            )
+
+        # R soft embeddings.
+        # bptt=False: detach so gradients stop here (reasoning is treated as fixed).
+        # bptt=True:  keep grad — gradient flows from answer loss back through
+        #             reasoning generation to p_embeds → STGS → free_logits.
+        if _use_hf_backend:
+            R_embeds = diff_model.model.get_input_embeddings()(R_tokens.long()).detach()
+        elif r_out.sampled_diff_embeds is not None:
+            R_embeds = r_out.sampled_diff_embeds
+        else:
+            R_embeds = r_out.sampled_diff_one_hot @ embedding_weights.detach()
+        if not bptt:
+            R_embeds = R_embeds.detach()
     # R_embeds: (B, R_gen_len, d)
 
     # --- Stage 2: answer generate from [x_i | p_i | R_i[:trim] | E] ---
@@ -969,7 +1020,7 @@ def pc_forward_pass_batched_free(
         })
         losses.append(d["sumloss"])
         y_logits_list.append(y_logits_i.detach())
-    return losses, y_logits_list
+    return {"losses": losses, "y_logits_list": y_logits_list, "R_tokens": R_tokens}
 
 
 def pc_forward_pass_batched(
@@ -992,11 +1043,16 @@ def pc_forward_pass_batched(
     gumbel_noise_scale: float = 1.0,
     accumulate_embeds: bool = False,
     stgs_noise_mode: str = "shared",
-) -> Tuple[List[Tensor], List[Optional[Tensor]]]:
+    offline_r_cache: Optional[Dict[str, Tensor]] = None,
+    x_strs_batch: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Dispatcher: routes to the appropriate batched implementation.
 
     teacher_forcing_r=True  → pc_forward_pass_batched_tf (bptt irrelevant: no generation)
     teacher_forcing_r=False → pc_forward_pass_batched_free (bptt controls R_embeds detach)
+
+    offline_r_cache: when provided, Stage 1 reasoning generation is skipped and cached
+        token IDs are used instead (offline EM M-step). Requires x_strs_batch.
 
     There is no serial fallback. bptt=True is handled inside pc_forward_pass_batched_free
     by keeping R_embeds grad-connected, mirroring sdlm_optimizer.py.
@@ -1024,7 +1080,121 @@ def pc_forward_pass_batched(
             gumbel_noise_scale=gumbel_noise_scale,
             accumulate_embeds=accumulate_embeds,
             stgs_noise_mode=stgs_noise_mode,
+            reasoning_generation_backend=reasoning_generation_backend,
+            reasoning_generate_kwargs=reasoning_generate_kwargs,
+            offline_r_cache=offline_r_cache,
+            x_strs_batch=x_strs_batch,
         )
+
+
+# ---------------------------------------------------------------------------
+# Offline EM: E-step reasoning cache generation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _generate_offline_reasoning_cache(
+    diff_model: STGSDiffModel,
+    free_logits: Tensor,                         # (1, seq_len, vocab) — detached
+    x_embeds_cache: Dict[str, Tensor],           # x_str -> (1, x_len, d)
+    train_triples: List[Tuple[str, str, str]],   # (x_str, R_gt_str, y_raw_str)
+    stgs_module: "STGS",                         # training module — properties inherited
+    embedding_weights: Tensor,                   # (vocab, d)
+    offline_em_stgs_method: str,                 # "argmax"|"embsim-dot"|"embsim-cos"|"embsim-l2"|"soft"
+    offline_em_stgs_embsim_probs: str,            # "gumbel_soft"|"input_logits"
+    offline_em_temperature: Union[str, float],   # "learned" | float
+    max_new_tokens_reasoning: int,
+    reasoning_generation_backend: str,
+    reasoning_generate_kwargs: Optional[Dict[str, Any]],
+    cache_batch_size: int,
+    device,
+) -> Dict[str, Tensor]:
+    """E-step: generate reasoning tokens for all training x_strs using the current prompt.
+
+    Returns a dict mapping each unique x_str to a (1, R_len) CPU int64 tensor of
+    reasoning token IDs.  These are fed as fixed inputs during the subsequent M-step
+    forward passes instead of re-generating reasoning from scratch each iteration.
+    """
+    # --- Resolve E-step temperature ---
+    if offline_em_temperature == "learned":
+        e_step_temp: Optional[float] = None      # STGS uses self.init_temperature
+    else:
+        e_step_temp = float(offline_em_temperature)
+
+    # --- Build p_embeds for the E-step ---
+    # Special case: soft distribution from raw input logits (no STGS, no Gumbel noise).
+    if offline_em_stgs_method == "soft" and offline_em_stgs_embsim_probs == "input_logits":
+        temp = e_step_temp if e_step_temp is not None else stgs_module.init_temperature
+        p_probs = F.softmax(free_logits.float() / temp, dim=-1)
+        p_embeds = (p_probs.to(embedding_weights.dtype) @ embedding_weights).detach()
+    else:
+        # Build a lightweight E-step STGS module, inheriting strategy params from the
+        # training module but overriding hard_method, embsim_probs, and temperature.
+        e_step_stgs = STGS(
+            vocab_size=stgs_module.vocab_size,
+            stgs_hard=(offline_em_stgs_method != "soft"),
+            stgs_hard_method=(
+                offline_em_stgs_method if offline_em_stgs_method != "soft" else "argmax"
+            ),
+            init_temperature=stgs_module.init_temperature,
+            learnable_temperature=False,         # no learnable temp in E-step
+            stgs_hard_embsim_probs=offline_em_stgs_embsim_probs,
+            stgs_hard_embsim_strategy=stgs_module.stgs_hard_embsim_strategy,
+            stgs_hard_embsim_top_k=stgs_module.stgs_hard_embsim_top_k,
+            stgs_hard_embsim_rerank_alpha=stgs_module.stgs_hard_embsim_rerank_alpha,
+            stgs_hard_embsim_sample_tau=stgs_module.stgs_hard_embsim_sample_tau,
+            stgs_hard_embsim_margin=stgs_module.stgs_hard_embsim_margin,
+            stgs_hard_embsim_fallback=stgs_module.stgs_hard_embsim_fallback,
+            logits_normalize=stgs_module.logits_normalize,
+            eps=stgs_module.eps,
+            device=str(device),
+        ).eval()
+        if e_step_temp is not None:
+            e_step_stgs.init_temperature = e_step_temp
+
+        _, p_one_hot, _, y_soft = e_step_stgs(
+            free_logits.detach(),
+            temperature=e_step_temp,             # None → uses module's init_temperature
+            embedding_weights=embedding_weights,
+            gumbel_noise_scale=0.0,              # deterministic: no Gumbel noise in E-step
+        )
+        if offline_em_stgs_method == "soft":
+            p_embeds = (y_soft @ embedding_weights.detach()).detach()
+        else:
+            p_embeds = (p_one_hot @ embedding_weights.detach()).detach()
+    # p_embeds: (1, seq_len, d) — fully detached
+
+    # --- Batch-generate reasoning tokens for every unique x_str ---
+    unique_x_strs = list(dict.fromkeys(t[0] for t in train_triples))  # deduplicated, ordered
+    _use_hf = reasoning_generation_backend == "hf_generate"
+    _r_gen_extra = {
+        "generation_backend": "hf_generate", "output_diff_one_hots": False,
+        **(reasoning_generate_kwargs or {}),
+    } if _use_hf else {}
+
+    cache: Dict[str, Tensor] = {}
+    dtype = embedding_weights.dtype
+    with tqdm(total=len(unique_x_strs), desc="E-step: caching reasoning", unit="x", leave=False) as pbar:
+        for batch_start in range(0, len(unique_x_strs), cache_batch_size):
+            batch_x_strs = unique_x_strs[batch_start:batch_start + cache_batch_size]
+            xp_seqs = [
+                torch.cat([x_embeds_cache[x_str], p_embeds], dim=1)
+                for x_str in batch_x_strs
+            ]
+            xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, dtype)
+            r_out = diff_model.generate(
+                inputs_embeds=xp_padded,
+                attention_mask=xp_mask,
+                max_new_tokens=max_new_tokens_reasoning,
+                output_normal_logits=False,
+                return_dict=True,
+                **_r_gen_extra,
+            )
+            R_tokens = r_out.sampled_diff_tokens   # (B_batch, R_gen_len)
+            for i, x_str in enumerate(batch_x_strs):
+                cache[x_str] = R_tokens[i:i+1].cpu()   # (1, R_gen_len)
+            pbar.update(len(batch_x_strs))
+
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +1782,7 @@ def evaluate_shared_prompt_batched(
     x_embeds_cache: Optional[Dict] = None,
     accumulate_embeds: bool = False,
     prompt_logits_transform: Optional[Callable] = None,
+    eval_inner_batch_size: int = 0,
 ) -> Dict[str, float]:
     """Batched counterpart of evaluate_shared_prompt.
 
@@ -1637,121 +1808,287 @@ def evaluate_shared_prompt_batched(
             prompt_logits_transform=prompt_logits_transform,
         )
 
-    embedding_layer = model.get_input_embeddings()
-    p_ids = free_logits.detach().argmax(dim=-1)   # (1, seq_len)
-
-    # Tokenize all x inputs
-    x_ids_list = []
-    for x_str, _ in eval_pairs:
-        if x_ids_cache and x_str in x_ids_cache:
-            x_ids_list.append(x_ids_cache[x_str])
-        else:
-            x_ids_list.append(_tokenize_x(x_str, tokenizer, device, use_chat_template))
-
-    B = len(eval_pairs)
-
-    if eval_mode == "discrete":
-        # Stage 1: left-pad [x_i | p] token ids for batched reasoning generate
-        xp_seqs = [torch.cat([xi, p_ids], dim=1) for xi in x_ids_list]
-        max_xp  = max(s.shape[1] for s in xp_seqs)
-        xp_pad  = torch.full((B, max_xp), tokenizer.pad_token_id, dtype=torch.long, device=device)
-        xp_mask = torch.zeros(B, max_xp, dtype=torch.long, device=device)
-        for i, s in enumerate(xp_seqs):
-            L = s.shape[1]; xp_pad[i, max_xp-L:] = s[0]; xp_mask[i, max_xp-L:] = 1
-
-        r_gen = model.generate(
-            input_ids=xp_pad, attention_mask=xp_mask,
-            max_new_tokens=max_new_tokens_reasoning,
-            pad_token_id=tokenizer.pad_token_id,
+    # Chunked mini-batch evaluation: process eval_pairs in sub-batches and aggregate.
+    if eval_inner_batch_size > 0 and len(eval_pairs) > eval_inner_batch_size:
+        _shared_kwargs = dict(
+            free_logits=free_logits, model=model, diff_model=diff_model,
+            stgs_module=stgs_module, embedding_weights=embedding_weights,
+            tokenizer=tokenizer, device=device, E_input_ids=E_input_ids,
+            E_embeds=E_embeds, extraction_fns=extraction_fns,
+            max_new_tokens_reasoning=max_new_tokens_reasoning,
+            max_new_tokens_answer=max_new_tokens_answer,
+            eval_mode=eval_mode,
+            reasoning_generation_backend=reasoning_generation_backend,
+            reasoning_generate_kwargs=reasoning_generate_kwargs,
+            use_chat_template=use_chat_template, epoch=epoch,
+            eval_split=eval_split, x_ids_cache=x_ids_cache,
+            x_embeds_cache=x_embeds_cache, accumulate_embeds=accumulate_embeds,
+            prompt_logits_transform=prompt_logits_transform,
+            eval_inner_batch_size=0,  # no further chunking within each mini-batch
         )
-        R_ids = r_gen.sequences[:, max_xp:]   # (B, max_new_tokens_reasoning)
-
-        # Stage 2: left-pad [x_i | p | R_i | E]
-        xpRE_seqs = [
-            torch.cat([x_ids_list[i], p_ids, R_ids[i:i+1], E_input_ids], dim=1)
-            for i in range(B)
-        ]
-        max_xpRE = max(s.shape[1] for s in xpRE_seqs)
-        xpRE_pad  = torch.full((B, max_xpRE), tokenizer.pad_token_id, dtype=torch.long, device=device)
-        xpRE_mask = torch.zeros(B, max_xpRE, dtype=torch.long, device=device)
-        for i, s in enumerate(xpRE_seqs):
-            L = s.shape[1]; xpRE_pad[i, max_xpRE-L:] = s[0]; xpRE_mask[i, max_xpRE-L:] = 1
-
-        y_gen   = model.generate(
-            input_ids=xpRE_pad, attention_mask=xpRE_mask,
-            max_new_tokens=max_new_tokens_answer,
-            pad_token_id=tokenizer.pad_token_id,
+        agg: Dict[str, float] = {}
+        total_n = 0
+        n_chunks = (len(eval_pairs) + eval_inner_batch_size - 1) // eval_inner_batch_size
+        chunk_pbar = tqdm(
+            total=n_chunks,
+            desc=f"{eval_split} eval chunks ({eval_mode})",
+            leave=False,
         )
-        Y_ids   = y_gen.sequences[:, max_xpRE:]   # (B, max_new_tokens_answer)
-        R_for_accuracy = R_ids
+        try:
+            for chunk_start in range(0, len(eval_pairs), eval_inner_batch_size):
+                chunk = eval_pairs[chunk_start:chunk_start + eval_inner_batch_size]
+                chunk_metrics = evaluate_shared_prompt_batched(eval_pairs=chunk, **_shared_kwargs)
+                n = len(chunk)
+                total_n += n
+                for k, v in chunk_metrics.items():
+                    agg[k] = agg.get(k, 0.0) + v * n
+                chunk_pbar.update(1)
+        finally:
+            chunk_pbar.close()
+        return {k: v / max(total_n, 1) for k, v in agg.items()}
 
-    else:  # soft
-        if x_embeds_cache:
-            x_emb_list = [
-                x_embeds_cache.get(x_str) or embedding_layer(x_ids_list[i])
-                for i, (x_str, _) in enumerate(eval_pairs)
+    with torch.no_grad():
+        embedding_layer = model.get_input_embeddings()
+        p_ids = free_logits.detach().argmax(dim=-1)   # (1, seq_len)
+
+        # Tokenize all x inputs
+        x_ids_list = []
+        for x_str, _ in eval_pairs:
+            if x_ids_cache and x_str in x_ids_cache:
+                x_ids_list.append(x_ids_cache[x_str])
+            else:
+                x_ids_list.append(_tokenize_x(x_str, tokenizer, device, use_chat_template))
+
+        B = len(eval_pairs)
+
+        if eval_mode == "discrete":
+            # Stage 1: left-pad [x_i | p] token ids for batched reasoning generate
+            xp_seqs = [torch.cat([xi, p_ids], dim=1) for xi in x_ids_list]
+            max_xp  = max(s.shape[1] for s in xp_seqs)
+            xp_pad  = torch.full((B, max_xp), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            xp_mask = torch.zeros(B, max_xp, dtype=torch.long, device=device)
+            for i, s in enumerate(xp_seqs):
+                L = s.shape[1]; xp_pad[i, max_xp-L:] = s[0]; xp_mask[i, max_xp-L:] = 1
+
+            _r_gen_kwargs = dict(reasoning_generate_kwargs or {}) if reasoning_generation_backend == "hf_generate" else {}
+            r_gen = model.generate(
+                input_ids=xp_pad, attention_mask=xp_mask,
+                max_new_tokens=max_new_tokens_reasoning,
+                pad_token_id=tokenizer.pad_token_id,
+                **_r_gen_kwargs,
+            )
+            R_ids = r_gen.sequences[:, max_xp:]   # (B, max_new_tokens_reasoning)
+
+            # Stage 2: left-pad [x_i | p | R_i | E]
+            xpRE_seqs = [
+                torch.cat([x_ids_list[i], p_ids, R_ids[i:i+1], E_input_ids], dim=1)
+                for i in range(B)
             ]
-        else:
-            with torch.no_grad():
+            max_xpRE = max(s.shape[1] for s in xpRE_seqs)
+            xpRE_pad  = torch.full((B, max_xpRE), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            xpRE_mask = torch.zeros(B, max_xpRE, dtype=torch.long, device=device)
+            for i, s in enumerate(xpRE_seqs):
+                L = s.shape[1]; xpRE_pad[i, max_xpRE-L:] = s[0]; xpRE_mask[i, max_xpRE-L:] = 1
+
+            y_gen   = model.generate(
+                input_ids=xpRE_pad, attention_mask=xpRE_mask,
+                max_new_tokens=max_new_tokens_answer,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            Y_ids   = y_gen.sequences[:, max_xpRE:]   # (B, max_new_tokens_answer)
+            R_for_accuracy = R_ids
+
+        else:  # soft
+            if x_embeds_cache:
+                x_emb_list = [
+                    x_embeds_cache.get(x_str) if x_embeds_cache.get(x_str) is not None else embedding_layer(x_ids_list[i])
+                    for i, (x_str, _) in enumerate(eval_pairs)
+                ]
+            else:
                 x_emb_list = [embedding_layer(xid) for xid in x_ids_list]
 
-        _, oh, _, _ = stgs_module(
-            free_logits, gumbel_noise_scale=0.0, embedding_weights=embedding_weights,
-        )
-        p_emb = oh @ embedding_weights.detach()   # (1, seq_len, d)
+            _, oh, _, _ = stgs_module(
+                free_logits, gumbel_noise_scale=0.0, embedding_weights=embedding_weights,
+            )
+            p_emb = oh @ embedding_weights.detach()   # (1, seq_len, d)
 
-        xp_seqs = [torch.cat([xe, p_emb], dim=1) for xe in x_emb_list]
-        xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, x_emb_list[0].dtype)
-        with torch.no_grad():
+            xp_seqs = [torch.cat([xe, p_emb], dim=1) for xe in x_emb_list]
+            xp_padded, xp_mask = _left_pad_embed_sequences(xp_seqs, device, x_emb_list[0].dtype)
+            _use_hf_backend = reasoning_generation_backend == "hf_generate"
+            _r_gen_extra = {"generation_backend": "hf_generate", "output_diff_one_hots": False, **(reasoning_generate_kwargs or {})} if _use_hf_backend else {}
             r_out = diff_model.generate(
                 inputs_embeds=xp_padded, attention_mask=xp_mask,
                 max_new_tokens=max_new_tokens_reasoning,
                 output_normal_logits=False, return_dict=True,
-                accumulate_embeds=accumulate_embeds,
+                accumulate_embeds=accumulate_embeds and not _use_hf_backend,
+                **_r_gen_extra,
             )
-        R_emb = (
-            r_out.sampled_diff_embeds if r_out.sampled_diff_embeds is not None
-            else r_out.sampled_diff_one_hot @ embedding_weights.detach()
-        ).detach()
-        R_ids_soft = r_out.sampled_diff_tokens   # (B, R_gen_len) for text decoding
+            if _use_hf_backend:
+                R_emb = embedding_layer(r_out.sampled_diff_tokens.long()).detach()
+            else:
+                R_emb = (
+                    r_out.sampled_diff_embeds if r_out.sampled_diff_embeds is not None
+                    else r_out.sampled_diff_one_hot @ embedding_weights.detach()
+                ).detach()
+            R_ids_soft = r_out.sampled_diff_tokens   # (B, R_gen_len) for text decoding
 
-        xpRE_seqs = [
-            torch.cat([x_emb_list[i], p_emb, R_emb[i:i+1], E_embeds], dim=1)
-            for i in range(B)
-        ]
-        xpRE_padded, xpRE_mask = _left_pad_embed_sequences(xpRE_seqs, device, x_emb_list[0].dtype)
-        with torch.no_grad():
+            xpRE_seqs = [
+                torch.cat([x_emb_list[i], p_emb, R_emb[i:i+1], E_embeds], dim=1)
+                for i in range(B)
+            ]
+            xpRE_padded, xpRE_mask = _left_pad_embed_sequences(xpRE_seqs, device, x_emb_list[0].dtype)
             y_out = diff_model.generate(
                 inputs_embeds=xpRE_padded, attention_mask=xpRE_mask,
                 max_new_tokens=max_new_tokens_answer,
                 output_normal_logits=False, return_dict=True,
             )
-        Y_ids = y_out.sampled_diff_tokens          # (B, max_new_tokens_answer)
-        R_for_accuracy = R_ids_soft
+            Y_ids = y_out.sampled_diff_tokens          # (B, max_new_tokens_answer)
+            R_for_accuracy = R_ids_soft
 
-    # Aggregate accuracy
-    any_correct    = 0
-    all_correct    = 0
-    method_correct: Dict[str, int] = {m: 0 for m in extraction_fns}
-    for i, (_, y_raw) in enumerate(eval_pairs):
-        R_text = tokenizer.decode(R_for_accuracy[i].tolist(), skip_special_tokens=True)
-        Y_text = tokenizer.decode(Y_ids[i].tolist(), skip_special_tokens=True)
-        res = _compute_method_results(
-            R_text=R_text, Y_text=Y_text,
-            y_raw_str=y_raw, extraction_fns=extraction_fns,
+        # Aggregate accuracy
+        any_correct    = 0
+        all_correct    = 0
+        method_correct: Dict[str, int] = {m: 0 for m in extraction_fns}
+        for i, (_, y_raw) in enumerate(eval_pairs):
+            R_text = tokenizer.decode(R_for_accuracy[i].tolist(), skip_special_tokens=True)
+            Y_text = tokenizer.decode(Y_ids[i].tolist(), skip_special_tokens=True)
+            res = _compute_method_results(
+                R_text=R_text, Y_text=Y_text,
+                y_raw_str=y_raw, extraction_fns=extraction_fns,
+            )
+            for m, ok in res.items():
+                if ok: method_correct[m] += 1
+            any_correct += int(any(res.values()))
+            all_correct += int(all(res.values()))
+            if is_weave_active():
+                _p_text = tokenizer.decode(p_ids.squeeze(0).tolist(), skip_special_tokens=False)
+                _p_text_clean = tokenizer.decode(p_ids.squeeze(0).tolist(), skip_special_tokens=True)
+                weave_lm_eval_step(
+                    call_name="answer_generate_batched_eval",
+                    split=eval_split,
+                    epoch=epoch,
+                    lm_name="model.generate" if eval_mode == "discrete" else "diff_model.generate",
+                    input_mode="input_ids" if eval_mode == "discrete" else "inputs_embeds",
+                    output_mode="generated_tokens",
+                    call_role="answer",
+                    batched=True,
+                    eval_mode=eval_mode,
+                    reasoning_generation_backend=reasoning_generation_backend,
+                    use_chat_template=use_chat_template,
+                    x_text_raw=eval_pairs[i][0],
+                    p_text_argmax=_p_text,
+                    p_text_argmax_clean=_p_text_clean,
+                    R_text_clean=R_text,
+                    Y_text_clean=Y_text,
+                    y_target=y_raw,
+                    correct_per_method=res,
+                    any_correct=any(res.values()),
+                    all_correct=all(res.values()),
+                )
+
+        return _metrics_from_accuracy_counts(
+            per_method_correct=method_correct,
+            any_correct_count=any_correct,
+            all_correct_count=all_correct,
+            n_examples=B,
+            extraction_fns=extraction_fns,
         )
-        for m, ok in res.items():
-            if ok: method_correct[m] += 1
-        any_correct += int(any(res.values()))
-        all_correct += int(all(res.values()))
 
-    out: Dict[str, float] = {
-        "any_correct": any_correct / max(B, 1),
-        "all_correct": all_correct / max(B, 1),
+
+# ---------------------------------------------------------------------------
+# LoRA SVD initialization utilities
+# ---------------------------------------------------------------------------
+
+def lora_svd_reconstruct(
+    token_ids: List[int],
+    lora_rank: int,
+    embedding_weights: Tensor,
+    vocab_size: int,
+    device: torch.device,
+    spike: float = 10.0,
+) -> Dict[str, Any]:
+    """Decompose a one-hot logit matrix via rank-r SVD and decode all three
+    reconstruction methods (argmax, embsim-l2, embsim-cos).
+
+    Creates a ``(seq_len, vocab_size)`` one-hot matrix with *spike* at each
+    target token position, computes the rank-*r* truncated SVD factorisation
+    ``lora_A @ lora_B ≈ M``, then decodes the approximation with three
+    methods so the caller can compare reconstruction quality.
+
+    Args:
+        token_ids:        Target token ID sequence (length = seq_len).
+        lora_rank:        Desired LoRA rank; clamped to ``min(rank, seq_len)``.
+        embedding_weights: ``(vocab_size, embed_dim)`` embedding table (detached).
+        vocab_size:       Vocabulary size.
+        device:           PyTorch device for all tensors.
+        spike:            Logit value placed at each target token position in
+                          the one-hot matrix (default 10.0).
+
+    Returns:
+        Dict with keys:
+
+        * ``lora_A`` – ``(1, seq_len, effective_rank)`` tensor (no grad).
+        * ``lora_B`` – ``(1, effective_rank, vocab_size)`` tensor (no grad).
+        * ``reconstructed`` – ``(seq_len, vocab_size)`` float tensor
+          ``= lora_A.squeeze(0) @ lora_B.squeeze(0)``.
+        * ``effective_rank`` – actual rank used after clamping.
+        * ``recon_error`` – Frobenius norm ``||M - reconstructed||_F``.
+        * ``argmax_ids`` – ``List[int]`` from ``argmax(reconstructed, dim=-1)``.
+        * ``embsim_l2_ids`` – ``List[int]`` nearest token by L2 distance.
+        * ``embsim_cos_ids`` – ``List[int]`` nearest token by cosine similarity.
+    """
+    seq_len = len(token_ids)
+    token_ids_t = torch.tensor(token_ids, dtype=torch.long, device=device)
+
+    # Build one-hot logit matrix.
+    oh = torch.zeros(seq_len, vocab_size, device=device)
+    oh[torch.arange(seq_len, device=device), token_ids_t] = spike
+
+    # Rank-r SVD decomposition.
+    mat = oh.float()
+    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    r = min(lora_rank, S.shape[0])
+    sq = S[:r].sqrt()
+    A = (U[:, :r] * sq.unsqueeze(0))    # (seq_len, r)
+    B = (sq.unsqueeze(1) * Vh[:r, :])   # (r, vocab_size)
+    lora_A = A.unsqueeze(0)             # (1, seq_len, r)
+    lora_B = B.unsqueeze(0)             # (1, r, vocab_size)
+
+    reconstructed = (lora_A @ lora_B).squeeze(0).float()  # (seq_len, vocab_size)
+    recon_error = float((oh.float() - reconstructed).norm().item())
+
+    # Argmax reconstruction.
+    argmax_ids = reconstructed.argmax(dim=-1).cpu().tolist()
+
+    # Embsim-L2 and embsim-cos reconstructions.
+    with torch.no_grad():
+        _emb = embedding_weights.float().to(device)     # (vocab, embed_dim)
+        _probs = torch.softmax(reconstructed.unsqueeze(0), dim=-1)  # (1, seq_len, vocab)
+        _soft_emb = torch.matmul(_probs, _emb)          # (1, seq_len, embed_dim)
+
+        # L2.
+        _soft_sq = (_soft_emb ** 2).sum(dim=-1, keepdim=True)   # (1, seq_len, 1)
+        _emb_sq = (_emb ** 2).sum(dim=-1)                        # (vocab,)
+        _cross = torch.matmul(_soft_emb, _emb.T)                 # (1, seq_len, vocab)
+        _l2_sq = _soft_sq - 2 * _cross + _emb_sq                 # (1, seq_len, vocab)
+        embsim_l2_ids = _l2_sq.argmin(dim=-1).squeeze(0).cpu().tolist()
+
+        # Cosine.
+        _soft_norm = F.normalize(_soft_emb, dim=-1, eps=1e-10)   # (1, seq_len, embed_dim)
+        _e_norm = F.normalize(_emb, dim=-1, eps=1e-10)            # (vocab, embed_dim)
+        _cos_sim = torch.matmul(_soft_norm, _e_norm.T)            # (1, seq_len, vocab)
+        embsim_cos_ids = _cos_sim.argmax(dim=-1).squeeze(0).cpu().tolist()
+
+    return {
+        "lora_A": lora_A.detach().cpu(),
+        "lora_B": lora_B.detach().cpu(),
+        "reconstructed": reconstructed.cpu(),
+        "effective_rank": r,
+        "recon_error": recon_error,
+        "argmax_ids": argmax_ids,
+        "embsim_l2_ids": embsim_l2_ids,
+        "embsim_cos_ids": embsim_cos_ids,
     }
-    for m, cnt in method_correct.items():
-        out[f"{m}_correct"] = cnt / max(B, 1)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1781,11 +2118,14 @@ def pc_optimize_inputs(
     # Optimization
     seq_len: int = 20,
     initial_prompt_text: Optional[str] = None,
+    initial_prompt_lora_reconstruction: str = "argmax",
+    initial_prompt_lora_spike: float = 10.0,
     epochs: int = 2000,
     learning_rate: float = 0.01,
     inner_batch_size: int = 4,
     batch_size: Optional[int] = None,
     # STGS for prompt p
+    stgs_module: STGS = None,
     temperature: float = 1.0,
     learnable_temperature: bool = False,
     decouple_learnable_temperature: bool = False,
@@ -1832,6 +2172,12 @@ def pc_optimize_inputs(
     init_mlm_top_k: int = 50,
     logits_lora_rank: int = 0,
     logits_lora_b_learning_rate: Optional[float] = None,
+    # LR scheduler
+    lr_schedule: str = "none",
+    lr_warmup_epochs: int = 0,
+    lr_schedule_min: float = 0.0,
+    lr_schedule_step_size: int = 10,
+    lr_schedule_gamma: float = 0.1,
     # Schedule
     max_gradient_norm: float = 0.0,
     temperature_anneal_schedule: str = "none",
@@ -1882,11 +2228,19 @@ def pc_optimize_inputs(
     use_batched_forward_pass: bool = False,
     batched_stgs_noise_mode: str = "shared",       # "shared" | "independent"
     # Batched evaluation
-    use_batched_eval: bool = False,
+    use_batched_val_eval: bool = False,
+    eval_inner_batch_size: int = 0,
     # Gradient accumulation
     gradient_accumulation_steps: int = 1,
+    # SWA (Stochastic Weight Averaging over prompt logits)
+    use_swa: bool = False,
+    swa_start_epoch: Optional[int] = None,
+    swa_freq: int = 1,
+    # Multi-Gumbel sampling (N independent draws per mini-batch, losses averaged)
+    gumbel_n_samples: int = 1,
     # Pre-training validation
     val_eval_before_training: bool = False,
+    test_eval_before_training: bool = False,
     # Chat template
     use_chat_template: bool = False,
     # Memory / speed optimizations
@@ -1894,6 +2248,16 @@ def pc_optimize_inputs(
     prompt_logits_transform: Optional[
         Callable[[Tensor, Sequence[Tuple[str, str]]], Tensor]
     ] = None,
+    # MAS rotational metric (opt-in; requires logits_lora_rank > 0)
+    mas_metric_every: int = 0,
+    mas_hvp_mode: str = "autograd",   # "autograd" | "jvp"
+    # Offline EM: cache reasoning at E-step, optimize prompt at M-step
+    offline_em: bool = False,
+    offline_em_resample_every: int = 0,          # 0 = never resample; N > 0 = resample every N epochs
+    offline_em_stgs_method: str = "soft",        # "argmax"|"embsim-dot"|"embsim-cos"|"embsim-l2"|"soft"
+    offline_em_stgs_embsim_probs: str = "gumbel_soft",       # "gumbel_soft"|"input_logits"
+    offline_em_temperature: Union[str, float] = "learned",   # "learned" | float
+    offline_em_cache_batch_size: int = 0,                    # 0 = fall back to inner_batch_size
     # Extra kwargs forwarded to LossClass
     kwargs: dict = {},
 ) -> Dict:
@@ -1929,6 +2293,8 @@ def pc_optimize_inputs(
         "fixed_gt_suffix_rank2_n": fixed_gt_suffix_rank2_n,
         "init_strategy": init_strategy,
         "superposition_metric_every": kwargs.get("superposition_metric_every", 0),
+        "offline_em": offline_em,
+        "use_batched_forward_pass": use_batched_forward_pass,
     }
     ensure_pc_main_compatibility(compatibility_config)
 
@@ -1964,6 +2330,8 @@ def pc_optimize_inputs(
             "reasoning_generate_kwargs may not override internally managed generation arguments; "
             f"got reserved keys: {', '.join(overlapping_reasoning_keys)}"
         )
+    if use_swa and swa_start_epoch is None:
+        swa_start_epoch = int(0.75 * epochs)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     if discrete_reinit_entropy_threshold < 0.0:
@@ -2132,30 +2500,44 @@ def pc_optimize_inputs(
     # One-hot initialization from initial_prompt_text
     if _initial_prompt_token_ids is not None:
         _oh = torch.zeros(1, seq_len, vocab_size, device=device)
-        _oh[0, torch.arange(seq_len, device=device), _initial_prompt_token_ids.long()] = 10.0
+        _oh[0, torch.arange(seq_len, device=device), _initial_prompt_token_ids.long()] = initial_prompt_lora_spike
 
         if logits_lora_rank > 0:
-            # SVD rank-r approximation of the one-hot logit matrix into lora_A @ lora_B.
-            mat = _oh.squeeze(0).float()                   # (seq_len, vocab_size)
-            U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
-            r = min(logits_lora_rank, S.shape[0])
-            sq = S[:r].sqrt()
-            A = (U[:, :r] * sq.unsqueeze(0)).to(device)   # (seq_len, r)
-            B = (sq.unsqueeze(1) * Vh[:r, :]).to(device)  # (r, vocab_size)
-            lora_A = A.unsqueeze(0).detach().to(_oh.dtype).requires_grad_(True)
-            lora_B = B.unsqueeze(0).detach().to(_oh.dtype).requires_grad_(True)
+            # SVD rank-r approximation via shared utility.
+            _svd = lora_svd_reconstruct(
+                token_ids=_initial_prompt_token_ids.cpu().tolist(),
+                lora_rank=logits_lora_rank,
+                embedding_weights=embedding_weights,
+                vocab_size=vocab_size,
+                device=device,
+                spike=initial_prompt_lora_spike,
+            )
+            r = _svd["effective_rank"]
+            lora_A = _svd["lora_A"].to(device).to(_oh.dtype).requires_grad_(True)
+            lora_B = _svd["lora_B"].to(device).to(_oh.dtype).requires_grad_(True)
             parameters = [lora_A, lora_B]
 
-            # Measure reconstruction quality.
-            reconstructed = (lora_A.detach() @ lora_B.detach()).squeeze(0)  # (seq_len, vocab)
-            recon_ids = reconstructed.argmax(dim=-1).cpu().tolist()
             requested_ids = _initial_prompt_token_ids.cpu().tolist()
             requested_text_dec = tokenizer.decode(requested_ids, skip_special_tokens=False)
-            reconstructed_text_dec = tokenizer.decode(recon_ids, skip_special_tokens=False)
-            recon_error = float(
-                (_oh.squeeze(0).float() - reconstructed.float()).norm().item()
-            )
+            recon_error = _svd["recon_error"]
+            argmax_ids = _svd["argmax_ids"]
+            embsim_l2_ids = _svd["embsim_l2_ids"]
+            embsim_cos_ids = _svd["embsim_cos_ids"]
+            argmax_text_dec = tokenizer.decode(argmax_ids, skip_special_tokens=False)
+            embsim_l2_text_dec = tokenizer.decode(embsim_l2_ids, skip_special_tokens=False)
+            embsim_cos_text_dec = tokenizer.decode(embsim_cos_ids, skip_special_tokens=False)
+
+            # Select the primary reconstruction according to the chosen method.
+            _recon_map = {
+                "argmax": (argmax_ids, argmax_text_dec),
+                "embsim-l2": (embsim_l2_ids, embsim_l2_text_dec),
+                "embsim-cos": (embsim_cos_ids, embsim_cos_text_dec),
+            }
+            recon_ids, reconstructed_text_dec = _recon_map[initial_prompt_lora_reconstruction]
             is_exact = (recon_ids == requested_ids)
+
+            def _label(method: str) -> str:
+                return " [PRIMARY]" if method == initial_prompt_lora_reconstruction else ""
 
             # Loud warning — printed to both stdout and stderr so it is
             # impossible to miss in logs or terminal output.
@@ -2165,9 +2547,11 @@ def pc_optimize_inputs(
                 _SEP,
                 "  LOSSY INIT WARNING: initial_prompt_text + logits_lora_rank > 0",
                 f"  Rank-{r} SVD of one-hot logits (seq_len={seq_len}, vocab={vocab_size})",
-                f"  Requested    : {requested_text_dec!r}",
-                f"  Argmax(lora) : {reconstructed_text_dec!r}",
-                f"  Token-exact  : {is_exact}",
+                f"  Requested          : {requested_text_dec!r}",
+                f"  Argmax(lora){_label('argmax')}: {argmax_text_dec!r}",
+                f"  EmbsimL2(lora){_label('embsim-l2')}: {embsim_l2_text_dec!r}",
+                f"  EmbsimCos(lora){_label('embsim-cos')}: {embsim_cos_text_dec!r}",
+                f"  Token-exact [{initial_prompt_lora_reconstruction}]: {is_exact}",
                 f"  ||M - AB||_F : {recon_error:.4f}",
                 _SEP,
                 "",
@@ -2177,9 +2561,11 @@ def pc_optimize_inputs(
             print(_msg, file=sys.stderr, flush=True)
             logger.warning(
                 "initial_prompt_text with logits_lora_rank=%d: rank-%d SVD approximation. "
-                "requested=%r  argmax_init=%r  token_exact=%s  recon_error=%.4f",
+                "reconstruction_method=%s  requested=%r  argmax=%r  embsim_l2=%r  embsim_cos=%r  "
+                "token_exact=%s  recon_error=%.4f",
                 logits_lora_rank, r,
-                requested_text_dec, reconstructed_text_dec,
+                initial_prompt_lora_reconstruction,
+                requested_text_dec, argmax_text_dec, embsim_l2_text_dec, embsim_cos_text_dec,
                 is_exact, recon_error,
             )
 
@@ -2190,9 +2576,14 @@ def pc_optimize_inputs(
                     reconstructed_text=reconstructed_text_dec,
                     reconstructed_token_ids=recon_ids,
                     reconstruction_error=recon_error,
+                    reconstruction_method=initial_prompt_lora_reconstruction,
                     lora_rank=r,
                     seq_len=seq_len,
                     is_exact=is_exact,
+                    embsim_l2_text=embsim_l2_text_dec,
+                    embsim_l2_token_ids=embsim_l2_ids,
+                    embsim_cos_text=embsim_cos_text_dec,
+                    embsim_cos_token_ids=embsim_cos_ids,
                 )
 
         else:
@@ -2213,26 +2604,27 @@ def pc_optimize_inputs(
     # -----------------------------------------------------------------------
     # STGS module for the shared prompt p
     # -----------------------------------------------------------------------
-    stgs_module = STGS(
-        vocab_size=vocab_size,
-        stgs_hard=stgs_hard,
-        stgs_hard_method=stgs_hard_method,
-        init_temperature=temperature,
-        learnable_temperature=learnable_temperature,
-        nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
-        stgs_hard_embsim_probs=stgs_hard_embsim_probs,
-        stgs_hard_embsim_strategy=stgs_hard_embsim_strategy,
-        stgs_hard_embsim_top_k=stgs_hard_embsim_top_k,
-        stgs_hard_embsim_rerank_alpha=stgs_hard_embsim_rerank_alpha,
-        stgs_hard_embsim_sample_tau=stgs_hard_embsim_sample_tau,
-        stgs_hard_embsim_margin=stgs_hard_embsim_margin,
-        stgs_hard_embsim_fallback=stgs_hard_embsim_fallback,
-        logits_normalize=logits_normalize,
-        input_dropout=stgs_input_dropout,
-        output_dropout=stgs_output_dropout,
-        eps=eps,
-        device=device,
-    )
+    if stgs_module is None:
+        stgs_module = STGS(
+            vocab_size=vocab_size,
+            stgs_hard=stgs_hard,
+            stgs_hard_method=stgs_hard_method,
+            init_temperature=temperature,
+            learnable_temperature=learnable_temperature,
+            nbr_learnable_temperatures=seq_len if decouple_learnable_temperature else None,
+            stgs_hard_embsim_probs=stgs_hard_embsim_probs,
+            stgs_hard_embsim_strategy=stgs_hard_embsim_strategy,
+            stgs_hard_embsim_top_k=stgs_hard_embsim_top_k,
+            stgs_hard_embsim_rerank_alpha=stgs_hard_embsim_rerank_alpha,
+            stgs_hard_embsim_sample_tau=stgs_hard_embsim_sample_tau,
+            stgs_hard_embsim_margin=stgs_hard_embsim_margin,
+            stgs_hard_embsim_fallback=stgs_hard_embsim_fallback,
+            logits_normalize=logits_normalize,
+            input_dropout=stgs_input_dropout,
+            output_dropout=stgs_output_dropout,
+            eps=eps,
+            device=device,
+        )
     parameters += list(stgs_module.parameters())
 
     optimizer = build_prompt_optimizer(
@@ -2240,6 +2632,15 @@ def pc_optimize_inputs(
         learning_rate=learning_rate,
         lora_B=lora_B,
         logits_lora_b_learning_rate=logits_lora_b_learning_rate,
+    )
+    lr_scheduler = build_lr_scheduler(
+        optimizer,
+        schedule=lr_schedule,
+        total_epochs=epochs,
+        warmup_epochs=lr_warmup_epochs,
+        lr_min=lr_schedule_min,
+        step_size=lr_schedule_step_size,
+        gamma=lr_schedule_gamma,
     )
 
     # -----------------------------------------------------------------------
@@ -2283,6 +2684,52 @@ def pc_optimize_inputs(
             parts.append(fixed_suffix)
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
+    def _build_mas_loss_fn(mini_batch, mini_batch_pair_contexts):
+        """Return a Callable A_val -> loss for the last sample in mini_batch.
+
+        Used by mas_hvp_mode='jvp' to compute MAS rotational metrics without
+        create_graph=True.  Captures caches and frozen params by reference;
+        mini_batch / mini_batch_pair_contexts are passed explicitly so they
+        are snapshot-frozen at call time.
+        """
+        _x_str, _R_str, _y_str = mini_batch[-1]
+        _loss_inst = loss_cache[(_y_str, Y_tokens_cache[_y_str].shape[1])]
+        _lora_B_d  = lora_B.detach()
+
+        def _loss_fn(A_val: Tensor) -> Tensor:
+            _active = A_val @ _lora_B_d           # (1, n_free, vocab)
+            if length_alpha is not None:
+                _lam = n_free * torch.sigmoid(length_alpha.detach())
+                _i   = torch.arange(n_free, 0, -1, device=device, dtype=_active.dtype)
+                _g   = torch.sigmoid(prompt_length_beta * (_lam - _i))
+                _active = _g.view(1, n_free, 1) * _active + (1.0 - _g.view(1, n_free, 1)) * eos_logit_template.detach()
+            _parts = []
+            if fixed_prefix is not None:
+                _parts.append(fixed_prefix.detach())
+            if n_free > 0:
+                _parts.append(_active)
+            _fl = torch.cat(_parts, dim=1) if _parts else _active
+            if prompt_logits_transform is not None:
+                _fl = prompt_logits_transform(_fl, mini_batch_pair_contexts)
+            return pc_forward_pass(
+                diff_model=diff_model, stgs_module=stgs_module,
+                loss_instance=_loss_inst, free_logits=_fl,
+                embedding_weights=embedding_weights,
+                x_ids=x_ids_cache[_x_str], x_embeds=x_embeds_cache[_x_str], x_text_raw=_x_str,
+                R_gt_ids=R_gt_ids_cache[(_x_str, _R_str)],
+                R_gt_embeds=R_gt_embeds_cache[(_x_str, _R_str)], R_gt_text_raw=_R_str,
+                E_input_ids=E_input_ids, E_embeds=E_embeds,
+                Y_tokens=Y_tokens_cache[_y_str], y_target_text_raw=_y_str,
+                use_chat_template=use_chat_template, teacher_forcing_r=teacher_forcing_r,
+                bptt=bptt, reasoning_generation_backend=reasoning_generation_backend,
+                reasoning_generate_kwargs=reasoning_generate_kwargs,
+                max_new_tokens_reasoning=max_new_tokens_reasoning,
+                max_new_tokens_answer=max_new_tokens_answer,
+                gumbel_noise_scale=current_gumbel_scale,
+                accumulate_embeds=accumulate_embeds, tokenizer=tokenizer, weave_extras={},
+            )
+        return _loss_fn
+
     superposition_callback = None
     if superposition_metric_every > 0:
         try:
@@ -2313,6 +2760,9 @@ def pc_optimize_inputs(
     train_accuracy_history: List[Dict] = []
     val_accuracy_history: List[Dict] = []
     current_gumbel_scale = gumbel_noise_scale
+    # SWA state
+    swa_logits_accum: Optional[torch.Tensor] = None
+    swa_n: int = 0
     ema_loss = None
     anneal_total = temperature_anneal_epochs if temperature_anneal_epochs > 0 else epochs
     _ppo_ref_logits: Optional[Tensor] = None
@@ -2367,7 +2817,7 @@ def pc_optimize_inputs(
 
     # Pre-training validation (epoch -1)
     if val_eval_before_training and val_pairs:
-        _eval_fn = evaluate_shared_prompt_batched if use_batched_eval else evaluate_shared_prompt
+        _eval_fn = evaluate_shared_prompt_batched if use_batched_val_eval else evaluate_shared_prompt
         _pre_fl = _assemble_prompt_logits().detach()
         _pre_val_metrics = _eval_fn(
             free_logits=_pre_fl,
@@ -2393,11 +2843,54 @@ def pc_optimize_inputs(
             x_embeds_cache=x_embeds_cache if val_prompt_eval_mode == "soft" else None,
             accumulate_embeds=accumulate_embeds,
             prompt_logits_transform=prompt_logits_transform,
+            eval_inner_batch_size=eval_inner_batch_size,
         )
         _pre_val_metrics["epoch"] = -1
         val_accuracy_history.append(_pre_val_metrics)
         if wandb.run is not None:
             wandb.log({f"val/{k}": v for k, v in _pre_val_metrics.items()})
+    if test_eval_before_training and per_epoch_callback is not None:
+        _pre_fl = _assemble_prompt_logits().detach()
+        _pre_test_metrics = per_epoch_callback(-1, _pre_fl)
+        if _pre_test_metrics and wandb.run is not None:
+            wandb.log(_pre_test_metrics)
+
+    # -----------------------------------------------------------------------
+    # Offline EM: E-step closure + initial cache
+    # -----------------------------------------------------------------------
+    offline_r_cache: Optional[Dict[str, Tensor]] = None
+
+    def _run_e_step(epoch_label: int) -> Dict[str, Tensor]:
+        logger.info("[Offline EM] Generating reasoning cache (E-step at epoch %d)...", epoch_label)
+        _fl = _assemble_prompt_logits().detach()
+        # Use only the free (non-fixed) portion of the logits for p_embeds, matching what
+        # pc_forward_pass_batched_free does during M-step.
+        _result = _generate_offline_reasoning_cache(
+            diff_model=diff_model,
+            free_logits=_fl,
+            x_embeds_cache=x_embeds_cache,
+            train_triples=train_triples,
+            stgs_module=stgs_module,
+            embedding_weights=embedding_weights,
+            offline_em_stgs_method=offline_em_stgs_method,
+            offline_em_stgs_embsim_probs=offline_em_stgs_embsim_probs,
+            offline_em_temperature=offline_em_temperature,
+            max_new_tokens_reasoning=max_new_tokens_reasoning,
+            reasoning_generation_backend=reasoning_generation_backend,
+            reasoning_generate_kwargs=reasoning_generate_kwargs,
+            cache_batch_size=offline_em_cache_batch_size or inner_batch_size,
+            device=device,
+        )
+        if wandb.run is not None:
+            wandb.log({
+                "offline_em/cache_refreshed_epoch": epoch_label,
+                "offline_em/cache_size": len(_result),
+            })
+        logger.info("[Offline EM] Cache ready: %d unique x_strs.", len(_result))
+        return _result
+
+    if offline_em:
+        offline_r_cache = _run_e_step(epoch_label=0)
 
     try:
         for epoch in range(epochs):
@@ -2408,6 +2901,15 @@ def pc_optimize_inputs(
             )
             if not learnable_temperature:
                 stgs_module.init_temperature = current_temperature
+
+            # Offline EM: periodic E-step refresh
+            if (
+                offline_em
+                and offline_em_resample_every > 0
+                and epoch > 0
+                and epoch % offline_em_resample_every == 0
+            ):
+                offline_r_cache = _run_e_step(epoch_label=epoch)
 
             discrete_reinit_applied = False
             discrete_reinit_num_positions = 0
@@ -2526,6 +3028,11 @@ def pc_optimize_inputs(
                     )
 
                     loss_scale = n_batch * max(gradient_accumulation_steps, 1)
+                    _is_mas_iter = (
+                        mas_metric_every > 0
+                        and lora_A is not None
+                        and global_iteration % mas_metric_every == 0
+                    )
                     if use_batched_forward_pass:
                         _x_emb   = [x_embeds_cache[x]         for x, _, _ in mini_batch]
                         _R_emb   = [R_gt_embeds_cache[(x, R)]  for x, R, _ in mini_batch]
@@ -2535,7 +3042,7 @@ def pc_optimize_inputs(
                             for _, _, y in mini_batch
                         ]
 
-                        per_losses, y_logits_list = pc_forward_pass_batched(
+                        _bfp_kwargs = dict(
                             diff_model=diff_model, stgs_module=stgs_module,
                             loss_instances=_losses_,
                             free_logits=fl_batch, embedding_weights=embedding_weights,
@@ -2550,11 +3057,31 @@ def pc_optimize_inputs(
                             gumbel_noise_scale=current_gumbel_scale,
                             accumulate_embeds=accumulate_embeds,
                             stgs_noise_mode=batched_stgs_noise_mode,
+                            offline_r_cache=offline_r_cache,
+                            x_strs_batch=[x for x, _, _ in mini_batch],
                         )
+                        if gumbel_n_samples > 1:
+                            _all_batched_outs = [
+                                pc_forward_pass_batched(**_bfp_kwargs)
+                                for _ in range(gumbel_n_samples)
+                            ]
+                            _batched_out = _all_batched_outs[0]
+                            per_losses = [
+                                torch.stack([out["losses"][si] for out in _all_batched_outs]).mean()
+                                for si in range(n_batch)
+                            ]
+                        else:
+                            _batched_out = pc_forward_pass_batched(**_bfp_kwargs)
+                            per_losses = _batched_out["losses"]
+                        y_logits_list  = _batched_out["y_logits_list"]
+                        R_tokens_batch = _batched_out["R_tokens"]
                         for si, (loss, y_lg, (x_str, R_gt_str, y_raw_str)) in enumerate(
                             zip(per_losses, y_logits_list, mini_batch)
                         ):
-                            (loss / loss_scale).backward(retain_graph=si < n_batch - 1)
+                            # Retain all graphs on MAS iterations when using autograd mode so
+                            # compute_rotational_metrics can reuse the graph after the loop.
+                            _retain = (si < n_batch - 1) or (_is_mas_iter and mas_hvp_mode == "autograd")
+                            (loss / loss_scale).backward(retain_graph=_retain)
                             batch_loss += loss.item()
                             train_Y_text = (
                                 tokenizer.decode(
@@ -2562,7 +3089,14 @@ def pc_optimize_inputs(
                                     skip_special_tokens=True,
                                 ) if y_lg is not None else ""
                             )
-                            train_R_text = R_gt_str if teacher_forcing_r else ""
+                            if teacher_forcing_r:
+                                train_R_text = R_gt_str
+                            elif R_tokens_batch is not None:
+                                train_R_text = tokenizer.decode(
+                                    R_tokens_batch[si].tolist(), skip_special_tokens=True,
+                                )
+                            else:
+                                train_R_text = ""
                             train_method_results = _compute_method_results(
                                 R_text=train_R_text, Y_text=train_Y_text,
                                 y_raw_str=y_raw_str, extraction_fns=extraction_fns,
@@ -2572,6 +3106,34 @@ def pc_optimize_inputs(
                             train_any_correct_count += int(any(train_method_results.values()))
                             train_all_correct_count += int(all(train_method_results.values()))
                             epoch_train_examples += 1
+                            if is_weave_active():
+                                weave_lm_train_step(
+                                    call_name=(
+                                        "teacher_forced_answer_forward_batched"
+                                        if teacher_forcing_r else "answer_generate_batched"
+                                    ),
+                                    split="train",
+                                    epoch=epoch,
+                                    iteration=iteration,
+                                    global_iteration=global_iteration,
+                                    loss=loss.item(),
+                                    teacher_forcing_r=teacher_forcing_r,
+                                    reasoning_generation_backend=reasoning_generation_backend,
+                                    x_text_raw=x_str,
+                                    p_text_batch_argmax=p_text_batch,
+                                    R_gt_text=R_gt_str,
+                                    R_text_clean=train_R_text,
+                                    Y_text_clean=train_Y_text,
+                                    y_target=y_raw_str,
+                                    correct_per_method=train_method_results,
+                                    any_correct=any(train_method_results.values()),
+                                    all_correct=all(train_method_results.values()),
+                                    lm_name="diff_model.forward" if teacher_forcing_r else "diff_model.generate",
+                                    input_mode="inputs_embeds",
+                                    output_mode="normal_logits" if teacher_forcing_r else "generated_tokens",
+                                    call_role="answer",
+                                    batched=True,
+                                )
                             train_metrics_running = _metrics_from_accuracy_counts(
                                 per_method_correct=train_method_correct,
                                 any_correct_count=train_any_correct_count,
@@ -2579,7 +3141,26 @@ def pc_optimize_inputs(
                                 n_examples=epoch_train_examples,
                                 extraction_fns=extraction_fns,
                             )
+                        # MAS rotational metric — batched path
+                        if _is_mas_iter:
+                            try:
+                                if mas_hvp_mode == "jvp":
+                                    from mas_analysis import compute_rotational_metrics_jvp
+                                    _mas_raw = compute_rotational_metrics_jvp(
+                                        _build_mas_loss_fn(mini_batch, mini_batch_pair_contexts), lora_A
+                                    )
+                                else:
+                                    from mas_analysis import compute_rotational_metrics
+                                    _mas_raw = compute_rotational_metrics(per_losses[-1], lora_A)
+                                if wandb.run is not None:
+                                    wandb.log({f"mas/{k}": v for k, v in _mas_raw.items()})
+                            except Exception as exc:
+                                logger.warning(
+                                    "MAS rotational metric skipped at iteration %d: %s",
+                                    global_iteration, exc,
+                                )
                     else:
+                        _mas_last_loss = None  # last sample's loss tensor for MAS (single-sample estimate)
                         for sample_idx, (x_str, R_gt_str, y_raw_str) in enumerate(mini_batch):
                             x_ids = x_ids_cache[x_str]
                             x_embeds = x_embeds_cache[x_str]
@@ -2590,7 +3171,7 @@ def pc_optimize_inputs(
                             loss_instance = loss_cache[(y_raw_str, Y_len)]
 
                             weave_extras: Dict = {}
-                            loss = pc_forward_pass(
+                            _fp_kwargs = dict(
                                 diff_model=diff_model,
                                 stgs_module=stgs_module,
                                 loss_instance=loss_instance,
@@ -2618,7 +3199,21 @@ def pc_optimize_inputs(
                                 tokenizer=tokenizer,
                                 weave_extras=weave_extras,
                             )
-                            (loss / loss_scale).backward(retain_graph=sample_idx < (n_batch - 1))
+                            if gumbel_n_samples > 1:
+                                _g_losses = [
+                                    pc_forward_pass(**_fp_kwargs)
+                                    for _ in range(gumbel_n_samples)
+                                ]
+                                loss = torch.stack(_g_losses).mean()
+                            else:
+                                loss = pc_forward_pass(**_fp_kwargs)
+                            # Capture last sample's loss for MAS (single-sample estimate; only on MAS iterations)
+                            if _is_mas_iter and sample_idx == n_batch - 1:
+                                _mas_last_loss = loss  # unscaled; single sample for MAS
+                            # Retain all graphs on MAS iterations when using autograd mode so
+                            # compute_rotational_metrics can reuse the graph after the sample loop.
+                            _retain = (sample_idx < (n_batch - 1)) or (_is_mas_iter and mas_hvp_mode == "autograd")
+                            (loss / loss_scale).backward(retain_graph=_retain)
                             batch_loss += loss.item()
 
                             # Teacher forcing does not generate reasoning, so training accuracy
@@ -2666,6 +3261,26 @@ def pc_optimize_inputs(
                                 trace_payload.update(trace_common)
                                 trace_payload["epoch"] = epoch
                                 weave_lm_train_step(**trace_payload)
+
+                    # MAS rotational metric — serial path
+                    if not use_batched_forward_pass and _is_mas_iter:
+                        try:
+                            _mas_raw = None
+                            if mas_hvp_mode == "jvp":
+                                from mas_analysis import compute_rotational_metrics_jvp
+                                _mas_raw = compute_rotational_metrics_jvp(
+                                    _build_mas_loss_fn(mini_batch, mini_batch_pair_contexts), lora_A
+                                )
+                            elif _mas_last_loss is not None:
+                                from mas_analysis import compute_rotational_metrics
+                                _mas_raw = compute_rotational_metrics(_mas_last_loss, lora_A)
+                            if _mas_raw is not None and wandb.run is not None:
+                                wandb.log({f"mas/{k}": v for k, v in _mas_raw.items()})
+                        except Exception as exc:
+                            logger.warning(
+                                "MAS rotational metric skipped at iteration %d: %s",
+                                global_iteration, exc,
+                            )
 
                     mean_batch_loss = batch_loss / max(n_batch, 1)
                     reg_loss = None
@@ -2827,6 +3442,15 @@ def pc_optimize_inputs(
 
             # Cache fl and p_text once per epoch after parameter update
             fl_epoch = _assemble_prompt_logits().detach()
+
+            # SWA: accumulate Welford online mean of prompt logits
+            if use_swa and epoch >= swa_start_epoch and (epoch - swa_start_epoch) % swa_freq == 0:
+                swa_n += 1
+                if swa_n == 1:
+                    swa_logits_accum = fl_epoch.clone()
+                else:
+                    swa_logits_accum = swa_logits_accum + (fl_epoch - swa_logits_accum) / swa_n
+
             p_token_ids_epoch = fl_epoch.argmax(dim=-1).squeeze(0).tolist()
             p_text_epoch = tokenizer.decode(
                 p_token_ids_epoch,
@@ -2871,6 +3495,7 @@ def pc_optimize_inputs(
                     "epoch": epoch,
                     "allowed_vocab_size": vocab_size,
                     "vocab_size": vocab_size,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
                 }
                 log_dict.update({f"train/{k}": v for k, v in train_metrics_epoch.items()})
                 log_dict.update(epoch_reg_log)
@@ -2878,6 +3503,8 @@ def pc_optimize_inputs(
                 log_dict["grad_norm"] = total_norm if total_norm is not None else grad_stats["prompt_grad_norm"]
                 log_dict["discrete_reinit"] = int(discrete_reinit_applied)
                 log_dict["discrete_reinit_num_positions"] = discrete_reinit_num_positions
+                if use_swa:
+                    log_dict["swa_n"] = swa_n
                 if discrete_reinit_entropy_mean is not None:
                     log_dict["discrete_reinit_entropy_mean"] = discrete_reinit_entropy_mean
                     log_dict["discrete_reinit_entropy_min"] = discrete_reinit_entropy_min
@@ -2927,7 +3554,7 @@ def pc_optimize_inputs(
             val_metrics = None
             # Validation
             if val_eval_every > 0 and (epoch + 1) % val_eval_every == 0 and val_pairs:
-                _eval_fn = evaluate_shared_prompt_batched if use_batched_eval else evaluate_shared_prompt
+                _eval_fn = evaluate_shared_prompt_batched if use_batched_val_eval else evaluate_shared_prompt
                 val_metrics = _eval_fn(
                     free_logits=fl_epoch,
                     eval_pairs=val_pairs,
@@ -2952,6 +3579,7 @@ def pc_optimize_inputs(
                     x_embeds_cache=x_embeds_cache if val_prompt_eval_mode == "soft" else None,
                     accumulate_embeds=accumulate_embeds,
                     prompt_logits_transform=prompt_logits_transform,
+                    eval_inner_batch_size=eval_inner_batch_size,
                 )
                 val_metrics["epoch"] = epoch
                 val_accuracy_history.append(val_metrics)
@@ -3032,6 +3660,9 @@ def pc_optimize_inputs(
             epoch_pbar.set_postfix(epoch_postfix, refresh=False)
             epoch_pbar.update(1)
 
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
             if early_stop_loss_threshold > 0.0 and epoch_avg_loss < early_stop_loss_threshold:
                 logger.info(
                     "Stopping early at epoch %s because mean batch loss %.6f < threshold %.6f",
@@ -3047,6 +3678,10 @@ def pc_optimize_inputs(
     # Build final result
     # -----------------------------------------------------------------------
     final_prompt_logits = _assemble_prompt_logits().detach()
+    if use_swa and swa_n > 0:
+        final_prompt_logits = swa_logits_accum
+        if wandb.run is not None:
+            wandb.run.summary["swa_n_snapshots"] = swa_n
     final_learnable_logits = _get_free_logits().detach()
     final_p_tokens = final_prompt_logits.argmax(dim=-1).squeeze(0).tolist()
     final_p_text = tokenizer.decode(final_p_tokens, skip_special_tokens=False)
@@ -3078,6 +3713,7 @@ def pc_optimize_inputs(
 
     return {
         "final_p_logits": final_prompt_logits,
+        "swa_logits": swa_logits_accum,
         "learnable_logits": final_learnable_logits,
         "learnable_temperatures": final_learnable_temperatures,
         "final_p_tokens": final_p_tokens,
