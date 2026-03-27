@@ -35,6 +35,7 @@ class STGS(nn.Module):
         dropout: float = 0.0,
         input_dropout: float = 0.0,
         output_dropout: float = 0.0,
+        output_top_k: int = 0,
         stgs_hard_method: str = "categorical",
         stgs_hard_embsim_probs: str = "gumbel_soft",
         stgs_hard_embsim_strategy: str = "nearest",  # nearest | topk_rerank | topk_sample | margin_fallback | lm_topk_restrict
@@ -73,6 +74,8 @@ class STGS(nn.Module):
         assert 0.0 <= self.input_dropout < 1.0, "input_dropout must be in [0, 1)"
         self.output_dropout = output_dropout
         assert 0.0 <= self.output_dropout < 1.0, "output_dropout must be in [0, 1)"
+        self.output_top_k = output_top_k
+        assert output_top_k >= 0, "output_top_k must be >= 0"
         self.eps = eps
         self.device = device
         self.tokenizer = tokenizer
@@ -97,6 +100,7 @@ class STGS(nn.Module):
         gumbel_noise_scale: float = 1.0,
         input_dropout: Optional[float] = None,
         output_dropout: Optional[float] = None,
+        output_top_k: Optional[int] = None,
         embedding_weights: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -193,6 +197,16 @@ class STGS(nn.Module):
         eff_output_dropout = self.output_dropout if output_dropout is None else output_dropout
         if eff_output_dropout > 0.0:
             y_soft = F.dropout(y_soft, p=eff_output_dropout, training=self.training)
+
+        # Post-softmax top-k: zero non-top-k probs and renormalise (mask is detached)
+        eff_output_top_k = self.output_top_k if output_top_k is None else output_top_k
+        if 0 < eff_output_top_k < self.vocab_size:
+            with torch.no_grad():
+                topk_vals = torch.topk(y_soft, eff_output_top_k, dim=-1).values
+                threshold = topk_vals[..., -1:]   # (batch, seq, 1)
+                mask = (y_soft >= threshold).to(y_soft.dtype)
+            y_soft = y_soft * mask
+            y_soft = y_soft / (y_soft.sum(dim=-1, keepdim=True) + self.eps)
 
         # Sampling from batched distribution y_soft:
         with torch.no_grad():
