@@ -398,7 +398,7 @@ def pc_forward_pass(
     x_text_rendered = _decode_trace_text(tokenizer, x_ids, skip_special_tokens=False) if tokenizer is not None else x_text_raw
     E_text_rendered = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=False) if tokenizer is not None else ""
     Y_target_rendered = _decode_trace_text(tokenizer, Y_tokens, skip_special_tokens=False) if tokenizer is not None else y_target_text_raw
-    Y_target_clean = _decode_trace_text(tokenizer, Y_tokens, skip_special_tokens=True) if tokenizer is not None else y_target_text_raw
+    Y_target_clean = _decode_trace_text(tokenizer, Y_tokens, skip_special_tokens=False) if tokenizer is not None else y_target_text_raw
 
     # Step 0: get soft prompt embeddings via STGS
     _, p_one_hot, _, _ = stgs_module(
@@ -409,7 +409,7 @@ def pc_forward_pass(
     p_embeds = p_one_hot @ embedding_weights.detach()   # (1, seq_len, embed_dim)
     p_token_ids = p_one_hot.detach().argmax(dim=-1)
     p_text_argmax = _decode_trace_text(tokenizer, p_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
-    p_text_argmax_clean = _decode_trace_text(tokenizer, p_token_ids, skip_special_tokens=True) if tokenizer is not None else ""
+    p_text_argmax_clean = _decode_trace_text(tokenizer, p_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
 
     if teacher_forcing_r:
         # Case A: teacher-forced R (or no R when R_gt_embeds is None)
@@ -429,7 +429,7 @@ def pc_forward_pass(
         y_logits = output.logits[:, -Y_len:, :]   # (1, Y_len, vocab)
         y_pred_token_ids = y_logits.detach().argmax(dim=-1)
         y_pred_text = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
-        y_pred_text_clean = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=True) if tokenizer is not None else ""
+        y_pred_text_clean = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
 
         if weave_extras is not None and tokenizer is not None:
             input_segments = [
@@ -557,7 +557,7 @@ def pc_forward_pass(
 
         R_gen_token_ids = r_out.sampled_diff_tokens
         R_gen_text = _decode_trace_text(tokenizer, R_gen_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
-        R_gen_text_clean = _decode_trace_text(tokenizer, R_gen_token_ids, skip_special_tokens=True) if tokenizer is not None else ""
+        R_gen_text_clean = _decode_trace_text(tokenizer, R_gen_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
 
         if weave_extras is not None and tokenizer is not None:
             reasoning_input_segments = [
@@ -638,7 +638,7 @@ def pc_forward_pass(
             y_logits = y_out.logits[:, :Y_len, :]
         y_pred_token_ids = y_logits.detach().argmax(dim=-1)
         y_pred_text = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
-        y_pred_text_clean = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=True) if tokenizer is not None else ""
+        y_pred_text_clean = _decode_trace_text(tokenizer, y_pred_token_ids, skip_special_tokens=False) if tokenizer is not None else ""
 
         if weave_extras is not None and tokenizer is not None:
             answer_input_segments = [
@@ -727,7 +727,7 @@ def pc_forward_pass(
         weave_extras["y_pred_text"] = _decode_trace_text(
             tokenizer,
             y_logits.detach().argmax(dim=-1),
-            skip_special_tokens=True,
+            skip_special_tokens=False,
         )
 
     input_dict = {
@@ -912,24 +912,18 @@ def pc_forward_pass_batched_free(
 
     # --- Stage 1: reasoning tokens ---
     if offline_r_cache is not None:
-        # Offline EM M-step: use cached reasoning tokens (no gradient through R).
+        # Offline EM M-step: use cached [R_trim | E] token IDs (no gradient through R).
+        # Cache stores int64 IDs; we embed per-sample on-the-fly here (not persisted).
+        # EoS trimming and E append were done at cache-build time, so no padding_starts needed.
         assert x_strs_batch is not None, (
             "x_strs_batch must be provided when offline_r_cache is not None"
         )
-        R_tokens = torch.cat(
-            [offline_r_cache[x_str].to(device) for x_str in x_strs_batch], dim=0
-        )  # (B, R_gen_len)
-        R_embeds = diff_model.model.get_input_embeddings()(R_tokens.long()).detach()
-        with torch.no_grad():
-            pad_id   = getattr(diff_model, "pad_token_id", 0) or 0
-            pad_mask = (R_tokens.long() == pad_id).long()
-            R_gen_len = R_tokens.shape[1]
-            raw_starts = pad_mask.argmax(dim=1)
-            padding_starts = torch.where(
-                raw_starts == 0,
-                torch.full_like(raw_starts, R_gen_len),
-                raw_starts,
-            )
+        _emb_layer = diff_model.model.get_input_embeddings()
+        re_embeds_list = [
+            _emb_layer(offline_r_cache[x_str].to(device).long()).detach()
+            for x_str in x_strs_batch
+        ]  # list of (1, R_trim_i+E_len, d) — variable length per sample
+        R_tokens = None                          # no uniform batch tensor; handled at call site
     else:
         # Online: generate reasoning fresh from [x_i | p_i].
         xp_seqs = [
@@ -981,13 +975,14 @@ def pc_forward_pass_batched_free(
     # --- Stage 2: answer generate from [x_i | p_i | R_i[:trim] | E] ---
     xpRE_seqs = []
     for i in range(B):
-        trim = int(padding_starts[i].item())
-        xpRE_seqs.append(torch.cat([
-            x_embeds_list[i],
-            p_embeds_batch[i:i+1],
-            R_embeds[i:i+1, :trim, :],
-            E_embeds,
-        ], dim=1))
+        if offline_r_cache is not None:
+            # re_embeds_list[i]: (1, R_trim_i+E_len, d) — trimmed R + E, embedded from cache IDs.
+            parts = [x_embeds_list[i], p_embeds_batch[i:i+1], re_embeds_list[i]]
+        else:
+            trim = int(padding_starts[i].item())
+            parts = [x_embeds_list[i], p_embeds_batch[i:i+1],
+                     R_embeds[i:i+1, :trim, :], E_embeds]
+        xpRE_seqs.append(torch.cat(parts, dim=1))
     xpRE_padded, xpRE_mask = _left_pad_embed_sequences(xpRE_seqs, device, dtype)
     y_out = diff_model.generate(
         inputs_embeds=xpRE_padded,
@@ -1104,15 +1099,17 @@ def _generate_offline_reasoning_cache(
     offline_em_temperature: Union[str, float],   # "learned" | float
     max_new_tokens_reasoning: int,
     reasoning_generation_backend: str,
+    E_input_ids: Tensor,                         # (1, E_len) int64 — extractor token IDs
     reasoning_generate_kwargs: Optional[Dict[str, Any]],
     cache_batch_size: int,
     device,
 ) -> Dict[str, Tensor]:
     """E-step: generate reasoning tokens for all training x_strs using the current prompt.
 
-    Returns a dict mapping each unique x_str to a (1, R_len) CPU int64 tensor of
-    reasoning token IDs.  These are fed as fixed inputs during the subsequent M-step
-    forward passes instead of re-generating reasoning from scratch each iteration.
+    Returns a dict mapping each unique x_str to a (1, R_trim+E_len) CPU int64 tensor
+    of EoS-trimmed reasoning token IDs with the extractor token IDs already appended.
+    These are fed as fixed inputs during the subsequent M-step forward passes.
+    Storing token IDs (not embeddings) allows Weave text decoding of the cached rollouts.
     """
     # --- Resolve E-step temperature ---
     if offline_em_temperature == "learned":
@@ -1173,6 +1170,16 @@ def _generate_offline_reasoning_cache(
 
     cache: Dict[str, Tensor] = {}
     dtype = embedding_weights.dtype
+    pad_id = getattr(diff_model, "pad_token_id", 0) or 0
+    # Also collect eos_token_id(s) — for chat models like Qwen3, eos_token_id
+    # (<|im_end|>) differs from pad_token_id and must be trimmed too.
+    _raw_eos = getattr(diff_model.model.config, "eos_token_id", pad_id)
+    _stop_ids: set = {pad_id}
+    if isinstance(_raw_eos, (list, tuple)):
+        _stop_ids.update(_raw_eos)
+    elif _raw_eos:
+        _stop_ids.add(int(_raw_eos))
+    _E_input_ids_cpu = E_input_ids.cpu()         # (1, E_len) int64 — kept on CPU for cat
     with tqdm(total=len(unique_x_strs), desc="E-step: caching reasoning", unit="x", leave=False) as pbar:
         for batch_start in range(0, len(unique_x_strs), cache_batch_size):
             batch_x_strs = unique_x_strs[batch_start:batch_start + cache_batch_size]
@@ -1191,7 +1198,18 @@ def _generate_offline_reasoning_cache(
             )
             R_tokens = r_out.sampled_diff_tokens   # (B_batch, R_gen_len)
             for i, x_str in enumerate(batch_x_strs):
-                cache[x_str] = R_tokens[i:i+1].cpu()   # (1, R_gen_len)
+                r = R_tokens[i]                    # (R_gen_len,) int64
+                # Trim at first stop token (pad_id or any eos_token_id).
+                stop_mask = torch.zeros_like(r, dtype=torch.bool)
+                for _sid in _stop_ids:
+                    stop_mask |= (r == _sid)
+                stop_pos = stop_mask.nonzero(as_tuple=True)[0]
+                trim = stop_pos[0].item() if len(stop_pos) > 0 else r.shape[0]
+                r_trimmed = r[:trim].unsqueeze(0)  # (1, trim) int64
+                # Cache [R_trim | E] as token IDs — never embeds.
+                cache[x_str] = torch.cat(
+                    [r_trimmed.cpu(), _E_input_ids_cpu], dim=1  # (1, trim+E_len) int64
+                )
             pbar.update(len(batch_x_strs))
 
     return cache
@@ -1320,7 +1338,7 @@ def evaluate_shared_prompt(
     example_rows: List[Dict[str, Any]] = []
 
     E_text_rendered = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=False)
-    E_text_clean = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=True)
+    E_text_clean = _decode_trace_text(tokenizer, E_input_ids, skip_special_tokens=False)
     eval_pbar = tqdm(
         total=n_eval,
         desc=f"{eval_split} eval ({eval_mode})",
@@ -1343,7 +1361,7 @@ def evaluate_shared_prompt(
                 )
                 p_text_clean = tokenizer.decode(
                     effective_prompt_logits.detach().argmax(dim=-1).squeeze(0).tolist(),
-                    skip_special_tokens=True,
+                    skip_special_tokens=False,
                 )
 
                 x_ids = (x_ids_cache or {}).get(x_str) if x_ids_cache else None
@@ -1377,7 +1395,7 @@ def evaluate_shared_prompt(
                             generation_backend="diff",
                         )
                     R_ids_only = r_out.sampled_diff_tokens
-                    R_text = tokenizer.decode(R_ids_only[0], skip_special_tokens=True)
+                    R_text = tokenizer.decode(R_ids_only[0], skip_special_tokens=False)
                     R_text_raw = tokenizer.decode(R_ids_only[0], skip_special_tokens=False)
                     reasoning_trace = _build_pc_lm_trace(
                         tokenizer=tokenizer,
@@ -1441,7 +1459,7 @@ def evaluate_shared_prompt(
                         do_sample=False,
                     )
                     Y_output_ids = Y_ids[:, xpR_ids.shape[1]:]
-                    Y_text = tokenizer.decode(Y_output_ids[0], skip_special_tokens=True)
+                    Y_text = tokenizer.decode(Y_output_ids[0], skip_special_tokens=False)
                     Y_text_raw = tokenizer.decode(Y_output_ids[0], skip_special_tokens=False)
                     answer_trace = _build_pc_lm_trace(
                         tokenizer=tokenizer,
@@ -1547,11 +1565,11 @@ def evaluate_shared_prompt(
                             generation_backend="diff",
                         )
                     R_ids_only = r_out.sampled_diff_tokens
-                    R_text = tokenizer.decode(R_ids_only[0], skip_special_tokens=True)
+                    R_text = tokenizer.decode(R_ids_only[0], skip_special_tokens=False)
                     R_text_raw = tokenizer.decode(R_ids_only[0], skip_special_tokens=False)
                     p_eval_ids = p_one_hot_eval.detach().argmax(dim=-1)
                     p_eval_text = _decode_trace_text(tokenizer, p_eval_ids, skip_special_tokens=False)
-                    p_eval_text_clean = _decode_trace_text(tokenizer, p_eval_ids, skip_special_tokens=True)
+                    p_eval_text_clean = _decode_trace_text(tokenizer, p_eval_ids, skip_special_tokens=False)
                     reasoning_trace = _build_pc_lm_trace(
                         tokenizer=tokenizer,
                         call_name="reasoning_generate",
@@ -1615,7 +1633,7 @@ def evaluate_shared_prompt(
                         return_dict=True,
                     )
                     Y_output_ids = y_out.sampled_diff_tokens
-                    Y_text = tokenizer.decode(Y_output_ids[0], skip_special_tokens=True)
+                    Y_text = tokenizer.decode(Y_output_ids[0], skip_special_tokens=False)
                     Y_text_raw = tokenizer.decode(Y_output_ids[0], skip_special_tokens=False)
                     answer_trace = _build_pc_lm_trace(
                         tokenizer=tokenizer,
@@ -1875,6 +1893,7 @@ def evaluate_shared_prompt_batched(
                 input_ids=xp_pad, attention_mask=xp_mask,
                 max_new_tokens=max_new_tokens_reasoning,
                 pad_token_id=tokenizer.pad_token_id,
+                return_dict_in_generate=True,
                 **_r_gen_kwargs,
             )
             R_ids = r_gen.sequences[:, max_xp:]   # (B, max_new_tokens_reasoning)
@@ -1894,6 +1913,7 @@ def evaluate_shared_prompt_batched(
                 input_ids=xpRE_pad, attention_mask=xpRE_mask,
                 max_new_tokens=max_new_tokens_answer,
                 pad_token_id=tokenizer.pad_token_id,
+                return_dict_in_generate=True,
             )
             Y_ids   = y_gen.sequences[:, max_xpRE:]   # (B, max_new_tokens_answer)
             R_for_accuracy = R_ids
@@ -1950,8 +1970,8 @@ def evaluate_shared_prompt_batched(
         all_correct    = 0
         method_correct: Dict[str, int] = {m: 0 for m in extraction_fns}
         for i, (_, y_raw) in enumerate(eval_pairs):
-            R_text = tokenizer.decode(R_for_accuracy[i].tolist(), skip_special_tokens=True)
-            Y_text = tokenizer.decode(Y_ids[i].tolist(), skip_special_tokens=True)
+            R_text = tokenizer.decode(R_for_accuracy[i].tolist(), skip_special_tokens=False)
+            Y_text = tokenizer.decode(Y_ids[i].tolist(), skip_special_tokens=False)
             res = _compute_method_results(
                 R_text=R_text, Y_text=Y_text,
                 y_raw_str=y_raw, extraction_fns=extraction_fns,
@@ -1962,7 +1982,7 @@ def evaluate_shared_prompt_batched(
             all_correct += int(all(res.values()))
             if is_weave_active():
                 _p_text = tokenizer.decode(p_ids.squeeze(0).tolist(), skip_special_tokens=False)
-                _p_text_clean = tokenizer.decode(p_ids.squeeze(0).tolist(), skip_special_tokens=True)
+                _p_text_clean = tokenizer.decode(p_ids.squeeze(0).tolist(), skip_special_tokens=False)
                 weave_lm_eval_step(
                     call_name="answer_generate_batched_eval",
                     split=eval_split,
@@ -2872,6 +2892,7 @@ def pc_optimize_inputs(
             train_triples=train_triples,
             stgs_module=stgs_module,
             embedding_weights=embedding_weights,
+            E_input_ids=E_input_ids,
             offline_em_stgs_method=offline_em_stgs_method,
             offline_em_stgs_embsim_probs=offline_em_stgs_embsim_probs,
             offline_em_temperature=offline_em_temperature,
@@ -3060,6 +3081,7 @@ def pc_optimize_inputs(
                             offline_r_cache=offline_r_cache,
                             x_strs_batch=[x for x, _, _ in mini_batch],
                         )
+                        '''
                         if gumbel_n_samples > 1:
                             _all_batched_outs = [
                                 pc_forward_pass_batched(**_bfp_kwargs)
@@ -3073,6 +3095,14 @@ def pc_optimize_inputs(
                         else:
                             _batched_out = pc_forward_pass_batched(**_bfp_kwargs)
                             per_losses = _batched_out["losses"]
+                        '''
+                        if gumbel_n_samples > 1:
+                            _bfp_kwargs['x_strs_batch'] *= gumbel_n_samples
+                            _bfp_kwargs['x_embeds_list'] *= gumbel_n_samples
+                            _bfp_kwargs['Y_tokens_list'] *= gumbel_n_samples
+                            _bfp_kwargs['loss_instances'] *= gumbel_n_samples
+                        _batched_out = pc_forward_pass_batched(**_bfp_kwargs)
+                        per_losses = _batched_out["losses"]
                         y_logits_list  = _batched_out["y_logits_list"]
                         R_tokens_batch = _batched_out["R_tokens"]
                         for si, (loss, y_lg, (x_str, R_gt_str, y_raw_str)) in enumerate(
@@ -3086,14 +3116,20 @@ def pc_optimize_inputs(
                             train_Y_text = (
                                 tokenizer.decode(
                                     y_lg.argmax(-1).squeeze(0).tolist(),
-                                    skip_special_tokens=True,
+                                    skip_special_tokens=False,
                                 ) if y_lg is not None else ""
                             )
                             if teacher_forcing_r:
                                 train_R_text = R_gt_str
                             elif R_tokens_batch is not None:
                                 train_R_text = tokenizer.decode(
-                                    R_tokens_batch[si].tolist(), skip_special_tokens=True,
+                                    R_tokens_batch[si].tolist(), skip_special_tokens=False,
+                                )
+                            elif offline_r_cache is not None:
+                                # Decode cached [R_trim | E] token IDs for logging.
+                                train_R_text = tokenizer.decode(
+                                    offline_r_cache[x_str].squeeze(0).tolist(),
+                                    skip_special_tokens=False,
                                 )
                             else:
                                 train_R_text = ""

@@ -17,7 +17,7 @@ MODEL_NAME="Qwen/Qwen3-0.6B"
 MODEL_KEY="qwen3-600m"
 
 # --- Dataset ---
-TRAIN_SIZE=50
+TRAIN_SIZE=0
 VAL_SIZE=100
 TEST_SIZE=1319
 TRAIN_SEED=10
@@ -31,7 +31,7 @@ MAX_NEW_TOKENS_R=512
 MAX_NEW_TOKENS_Y=4
 
 # --- Optimization ---
-EPOCHS=100
+EPOCHS=1
 LR=0.01
 SEQ_LEN=20
 
@@ -49,8 +49,9 @@ LR_SCHEDULE_GAMMA=0.1
 
 # initial_prompt_text: non-empty string = tokenize and use as starting prompt, overrides SEQ_LEN;
 #   empty string = ignore (use SEQ_LEN and init_strategy instead)
-INITIAL_PROMPT_TEXT=""
+#INITIAL_PROMPT_TEXT=""
 #INITIAL_PROMPT_TEXT="Let's decompose this problem into subproblems and think step-by-step. "
+INITIAL_PROMPT_TEXT="Let's think step-by-step. "
 # initial_prompt_lora_reconstruction: decode method used to verify the rank-r SVD approximation
 #   when initial_prompt_text and logits_lora_rank > 0 are both set.
 #   "argmax": greedy argmax of lora_A @ lora_B (default).
@@ -108,13 +109,13 @@ GRADIENT_ACCUMULATION_STEPS=4
 VAL_EVAL_BEFORE_TRAINING=True
 # test_eval_before_training: True = run one test epoch before the first training epoch (epoch -1);
 #   False = no pre-training test eval (default)
-TEST_EVAL_BEFORE_TRAINING=False
+TEST_EVAL_BEFORE_TRAINING=True
 
 # --- Validation ---
-VAL_EVAL_EVERY=1
+VAL_EVAL_EVERY=2
 TEST_EVAL_EVERY=5
-VAL_PROMPT_EVAL_MODE="soft"
-TEST_PROMPT_EVAL_MODE="soft"
+VAL_PROMPT_EVAL_MODE="discrete"
+TEST_PROMPT_EVAL_MODE="discrete"
 
 # --- MAS rotational metric ---
 # mas_metric_every: N = compute MAS rotational metric every N iterations (0 = disabled;
@@ -180,7 +181,7 @@ OFFLINE_EM_TEMPERATURE=1.0
 # 0 = fall back to INNER_BATCH_SIZE.
 OFFLINE_EM_CACHE_BATCH_SIZE=16
 
-RUN_NAME="${MODEL_KEY}_pcmt_gsm8k_SEED${OPT_SEED}"
+RUN_NAME="${MODEL_KEY}_eval_pcmt_gsm8k_SEED${OPT_SEED}"
 #RUN_NAME="${MODEL_KEY}_pc_mt_free_gsm8k_SL${SEQ_LEN}_EP${EPOCHS}_LR${LR}_SEED${OPT_SEED}"
 OUTPUT_DIR="results/pc_mt/${RUN_NAME}"
 SUPERPOSITION_OUTPUT_DIR="${OUTPUT_DIR}/superposition"

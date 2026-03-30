@@ -69,13 +69,13 @@ LOSSES="crossentropy"
 TEMPERATURE=2.0
 LEARNABLE_TEMPERATURE=True
 DECOUPLE_LEARNABLE_TEMPERATURE=True
-STGS_HARD=False
+STGS_HARD=True
 STGS_HARD_METHOD="categorical"
-LOGITS_NORMALIZE="none"
+LOGITS_NORMALIZE="zscore"
 LOGITS_LORA_RANK=0
 LOGITS_TOP_K=0
 LOGITS_TOP_P=1.0
-GUMBEL_NOISE_SCALE=1.0
+GUMBEL_NOISE_SCALE=0.06125 #1.0
 INIT_STRATEGY="zeros"
 
 # --- SWA ---
@@ -113,8 +113,8 @@ TEST_EVAL_BEFORE_TRAINING=False
 # --- Validation ---
 VAL_EVAL_EVERY=1
 TEST_EVAL_EVERY=5
-VAL_PROMPT_EVAL_MODE="soft"
-TEST_PROMPT_EVAL_MODE="soft"
+VAL_PROMPT_EVAL_MODE="discrete"
+TEST_PROMPT_EVAL_MODE="discrete"
 
 # --- MAS rotational metric ---
 # mas_metric_every: N = compute MAS rotational metric every N iterations (0 = disabled;
